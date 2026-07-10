@@ -1,5 +1,17 @@
 # A.R.I.A. pipeline configuration
 aria:
+  # Which engine bin/aria uses for the automated stages (triage, develop).
+  #   ollama — fully local & private via your Ollama server; great for
+  #            triage, produces *draft* plans without web research
+  #   claude — full capability via headless Claude Code (web research,
+  #            subagents)
+  # Slash commands inside a Claude Code session always use Claude.
+  # Override per-run with the ARIA_ENGINE environment variable.
+  engine: ollama
+  ollama:
+    base_url: http://localhost:11434
+    model: llama3.1:8b
+
   # Where /promote-project moves approved projects.
   # Relative paths are resolved from the aria/ root.
   # On your own machine, point this at e.g. ~/Documents/Projects

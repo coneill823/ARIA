@@ -2,24 +2,36 @@
 # A.R.I.A. command-line interface.
 #
 #   aria capture "idea text"   instant capture to the inbox (no LLM call)
-#   aria triage                classify the inbox        (headless Claude Code)
-#   aria develop [slug]        ideas -> proposed plans   (headless Claude Code)
+#   aria triage                classify the inbox
+#   aria develop [slug]        ideas -> proposed plans
 #   aria status                pipeline dashboard        (headless Claude Code)
 #   aria doctor                sanity-check the setup
 #
-# The headless verbs wrap `claude -p` so they can run from cron:
-#   0 7 * * *  cd /path/to/aria && bin/aria triage
+# triage/develop run on the engine set in system/config.yml (aria.engine):
+# 'ollama' = your local Ollama server, 'claude' = headless Claude Code.
+# Override per-run: ARIA_ENGINE=claude bin/aria triage
+# Cron example:  0 7 * * *  cd /path/to/aria && bin/aria triage
 set -euo pipefail
 
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+engine() {
+  if [ -n "${ARIA_ENGINE:-}" ]; then
+    echo "$ARIA_ENGINE"
+  else
+    sed -n 's/^[[:space:]]*engine:[[:space:]]*\([a-z]*\).*/\1/p' \
+      "$ARIA_ROOT/system/config.yml" | head -1 | grep . || echo claude
+  fi
+}
 
 require_claude() {
   command -v claude >/dev/null 2>&1 || {
     echo "error: claude CLI not found — install Claude Code first" >&2
     echo "       https://code.claude.com/docs" >&2
+    echo "       (or set engine: ollama in system/config.yml)" >&2
     exit 1
   }
 }
@@ -65,11 +77,17 @@ EOF
     ;;
 
   triage)
+    if [ "$(engine)" = "ollama" ]; then
+      exec "$ARIA_ROOT/bin/aria-ollama" triage "$@"
+    fi
     require_claude
     cd "$ARIA_ROOT" && claude -p "/triage"
     ;;
 
   develop)
+    if [ "$(engine)" = "ollama" ]; then
+      exec "$ARIA_ROOT/bin/aria-ollama" develop "$@"
+    fi
     require_claude
     cd "$ARIA_ROOT" && claude -p "/develop ${1:-}"
     ;;
@@ -87,9 +105,13 @@ EOF
       if [ -d "$ARIA_ROOT/$d" ]; then echo "ok   $d"
       else echo "MISS $d"; ok=1; fi
     done
+    echo "engine: $(engine)"
+    if [ "$(engine)" = "ollama" ]; then
+      "$ARIA_ROOT/bin/aria-ollama" check || ok=1
+    fi
     command -v claude >/dev/null 2>&1 \
       && echo "ok   claude CLI ($(command -v claude))" \
-      || { echo "MISS claude CLI (capture still works; automation won't)"; }
+      || { echo "note claude CLI missing (capture + ollama engine still work)"; }
     exit $ok
     ;;
 

@@ -66,14 +66,14 @@ Then drive the pipeline with slash commands:
 bin/aria capture "app that turns my grocery receipts into a meal planner"
 ```
 
-This writes the inbox note instantly (no LLM call). Other CLI verbs wrap
-headless Claude Code (`claude -p`) so they can run from cron or any
-automation:
+This writes the inbox note instantly (no LLM call). The other CLI verbs run
+the pipeline stages headlessly, so they work from cron or any automation:
 
 ```bash
 bin/aria triage      # classify the inbox
 bin/aria develop     # turn processing items into proposed plans
 bin/aria status      # print the pipeline dashboard
+bin/aria doctor      # sanity-check the setup (folders, engine, models)
 ```
 
 Example cron ("scheduled agent" mode — see OpenJarvis below):
@@ -83,6 +83,26 @@ Example cron ("scheduled agent" mode — see OpenJarvis below):
 0 7 * * *  cd /path/to/aria && bin/aria triage
 15 7 * * * cd /path/to/aria && bin/aria develop
 ```
+
+### Engines: local Ollama vs Claude
+
+`bin/aria triage` and `bin/aria develop` run on the engine set in
+`system/config.yml → aria.engine`:
+
+| | `ollama` (default) | `claude` |
+|---|---|---|
+| Runs on | your local Ollama server (e.g. `llama3.1:8b`) | headless Claude Code (`claude -p`) |
+| Cost / privacy | free, nothing leaves your machine | API usage, full capability |
+| Triage | ✅ works well on small models | ✅ |
+| Develop | ⚠️ *draft* plan from prior knowledge — `research.md` is marked unverified (no web access) | ✅ real web research with sources |
+
+The engines are interchangeable per run: `ARIA_ENGINE=claude bin/aria develop`
+re-does a stage with full research. Slash commands inside a Claude Code
+session always use Claude, and the review → approve → promote stages are
+Claude Code territory either way — an 8B model is great at sorting your
+inbox, not at being a project manager. `bin/aria doctor` verifies your
+Ollama server and model are reachable; the local engine is implemented in
+`bin/aria-ollama` (stdlib-only Python, talks to Ollama's `/api/chat`).
 
 ## Life after promotion
 
