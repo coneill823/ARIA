@@ -3,3 +3,4 @@ Thumbs.db
 *.tmp
 .obsidian/workspace*
 .claude/settings.local.json
+__pycache__/
