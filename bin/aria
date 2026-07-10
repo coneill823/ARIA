@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# A.R.I.A. command-line interface.
+#
+#   aria capture "idea text"   instant capture to the inbox (no LLM call)
+#   aria triage                classify the inbox        (headless Claude Code)
+#   aria develop [slug]        ideas -> proposed plans   (headless Claude Code)
+#   aria status                pipeline dashboard        (headless Claude Code)
+#   aria doctor                sanity-check the setup
+#
+# The headless verbs wrap `claude -p` so they can run from cron:
+#   0 7 * * *  cd /path/to/aria && bin/aria triage
+set -euo pipefail
+
+ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INBOX="$ARIA_ROOT/pipeline/00-inbox"
+
+usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+require_claude() {
+  command -v claude >/dev/null 2>&1 || {
+    echo "error: claude CLI not found — install Claude Code first" >&2
+    echo "       https://code.claude.com/docs" >&2
+    exit 1
+  }
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  capture)
+    idea="${*:-}"
+    if [ -z "$idea" ]; then
+      echo "usage: aria capture \"your idea, rambling welcome\"" >&2
+      exit 1
+    fi
+    mkdir -p "$INBOX"
+    stamp_id="$(date +%Y%m%d-%H%M)"
+    stamp_iso="$(date -u +%Y-%m-%dT%H:%MZ)"
+    # first few words of the idea, kebab-cased, as a filename hint
+    snippet="$(printf '%s' "$idea" | tr '[:upper:]' '[:lower:]' \
+      | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40 \
+      | awk -F- '{print $1"-"$2"-"$3"-"$4}' | sed 's/-*$//')"
+    file="$INBOX/$(date +%Y-%m-%d-%H%M)-${snippet:-idea}.md"
+    if [ -e "$file" ]; then file="${file%.md}-$RANDOM.md"; fi
+    cat > "$file" <<EOF
+---
+id: $stamp_id
+captured: $stamp_iso
+status: inbox
+type: unclassified
+slug:
+source: cli
+tags: []
+---
+
+## Raw capture
+
+$idea
+
+<!-- Sections below are added by the pipeline, never above this line. -->
+EOF
+    echo "captured -> ${file#"$ARIA_ROOT"/}"
+    echo "run 'aria triage' (or /triage in Claude Code) to classify"
+    ;;
+
+  triage)
+    require_claude
+    cd "$ARIA_ROOT" && claude -p "/triage"
+    ;;
+
+  develop)
+    require_claude
+    cd "$ARIA_ROOT" && claude -p "/develop ${1:-}"
+    ;;
+
+  status)
+    require_claude
+    cd "$ARIA_ROOT" && claude -p "/status"
+    ;;
+
+  doctor)
+    ok=0
+    for d in pipeline/00-inbox pipeline/01-processing \
+             pipeline/02-potential-projects pipeline/knowledge \
+             pipeline/archive system/templates .claude/commands .claude/agents; do
+      if [ -d "$ARIA_ROOT/$d" ]; then echo "ok   $d"
+      else echo "MISS $d"; ok=1; fi
+    done
+    command -v claude >/dev/null 2>&1 \
+      && echo "ok   claude CLI ($(command -v claude))" \
+      || { echo "MISS claude CLI (capture still works; automation won't)"; }
+    exit $ok
+    ;;
+
+  ""|-h|--help|help)
+    usage
+    ;;
+
+  *)
+    echo "error: unknown command '$cmd'" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

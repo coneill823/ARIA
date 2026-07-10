@@ -1,0 +1,27 @@
+# A.R.I.A. pipeline configuration
+aria:
+  # Where /promote-project moves approved projects.
+  # Relative paths are resolved from the aria/ root.
+  # On your own machine, point this at e.g. ~/Documents/Projects
+  promotion_target: ./active-projects
+
+  # Triage categories and where non-project items get filed.
+  categories:
+    project:  pipeline/01-processing           # moves on to /develop
+    task:     pipeline/knowledge/lists         # appended to the matching list
+    note:     pipeline/knowledge/notes
+    content:  pipeline/knowledge/content-ideas
+    someday:  pipeline/knowledge/someday
+    unclear:  pipeline/00-inbox                # stays put with questions attached
+
+  # Named lists that `task` items append to. Triage picks the best match,
+  # falling back to tasks.md.
+  lists:
+    grocery: pipeline/knowledge/lists/grocery.md
+    tasks:   pipeline/knowledge/lists/tasks.md
+
+  # Minimum triage confidence before auto-filing (else marked unclear).
+  triage_confidence_threshold: 0.7
+
+  # Whether /develop may use web search for research.
+  research_web_access: true
