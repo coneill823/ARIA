@@ -5,6 +5,7 @@ local Ollama server instead of Claude Code.
   aria-ollama check            verify the Ollama server and model are reachable
   aria-ollama triage [file]    classify inbox notes and file them
   aria-ollama develop [slug]   turn processing ideas into proposed plan drafts
+  aria-ollama auto [file]      triage, then develop whatever became a project
 
 Config: system/config.yml (aria.ollama.*). Env overrides: ARIA_OLLAMA_URL,
 ARIA_OLLAMA_MODEL. Python 3.8+ stdlib only — nothing to pip install.
@@ -46,9 +47,11 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     args = sys.argv[2:]
     if cmd == "triage":
-        return eng.triage_run(print_event, files=args or None)
+        return 1 if eng.triage_run(print_event, files=args or None)["failures"] else 0
     if cmd == "develop":
         return eng.develop_run(print_event, slugs=args or None)
+    if cmd == "auto":
+        return 1 if eng.auto_run(print_event, files=args or None)["failures"] else 0
     if cmd == "check":
         return check()
     print(__doc__.strip())

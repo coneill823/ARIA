@@ -12,6 +12,16 @@ aria:
     base_url: http://localhost:11434
     model: llama3.1:8b
 
+  # When capturing from the web UI, automatically run triage and then
+  # develop whatever became a project — idea in, proposed plan out.
+  auto_pipeline: true
+
+  # Absolute path to your Obsidian vault to enable the UI's "→ Obsidian"
+  # button (exports a project's idea/research/plan plus an index note with
+  # tags and wikilinks into <vault>/ARIA/). Empty = disabled.
+  # e.g. obsidian_vault: /home/you/Documents/SecondBrain
+  obsidian_vault:
+
   # Where /promote-project moves approved projects.
   # Relative paths are resolved from the aria/ root.
   # On your own machine, point this at e.g. ~/Documents/Projects

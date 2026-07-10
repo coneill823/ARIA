@@ -70,10 +70,15 @@
   .card .x { color: var(--dim); font-size: 12px; margin-top: 3px; }
   .badge { display: inline-block; font-size: 10px; padding: 1px 7px;
            border-radius: 99px; border: 1px solid var(--line);
-           color: var(--dim); margin-top: 5px; }
+           color: var(--dim); margin-top: 5px; margin-right: 4px; }
   .badge.approved { color: var(--ok); border-color: #14532d; }
   .badge.proposed { color: var(--warn); border-color: #57430e; }
   .badge.unclear  { color: var(--err); border-color: #5e1b1b; }
+  .badge.exported { color: var(--accent); border-color: var(--accent-dim); }
+  .card .actions { display: flex; gap: 6px; margin-top: 7px; }
+  .card .actions button { padding: 3px 9px; font-size: 11px; border-radius: 6px; }
+  .k-head { font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+            color: var(--dim); padding: 6px 4px 0; }
 
   /* ---------------- mind ---------------- */
   #mind { flex: 1; border-left: 1px solid var(--line); background: var(--panel);
@@ -116,18 +121,26 @@
   .conf-bar i { display: block; height: 100%; background: var(--accent);
                 border-radius: 3px; }
 
-  /* ---------------- modal ---------------- */
-  #modal { position: fixed; inset: 0; background: rgba(4, 8, 14, .8);
-           display: none; align-items: center; justify-content: center; }
-  #modal.open { display: flex; }
-  #modal .box { background: var(--panel); border: 1px solid var(--line);
-                border-radius: 12px; width: min(760px, 92vw);
-                max-height: 84vh; display: flex; flex-direction: column; }
-  #modal .box h3 { padding: 12px 16px; font-size: 13px; color: var(--accent);
-                   border-bottom: 1px solid var(--line);
-                   font-family: var(--mono); overflow-wrap: anywhere; }
-  #modal pre { padding: 14px 16px; overflow: auto; white-space: pre-wrap;
-               font-family: var(--mono); font-size: 12px; color: var(--text); }
+  /* ---------------- modals ---------------- */
+  .overlay { position: fixed; inset: 0; background: rgba(4, 8, 14, .8);
+             display: none; align-items: center; justify-content: center; }
+  .overlay.open { display: flex; }
+  .overlay .box { background: var(--panel); border: 1px solid var(--line);
+                  border-radius: 12px; width: min(760px, 92vw);
+                  max-height: 84vh; display: flex; flex-direction: column; }
+  .overlay .box h3 { padding: 12px 16px; font-size: 13px; color: var(--accent);
+                     border-bottom: 1px solid var(--line);
+                     font-family: var(--mono); overflow-wrap: anywhere; }
+  .overlay pre { padding: 14px 16px; overflow: auto; white-space: pre-wrap;
+                 font-family: var(--mono); font-size: 12px; color: var(--text); }
+  #refine-text { margin: 14px 16px 0; min-height: 140px; resize: vertical;
+                 background: var(--card); color: var(--text); font: inherit;
+                 border: 1px solid var(--line); border-radius: 8px;
+                 padding: 10px 12px; outline: none; }
+  #refine-text:focus { border-color: var(--accent-dim); }
+  .overlay .foot { padding: 12px 16px; display: flex; justify-content: flex-end;
+                   gap: 8px; }
+  .overlay .hint { padding: 0 16px; color: var(--dim); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -163,47 +176,89 @@ model read, think token-by-token, decide, and move files.</div></div>
   </aside>
 </div>
 
-<div id="modal"><div class="box"><h3 id="modal-title"></h3><pre id="modal-body"></pre></div></div>
+<div id="modal" class="overlay"><div class="box"><h3 id="modal-title"></h3><pre id="modal-body"></pre></div></div>
+
+<div id="refine-modal" class="overlay"><div class="box">
+  <h3 id="refine-title"></h3>
+  <div class="hint">Say what you'd change — "drop the SMS part", "make it a
+  browser extension instead", "add a budget of £50". Your words are attached
+  to the idea verbatim and it goes back through Processing for a fresh plan.
+  The previous plan is kept as an older version.</div>
+  <textarea id="refine-text" placeholder="I like X, but…"></textarea>
+  <div class="foot"><button id="refine-send">Send back through the pipeline</button></div>
+</div></div>
 
 <script>
 const $ = s => document.querySelector(s);
 const log = $('#log');
-let es = null, tokensEl = null;
+let es = null, tokensEl = null, autoPipeline = true, obsidianReady = false;
 
 /* ------------------------------------------------ board */
+function card(title, excerpt, badge, path) {
+  const d = document.createElement('div');
+  d.className = 'card';
+  d.innerHTML = `<div class="t"></div><div class="x"></div>`;
+  d.querySelector('.t').textContent = title;
+  d.querySelector('.x').textContent = excerpt || '';
+  if (badge) {
+    const s = document.createElement('span');
+    s.className = 'badge ' + badge; s.textContent = badge;
+    d.appendChild(s);
+  }
+  if (path) d.onclick = () => openNote(path);
+  else d.style.cursor = 'default';
+  return d;
+}
+
 async function refresh() {
   const b = await (await fetch('/api/board')).json();
-  const card = (title, excerpt, badge, path) => {
-    const d = document.createElement('div');
-    d.className = 'card';
-    d.innerHTML = `<div class="t"></div><div class="x"></div>`;
-    d.querySelector('.t').textContent = title;
-    d.querySelector('.x').textContent = excerpt || '';
-    if (badge) {
-      const s = document.createElement('span');
-      s.className = 'badge ' + badge; s.textContent = badge;
-      d.appendChild(s);
-    }
-    if (path) d.onclick = () => openNote(path);
-    return d;
-  };
-  const fill = (id, items) => {
+  const fill = (id, items, count) => {
     const el = $('#c-' + id); el.replaceChildren();
     items.forEach(i => el.appendChild(i));
-    $('#n-' + id).textContent = items.length || '';
+    $('#n-' + id).textContent = (count ?? items.length) || '';
   };
   fill('inbox', b.inbox.map(n =>
     card(n.file, n.excerpt, n.type === 'unclear' ? 'unclear' : '', n.path)));
   fill('processing', b.processing.map(n => card(n.file, n.excerpt, '', n.path)));
-  fill('potential', b.potential.map(p =>
-    card(p.slug, p.pitch, p.approved ? 'approved' : 'proposed', p.path)));
-  const k = b.knowledge;
-  fill('knowledge', Object.keys(k).map(sub => {
-    const c = card(sub, k[sub] + ' item' + (k[sub] === 1 ? '' : 's')
-      + (sub === 'lists' ? ` · ${b.open_tasks} open task${b.open_tasks === 1 ? '' : 's'}` : ''), '');
-    c.style.cursor = 'default';
+
+  fill('potential', b.potential.map(p => {
+    const c = card(p.slug, p.pitch, p.approved ? 'approved' : 'proposed', p.path);
+    if (p.rounds > 1) {
+      const s = document.createElement('span');
+      s.className = 'badge'; s.textContent = 'round ' + p.rounds;
+      c.appendChild(s);
+    }
+    if (p.exported) {
+      const s = document.createElement('span');
+      s.className = 'badge exported'; s.textContent = 'in obsidian';
+      c.appendChild(s);
+    }
+    const row = document.createElement('div');
+    row.className = 'actions';
+    const bR = document.createElement('button');
+    bR.textContent = 'Refine';
+    bR.onclick = e => { e.stopPropagation(); openRefine(p.slug); };
+    const bO = document.createElement('button');
+    bO.textContent = '→ Obsidian';
+    bO.title = obsidianReady ? 'export to your Obsidian vault'
+      : 'set obsidian_vault in system/config.yml first';
+    bO.onclick = e => { e.stopPropagation(); exportObsidian(p.slug); };
+    row.append(bR, bO);
+    c.appendChild(row);
     return c;
   }));
+
+  const kids = []; let kCount = 0;
+  for (const [sub, files] of Object.entries(b.knowledge)) {
+    const h = document.createElement('div');
+    h.className = 'k-head';
+    h.textContent = sub + (sub === 'lists'
+      ? ` · ${b.open_tasks} open task${b.open_tasks === 1 ? '' : 's'}` : '');
+    kids.push(h);
+    files.forEach(f => kids.push(card(f.file, '', '', f.path)));
+    kCount += files.length;
+  }
+  fill('knowledge', kids, kCount);
   fill('active', b.active.map(p => card(p.slug, 'phase: ' + p.phase, '')));
 }
 
@@ -214,15 +269,56 @@ async function openNote(path) {
   $('#modal-body').textContent = r.content;
   $('#modal').classList.add('open');
 }
-$('#modal').onclick = () => $('#modal').classList.remove('open');
+$('#modal').onclick = e => { if (e.target.id === 'modal') $('#modal').classList.remove('open'); };
+
+/* ------------------------------------------------ refine */
+let refineSlug = null;
+function openRefine(slug) {
+  refineSlug = slug;
+  $('#refine-title').textContent = 'Refine: ' + slug;
+  $('#refine-text').value = '';
+  $('#refine-modal').classList.add('open');
+  $('#refine-text').focus();
+}
+$('#refine-modal').onclick = e => {
+  if (e.target.id === 'refine-modal') $('#refine-modal').classList.remove('open');
+};
+$('#refine-send').onclick = async () => {
+  const feedback = $('#refine-text').value.trim();
+  if (!feedback || !refineSlug) return;
+  const r = await fetch('/api/refine', {
+    method: 'POST', body: JSON.stringify({ slug: refineSlug, feedback })
+  });
+  const j = await r.json();
+  $('#refine-modal').classList.remove('open');
+  $('#log .empty')?.remove();
+  if (!r.ok) { add('err', '✗ ' + j.error); return; }
+  add('banner', `── feedback attached to ${refineSlug} — re-planning ──`);
+  refresh();
+  run('develop', { slug: refineSlug });
+};
+
+/* ------------------------------------------------ obsidian */
+async function exportObsidian(slug) {
+  const r = await fetch('/api/export', {
+    method: 'POST', body: JSON.stringify({ slug })
+  });
+  const j = await r.json();
+  $('#log .empty')?.remove();
+  add(r.ok ? 'moved' : 'err',
+      r.ok ? `⬡ ${slug} exported to Obsidian: ${j.path}` : '✗ ' + j.error);
+  if (r.ok) refresh();
+}
 
 /* ------------------------------------------------ health */
 async function health() {
   try {
     const h = await (await fetch('/api/health')).json();
+    autoPipeline = !!h.auto_pipeline;
+    obsidianReady = !!h.obsidian;
     $('#dot').className = 'dot' + (h.ok ? ' ok' : '');
     $('#health-txt').textContent = h.ok
-      ? `ollama · ${h.model}`
+      ? `ollama · ${h.model}` + (autoPipeline ? ' · auto' : '')
       : (h.server ? `model ${h.model} missing` : `ollama unreachable — ${h.url}`);
   } catch { $('#health-txt').textContent = 'ui server unreachable'; }
 }
@@ -233,7 +329,13 @@ $('#capture').onsubmit = async e => {
   const text = $('#idea').value.trim();
   if (!text) return;
   const r = await fetch('/api/capture', { method: 'POST', body: JSON.stringify({ text }) });
-  if (r.ok) { $('#idea').value = ''; refresh(); }
+  if (!r.ok) return;
+  const j = await r.json();
+  $('#idea').value = '';
+  await refresh();
+  // auto-pipeline: freshly captured idea goes straight through triage,
+  // and on to develop if it turns out to be a project
+  if (autoPipeline && !es) run('auto', { file: j.file });
 };
 
 /* ------------------------------------------------ mind */
@@ -299,11 +401,12 @@ function handle(ev) {
   }
 }
 
-function run(stage) {
+function run(stage, params = {}) {
   if (es) return;
   $('#log .empty')?.remove();
   setButtons(true);
-  es = new EventSource('/api/run?stage=' + stage);
+  const qs = new URLSearchParams({ stage, ...params });
+  es = new EventSource('/api/run?' + qs);
   es.onmessage = e => {
     const ev = JSON.parse(e.data);
     if (ev.event === 'done') { es.close(); es = null; setButtons(false); refresh(); return; }

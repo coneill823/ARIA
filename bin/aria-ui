@@ -9,8 +9,11 @@ Stdlib only. Endpoints:
   GET  /api/board     pipeline state as JSON
   GET  /api/health    Ollama reachability + model
   GET  /api/note?path=<repo-relative .md>   note content
-  GET  /api/run?stage=triage|develop        Server-Sent Events stream
+  GET  /api/run?stage=triage|develop|auto   Server-Sent Events stream
+       (&file=<inbox note> scopes triage/auto, &slug=<slug> scopes develop)
   POST /api/capture   {"text": "..."} -> new inbox note
+  POST /api/refine    {"slug", "feedback"} -> idea goes back to processing
+  POST /api/export    {"slug"} -> publish project into the Obsidian vault
 """
 
 import json
@@ -77,29 +80,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"path": rel,
                             "content": target.read_text(encoding="utf-8")})
         elif url.path == "/api/run":
-            self.run_stage((query.get("stage") or [""])[0])
+            self.run_stage((query.get("stage") or [""])[0],
+                           file=(query.get("file") or [""])[0],
+                           slug=(query.get("slug") or [""])[0])
         else:
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
-        if url.path != "/api/capture":
-            self.send_json({"error": "not found"}, 404)
-            return
         length = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
-            path = eng.capture_note(str(body.get("text", "")), source="ui")
+            if url.path == "/api/capture":
+                path = eng.capture_note(str(body.get("text", "")), source="ui")
+                self.send_json({"ok": True, "file": path.name,
+                                "path": str(path.relative_to(eng.ROOT))})
+            elif url.path == "/api/refine":
+                dest = eng.refine(str(body.get("slug", "")),
+                                  str(body.get("feedback", "")))
+                self.send_json({"ok": True, "slug": dest.stem,
+                                "path": str(dest.relative_to(eng.ROOT))})
+            elif url.path == "/api/export":
+                index = eng.export_obsidian(str(body.get("slug", "")))
+                self.send_json({"ok": True, "path": str(index)})
+            else:
+                self.send_json({"error": "not found"}, 404)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 400)
-            return
-        self.send_json({"ok": True, "file": path.name})
 
     # ------------------------------------------------------------ engine
 
-    def run_stage(self, stage):
-        if stage not in ("triage", "develop"):
-            self.send_json({"error": "stage must be triage or develop"}, 400)
+    def run_stage(self, stage, file="", slug=""):
+        if stage not in ("triage", "develop", "auto"):
+            self.send_json({"error": "stage must be triage, develop or auto"}, 400)
             return
         if not RUN_LOCK.acquire(blocking=False):
             self.send_json({"error": "a run is already in progress"}, 409)
@@ -118,11 +131,14 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     dead = True
 
+            files = [f"pipeline/00-inbox/{Path(file).name}"] if file else None
             try:
                 if stage == "triage":
-                    eng.triage_run(emit)
+                    eng.triage_run(emit, files=files)
+                elif stage == "auto":
+                    eng.auto_run(emit, files=files)
                 else:
-                    eng.develop_run(emit)
+                    eng.develop_run(emit, slugs=[slug] if slug else None)
             except Exception as exc:
                 emit({"event": "error", "log": f"engine crashed: {exc}"})
             emit({"event": "done"})

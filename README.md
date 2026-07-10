@@ -98,8 +98,8 @@ A local dashboard (stdlib-only Python + a single HTML file, binds to
 
 - **Board** — live view of every pipeline stage: inbox, processing,
   potential projects (with pitch + proposed/approved badges), knowledge
-  counts, and active projects with their phase. Click any card to read the
-  underlying note.
+  (every note and list as its own clickable card), and active projects with
+  their phase. Click any card to read the underlying note.
 - **Capture bar** — drop ideas straight into the inbox from the browser.
 - **Mind panel** — the AI's thought process, streamed live while triage or
   develop runs: the exact prompt sent to the model (collapsible), the
@@ -109,6 +109,53 @@ A local dashboard (stdlib-only Python + a single HTML file, binds to
 
 The UI drives the same engine as the CLI (`bin/aria_engine.py`), so
 everything it does lands in the same markdown files and ledger.
+
+#### Auto-pipeline — idea in, plan out
+
+With `aria.auto_pipeline: true` (the default), capturing an idea in the UI
+immediately runs triage and, if it's classified a project, develop — so a
+raw idea becomes a proposed plan in the Potential column without you
+clicking anything. You watch the whole thing happen in the mind panel. The
+`ok · auto` tag in the header confirms it's on. (The manual **Run Triage** /
+**Run Develop** buttons still work, and cron users get the same in one shot
+with `bin/aria auto`.)
+
+#### Refine loop — your input sharpens the idea
+
+![Refine a proposed project](docs/ui-refine.png)
+
+Every Potential card has a **Refine** button. Type what you'd change ("drop
+the SMS part", "must run fully offline", "add a £50 budget") and the idea
+goes *back through the pipeline*: your feedback is appended to `idea.md`
+verbatim under a `## Refinement request` heading, the current plan and
+research are kept as versioned snapshots (`proposed-plan.v1.md`, …, never
+deleted), the idea returns to Processing, and develop re-plans with your
+feedback as binding input. The card shows a `round N` badge so you can see
+how many passes it's had. Repeat until it's right.
+
+#### Send it to Obsidian
+
+Every Potential card also has a **→ Obsidian** button. Point
+`aria.obsidian_vault` at your vault (absolute path) and it publishes the
+project into `<vault>/ARIA/`: an index note with `tags: [aria, project]`, the
+pitch, and wikilinks to copies of the idea, research, and plan — so it drops
+straight into your second-brain graph. The card then shows an `in obsidian`
+badge. This is a lightweight export; the full **approve → promote** exit
+(below) still runs through Claude Code.
+
+#### How an idea leaves Potential
+
+There are two exits, by design:
+
+1. **→ Obsidian** (above) — a quick publish into your second brain, for
+   ideas you want to keep and cross-link but not necessarily build yet.
+2. **Approve → promote** — the real build path, and the deliberate
+   human gate. In a Claude Code session (`claude` from the repo root) run
+   `/approve <slug>` to turn the plan into an approved `requirements.md`,
+   then `/promote-project <slug>` to move it out to `active-projects/` with
+   its own PM and subagent team. The UI intentionally has no one-click
+   "build this" button — promotion spins up an autonomous project, so it
+   stays a conscious decision you make in Claude Code.
 
 ### Engines: local Ollama vs Claude
 

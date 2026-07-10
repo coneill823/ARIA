@@ -4,20 +4,21 @@
 #   aria capture "idea text"   instant capture to the inbox (no LLM call)
 #   aria triage                classify the inbox
 #   aria develop [slug]        ideas -> proposed plans
+#   aria auto                  triage, then develop new projects (idea -> plan)
 #   aria status                pipeline dashboard        (headless Claude Code)
 #   aria ui [port]             web UI: board + live AI thought stream (default :8700)
 #   aria doctor                sanity-check the setup
 #
-# triage/develop run on the engine set in system/config.yml (aria.engine):
+# triage/develop/auto run on the engine set in system/config.yml (aria.engine):
 # 'ollama' = your local Ollama server, 'claude' = headless Claude Code.
 # Override per-run: ARIA_ENGINE=claude bin/aria triage
-# Cron example:  0 7 * * *  cd /path/to/aria && bin/aria triage
+# Cron example:  0 7 * * *  cd /path/to/aria && bin/aria auto
 set -euo pipefail
 
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -91,6 +92,14 @@ EOF
     fi
     require_claude
     cd "$ARIA_ROOT" && claude -p "/develop ${1:-}"
+    ;;
+
+  auto)
+    if [ "$(engine)" = "ollama" ]; then
+      exec "$ARIA_ROOT/bin/aria-ollama" auto "$@"
+    fi
+    require_claude
+    cd "$ARIA_ROOT" && claude -p "/triage" && claude -p "/develop"
     ;;
 
   status)

@@ -44,6 +44,10 @@ def config():
         "model": os.environ.get("ARIA_OLLAMA_MODEL", find("model", "llama3.1:8b")),
         "threshold": float(find("triage_confidence_threshold", "0.7")),
         "promotion_target": find("promotion_target", "./active-projects"),
+        "auto_pipeline": find("auto_pipeline", "true").lower()
+            in ("true", "yes", "on", "1"),
+        "obsidian_vault": os.environ.get(
+            "ARIA_OBSIDIAN_VAULT", find("obsidian_vault", "")),
     }
 
 
@@ -211,11 +215,12 @@ def triage_run(emit, files=None):
     if not files:
         emit({"event": "stage_done", "stage": "triage",
               "log": "inbox is empty — nothing to triage"})
-        return 0
+        return {"failures": 0, "projects": []}
 
     emit({"event": "start", "stage": "triage", "count": len(files),
           "log": f"triaging {len(files)} inbox note(s) with {cfg['model']}"})
     failures = 0
+    projects = []
     for f in files:
         fm, _, body = parse_note(f)
         captured = (fm.get("captured") or "?")[:10]
@@ -261,6 +266,7 @@ def triage_run(emit, files=None):
             f.rename(dest)
             ledger_update(dest.stem, "project", "processing",
                           "pipeline/01-processing/", captured, replaces=f.stem)
+            projects.append(dest.stem)
             emit({"event": "moved", "file": f.name,
                   "to": f"pipeline/01-processing/{dest.name}",
                   "log": f"project  {f.name} -> 01-processing/{dest.name}"})
@@ -291,9 +297,19 @@ def triage_run(emit, files=None):
                   "log": f"{typ:8} {f.name} -> knowledge/{folder}/"})
 
     emit({"event": "stage_done", "stage": "triage", "failures": failures,
+          "projects": projects,
           "log": "done — run develop for any new projects, "
                  "answer questions on anything unclear"})
-    return 1 if failures else 0
+    return {"failures": failures, "projects": projects}
+
+
+def auto_run(emit, files=None):
+    """Capture-to-plan automation: triage, then develop whatever became a
+    project — the 'idea goes in, proposed plan comes out' path."""
+    result = triage_run(emit, files=files)
+    if result["projects"]:
+        develop_run(emit, slugs=result["projects"])
+    return result
 
 
 # ---------------------------------------------------------------- develop
@@ -311,7 +327,9 @@ these sections:
 ## Decisions needed from you
 ## Risks
 Stay faithful to the idea's intent. Right-size it: a weekend tool gets a
-one-page plan. Pick one approach and say why, don't offer menus."""
+one-page plan. Pick one approach and say why, don't offer menus.
+If the note contains "Refinement request" sections, they are the owner's
+binding feedback on earlier drafts — the new plan must incorporate them."""
 
 RESEARCH_PROMPT = (
     "From prior knowledge only, list for this idea: likely existing "
@@ -396,6 +414,90 @@ def develop_run(emit, slugs=None):
     return 0
 
 
+# ---------------------------------------------------------------- refine
+
+def refine(slug, feedback):
+    """Attach the owner's feedback to a potential project and send it back
+    through the pipeline: old plan/research are versioned (never deleted),
+    the idea returns to 01-processing, and the next develop run re-plans
+    with the feedback as binding input."""
+    feedback = feedback.strip()
+    if not feedback:
+        raise ValueError("empty feedback")
+    proj = POTENTIAL / slug
+    idea = proj / "idea.md"
+    if not idea.exists():
+        raise ValueError(f"no such potential project: {slug}")
+
+    version = len(list(proj.glob("proposed-plan.v*.md"))) + 1
+    for name in ("proposed-plan", "research"):
+        f = proj / f"{name}.md"
+        if f.exists():
+            f.rename(proj / f"{name}.v{version}.md")
+
+    today = datetime.date.today().isoformat()
+    with idea.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n## Refinement request ({today}, round {version + 1})\n\n"
+                 f"{feedback}\n")
+
+    dest = PROCESSING / f"{slug}.md"
+    idea.rename(dest)
+    update_frontmatter(dest, status="processing")
+    fm = parse_note(dest)[0]
+    ledger_update(slug, "project", "processing", "pipeline/01-processing/",
+                  (fm.get("captured") or "?")[:10])
+    return dest
+
+
+# ---------------------------------------------------------------- obsidian
+
+def export_obsidian(slug):
+    """Publish a potential project into the Obsidian vault configured at
+    aria.obsidian_vault: one folder of prefixed notes plus an index note
+    with wikilinks and tags, so it joins the second-brain graph."""
+    cfg = config()
+    if not cfg["obsidian_vault"]:
+        raise ValueError("obsidian_vault is not set in system/config.yml — "
+                         "point it at your vault to enable export")
+    vault = Path(os.path.expanduser(cfg["obsidian_vault"]))
+    if not vault.is_dir():
+        raise ValueError(f"obsidian vault not found: {vault}")
+    proj = POTENTIAL / slug
+    if not proj.is_dir():
+        raise ValueError(f"no such potential project: {slug}")
+
+    today = datetime.date.today().isoformat()
+    dest = vault / "ARIA" / slug
+    dest.mkdir(parents=True, exist_ok=True)
+    links = []
+    for name in ("idea", "research", "proposed-plan", "requirements"):
+        src = proj / f"{name}.md"
+        if src.exists():
+            (dest / f"{slug}-{name}.md").write_text(
+                src.read_text(encoding="utf-8"), encoding="utf-8")
+            links.append(f"- [[{slug}-{name}|{name.replace('-', ' ').title()}]]")
+
+    plan = proj / "proposed-plan.md"
+    pitch = ""
+    if plan.exists():
+        m = re.search(r"^\s*>\s*\*\*Pitch:\*\*\s*(.+)$",
+                      plan.read_text(encoding="utf-8"), re.M)
+        pitch = m.group(1).strip() if m else ""
+
+    index = vault / "ARIA" / f"{slug}.md"
+    index.write_text(
+        f"---\ntags: [aria, project]\naria-slug: {slug}\nexported: {today}\n"
+        f"---\n\n# {slug.replace('-', ' ').title()}\n\n"
+        + (f"> {pitch}\n\n" if pitch else "")
+        + "\n".join(links)
+        + f"\n\nSource: A.R.I.A. pipeline — `pipeline/02-potential-projects/{slug}/`\n",
+        encoding="utf-8",
+    )
+    if plan.exists():
+        update_frontmatter(plan, exported=today)
+    return index
+
+
 # ---------------------------------------------------------------- board
 
 def _note_cards(folder):
@@ -422,6 +524,11 @@ def board():
             if not d.is_dir():
                 continue
             plan = d / "proposed-plan.md"
+            # a folder holding only versioned drafts is mid-refinement —
+            # the idea itself is showing in Processing right now
+            if not plan.exists() and not (d / "idea.md").exists() \
+                    and not (d / "requirements.md").exists():
+                continue
             fm = parse_note(plan)[0] if plan.exists() else {}
             pitch = ""
             if plan.exists():
@@ -434,13 +541,20 @@ def board():
                 "approved": (d / "requirements.md").exists(),
                 "status": fm.get("status", "proposed"),
                 "pitch": pitch,
+                "rounds": len(list(d.glob("proposed-plan.v*.md"))) + 1,
+                "exported": bool(fm.get("exported")),
             })
 
     knowledge = {}
     for sub in ("notes", "lists", "content-ideas", "someday"):
         d = KNOWLEDGE / sub
-        knowledge[sub] = len([p for p in d.glob("*.md") if p.name != "README.md"]) \
-            if d.is_dir() else 0
+        items = []
+        if d.is_dir():
+            for p in sorted(d.glob("*.md")):
+                if p.name == "README.md":
+                    continue
+                items.append({"file": p.name, "path": str(p.relative_to(ROOT))})
+        knowledge[sub] = items
     open_tasks = 0
     lists_dir = KNOWLEDGE / "lists"
     if lists_dir.is_dir():
@@ -474,13 +588,15 @@ def board():
 
 def health():
     cfg = config()
+    extras = {"auto_pipeline": cfg["auto_pipeline"],
+              "obsidian": bool(cfg["obsidian_vault"])}
     try:
         with urllib.request.urlopen(cfg["url"] + "/api/tags", timeout=5) as resp:
             models = [m.get("name", "") for m in json.load(resp).get("models", [])]
         model_ok = any(m == cfg["model"] or m.startswith(cfg["model"] + ":")
                        for m in models)
         return {"ok": model_ok, "server": True, "model": cfg["model"],
-                "url": cfg["url"], "models": models}
+                "url": cfg["url"], "models": models, **extras}
     except Exception as exc:
         return {"ok": False, "server": False, "model": cfg["model"],
-                "url": cfg["url"], "error": str(exc)}
+                "url": cfg["url"], "error": str(exc), **extras}
