@@ -5,6 +5,7 @@
 #   aria triage                classify the inbox
 #   aria develop [slug]        ideas -> proposed plans
 #   aria status                pipeline dashboard        (headless Claude Code)
+#   aria ui [port]             web UI: board + live AI thought stream (default :8700)
 #   aria doctor                sanity-check the setup
 #
 # triage/develop run on the engine set in system/config.yml (aria.engine):
@@ -16,7 +17,7 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -95,6 +96,10 @@ EOF
   status)
     require_claude
     cd "$ARIA_ROOT" && claude -p "/status"
+    ;;
+
+  ui)
+    exec python3 "$ARIA_ROOT/bin/aria-ui" "$@"
     ;;
 
   doctor)

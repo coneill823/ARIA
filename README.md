@@ -73,6 +73,7 @@ the pipeline stages headlessly, so they work from cron or any automation:
 bin/aria triage      # classify the inbox
 bin/aria develop     # turn processing items into proposed plans
 bin/aria status      # print the pipeline dashboard
+bin/aria ui          # web UI: pipeline board + live AI thought stream
 bin/aria doctor      # sanity-check the setup (folders, engine, models)
 ```
 
@@ -83,6 +84,31 @@ Example cron ("scheduled agent" mode — see OpenJarvis below):
 0 7 * * *  cd /path/to/aria && bin/aria triage
 15 7 * * * cd /path/to/aria && bin/aria develop
 ```
+
+### The web UI — watch A.R.I.A. think
+
+```bash
+bin/aria ui          # -> http://127.0.0.1:8700  (or: bin/aria ui 9000)
+```
+
+![A.R.I.A. web UI](docs/ui.png)
+
+A local dashboard (stdlib-only Python + a single HTML file, binds to
+127.0.0.1, no dependencies, nothing leaves your machine):
+
+- **Board** — live view of every pipeline stage: inbox, processing,
+  potential projects (with pitch + proposed/approved badges), knowledge
+  counts, and active projects with their phase. Click any card to read the
+  underlying note.
+- **Capture bar** — drop ideas straight into the inbox from the browser.
+- **Mind panel** — the AI's thought process, streamed live while triage or
+  develop runs: the exact prompt sent to the model (collapsible), the
+  model's raw output token by token as it thinks, the decision with
+  confidence bar and reasoning, and every file move. Unclear items show the
+  questions the model wants answered.
+
+The UI drives the same engine as the CLI (`bin/aria_engine.py`), so
+everything it does lands in the same markdown files and ledger.
 
 ### Engines: local Ollama vs Claude
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A.R.I.A. local engine — runs the automated pipeline stages against a
+"""A.R.I.A. local engine CLI — runs the automated pipeline stages against a
 local Ollama server instead of Claude Code.
 
   aria-ollama check            verify the Ollama server and model are reachable
@@ -9,342 +9,46 @@ local Ollama server instead of Claude Code.
 Config: system/config.yml (aria.ollama.*). Env overrides: ARIA_OLLAMA_URL,
 ARIA_OLLAMA_MODEL. Python 3.8+ stdlib only — nothing to pip install.
 
-Trade-off vs the claude engine: fully local and private, but no web access.
-Triage works well on small models. Develop produces a *draft* plan and a
-research file that explicitly lists what still needs verifying — promote
-nothing on the strength of unverified local research.
+The pipeline logic lives in aria_engine.py (shared with the web UI, which
+additionally streams the model's thinking live — try: aria ui).
 """
 
-import json
-import os
-import re
 import sys
-import datetime
-import urllib.request
-import urllib.error
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-INBOX = ROOT / "pipeline" / "00-inbox"
-PROCESSING = ROOT / "pipeline" / "01-processing"
-POTENTIAL = ROOT / "pipeline" / "02-potential-projects"
-KNOWLEDGE = ROOT / "pipeline" / "knowledge"
-ARCHIVE = ROOT / "pipeline" / "archive"
-LEDGER = ROOT / "pipeline" / "LEDGER.md"
-
-CATEGORIES = ("project", "task", "note", "content", "someday", "unclear")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aria_engine as eng  # noqa: E402
 
 
-# ---------------------------------------------------------------- config
+def print_event(ev):
+    # tokens/prompts stream in the web UI; the CLI just prints the log lines
+    if ev.get("log") and ev["event"] not in ("token", "prompt", "thinking"):
+        print(ev["log"])
 
-def config():
-    text = (ROOT / "system" / "config.yml").read_text(encoding="utf-8")
-
-    def find(key, default):
-        m = re.search(rf"^\s*{re.escape(key)}:\s*(\S.*?)\s*$", text, re.M)
-        return m.group(1) if m else default
-
-    return {
-        "url": os.environ.get(
-            "ARIA_OLLAMA_URL", find("base_url", "http://localhost:11434")
-        ).rstrip("/"),
-        "model": os.environ.get("ARIA_OLLAMA_MODEL", find("model", "llama3.1:8b")),
-        "threshold": float(find("triage_confidence_threshold", "0.7")),
-    }
-
-
-def chat(cfg, prompt, system=None, force_json=False):
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    body = {"model": cfg["model"], "stream": False, "messages": messages}
-    if force_json:
-        body["format"] = "json"
-    req = urllib.request.Request(
-        cfg["url"] + "/api/chat",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.load(resp)["message"]["content"]
-
-
-# ---------------------------------------------------------------- notes
-
-def parse_note(path):
-    """Return (frontmatter_dict, raw_frontmatter, body)."""
-    text = path.read_text(encoding="utf-8")
-    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
-    if not m:
-        return {}, "", text
-    fm = dict(re.findall(r"^([A-Za-z_][\w-]*):[ \t]*(.*)$", m.group(1), re.M))
-    return fm, m.group(1), m.group(2)
-
-
-def update_frontmatter(path, **updates):
-    fm, raw, body = parse_note(path)
-    if not raw:  # no frontmatter at all — synthesize one
-        raw_lines = []
-    else:
-        raw_lines = raw.split("\n")
-    for key, value in updates.items():
-        pattern = re.compile(rf"^{re.escape(key)}:.*$")
-        for i, line in enumerate(raw_lines):
-            if pattern.match(line):
-                raw_lines[i] = f"{key}: {value}"
-                break
-        else:
-            raw_lines.append(f"{key}: {value}")
-    path.write_text("---\n" + "\n".join(raw_lines) + "\n---\n" + body, encoding="utf-8")
-
-
-def slugify(text, limit=5):
-    words = re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()
-    return "-".join(words[:limit]) or "untitled"
-
-
-def unique_path(path):
-    if not path.exists():
-        return path
-    n = 2
-    while True:
-        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
-
-
-# ---------------------------------------------------------------- ledger
-
-def ledger_update(name, typ, status, location, captured, replaces=None):
-    today = datetime.date.today().isoformat()
-    row = f"| {name} | {typ} | {status} | {location} | {captured} | {today} |"
-    lines = LEDGER.read_text(encoding="utf-8").splitlines() if LEDGER.exists() else []
-    keys = [f"| {n} " for n in (name, replaces) if n]
-    for i, line in enumerate(lines):
-        if any(line.startswith(k) for k in keys):
-            lines[i] = row
-            break
-    else:
-        for i, line in enumerate(lines):
-            if line.startswith("|---"):
-                lines.insert(i + 1, row)
-                break
-        else:
-            lines += ["## Current state", "", "| Slug / file | Type | Status | Location | Captured | Last moved |",
-                      "|---|---|---|---|---|---|", row]
-    lines.append(f"- {today} — {name} — → {location} ({status}) — by aria-ollama")
-    LEDGER.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-# ---------------------------------------------------------------- triage
-
-TRIAGE_SYSTEM = """You are a triage classifier for a personal idea pipeline.
-Classify the note into exactly one category:
-- project: something to be built or executed in multiple steps (an app, a
-  website, research, an event). The bar: would it need a plan?
-- task: one atomic action or list item (buy milk, email Sam).
-- note: reference material, a thought worth keeping, a quote, a link.
-- content: an idea for something to publish (video, TikTok, blog post).
-- someday: a genuine project idea the note itself defers ("someday", "one day").
-- unclear: you genuinely cannot tell. Do not force it.
-Judge intent, not polish — rambling 3am notes are the normal case.
-Respond with ONLY a JSON object, no other text:
-{"type": "<category>", "confidence": <0.0-1.0>,
- "slug": "<kebab-case-2-to-5-words>", "list": "<grocery|tasks>",
- "reasoning": "<one sentence>", "questions": ["<only when unclear>"]}"""
-
-
-def classify(cfg, body):
-    reply = chat(cfg, "Classify this note:\n\n" + body.strip(), TRIAGE_SYSTEM, force_json=True)
-    data = json.loads(reply)
-    if data.get("type") not in CATEGORIES:
-        raise ValueError(f"model returned unknown type {data.get('type')!r}")
-    data["confidence"] = float(data.get("confidence", 0))
-    return data
-
-
-def triage(args):
-    cfg = config()
-    if args:
-        files = [Path(a) if Path(a).is_absolute() else ROOT / a for a in args]
-    else:
-        files = sorted(p for p in INBOX.glob("*.md") if p.name != "README.md")
-    files = [f for f in files if parse_note(f)[0].get("status") == "inbox"]
-    if not files:
-        print("inbox is empty — nothing to triage")
-        return 0
-
-    failures = 0
-    for f in files:
-        fm, _, body = parse_note(f)
-        captured = (fm.get("captured") or "?")[:10]
-        try:
-            result = classify(cfg, body)
-        except Exception as exc:  # leave the note untouched on any failure
-            print(f"ERROR  {f.name}: {exc} — left in inbox untouched")
-            failures += 1
-            continue
-
-        typ = result["type"]
-        if result["confidence"] < cfg["threshold"] and typ != "unclear":
-            typ = "unclear"
-
-        if typ == "unclear":
-            questions = result.get("questions") or ["What did you want done with this?"]
-            with f.open("a", encoding="utf-8") as fh:
-                fh.write("\n## Questions from A.R.I.A.\n\n"
-                         + "".join(f"- {q}\n" for q in questions))
-            update_frontmatter(f, type="unclear")
-            print(f"unclear  {f.name}: needs your input ({result['reasoning']})")
-            continue
-
-        if typ == "project":
-            slug = result.get("slug") or slugify(body)
-            dest = unique_path(PROCESSING / f"{slug}.md")
-            update_frontmatter(f, type="project", status="processing", slug=dest.stem)
-            f.rename(dest)
-            ledger_update(dest.stem, "project", "processing",
-                          "pipeline/01-processing/", captured, replaces=f.stem)
-            print(f"project  {f.name} -> 01-processing/{dest.name}")
-        elif typ == "task":
-            list_name = "grocery" if result.get("list") == "grocery" else "tasks"
-            list_file = KNOWLEDGE / "lists" / f"{list_name}.md"
-            item = " ".join(body.split("## Raw capture")[-1].split())
-            item = re.sub(r"<!--.*?-->", "", item, flags=re.S).strip()
-            with list_file.open("a", encoding="utf-8") as fh:
-                fh.write(f"- [ ] {item}  *(captured {captured})*\n")
-            update_frontmatter(f, type="task", status="archived")
-            dest = unique_path(ARCHIVE / f.name)
-            f.rename(dest)
-            ledger_update(f.stem, "task", "archived",
-                          f"pipeline/knowledge/lists/{list_name}.md", captured)
-            print(f"task     {f.name} -> {list_name}.md (original archived)")
-        else:  # note / content / someday
-            folder = {"note": "notes", "content": "content-ideas",
-                      "someday": "someday"}[typ]
-            dest = unique_path(KNOWLEDGE / folder / f.name)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            update_frontmatter(f, type=typ, status="filed")
-            f.rename(dest)
-            ledger_update(f.stem, typ, "filed",
-                          f"pipeline/knowledge/{folder}/", captured)
-            print(f"{typ:8} {f.name} -> knowledge/{folder}/")
-
-    print("\ndone — run 'aria develop' for any new projects,"
-          " answer questions on anything unclear")
-    return 1 if failures else 0
-
-
-# ---------------------------------------------------------------- develop
-
-PLANNER_SYSTEM = """You write concise project plans from raw idea notes.
-Output plain markdown (no code fences around the whole reply) with exactly
-these sections:
-# Proposed plan: <name>
-> **Pitch:** <one sentence>
-## What we're building
-## Recommended approach
-## Scope   (with **In:** and **Out (for v1):** bullet lists)
-## Milestones   (markdown table: # | Milestone | Rough effort | Done means)
-## Recommended team   (subagent roles a project manager would need)
-## Decisions needed from you
-## Risks
-Stay faithful to the idea's intent. Right-size it: a weekend tool gets a
-one-page plan. Pick one approach and say why, don't offer menus."""
-
-RESEARCH_DISCLAIMER = """> **Generated by the local engine (no web access).**
-> Everything below is the model's prior knowledge, NOT verified research.
-> Treat every claim as a lead to check during /review — or rerun this stage
-> with the claude engine for sourced research.
-"""
-
-
-def develop(args):
-    cfg = config()
-    files = sorted(p for p in PROCESSING.glob("*.md") if p.name != "README.md")
-    if args:
-        wanted = set(args)
-        files = [f for f in files if f.stem in wanted]
-    if not files:
-        print("nothing in 01-processing to develop")
-        return 0
-
-    today = datetime.date.today().isoformat()
-    for f in files:
-        fm, _, body = parse_note(f)
-        slug = fm.get("slug") or f.stem
-        captured = (fm.get("captured") or "?")[:10]
-        try:
-            plan_body = chat(cfg, "Write the proposed plan for this idea:\n\n" + body.strip(),
-                             PLANNER_SYSTEM)
-            research_body = chat(
-                cfg,
-                "From prior knowledge only, list for this idea: likely existing "
-                "products/projects (prior art), candidate tools and building "
-                "blocks, rough audience notes, feasibility (effort ballpark and "
-                "hard parts), and open questions. Markdown with those five "
-                "sections. Flag anything you are unsure about:\n\n" + body.strip(),
-            )
-        except Exception as exc:
-            print(f"ERROR  {f.name}: {exc} — left in 01-processing untouched")
-            continue
-
-        proj = POTENTIAL / slug
-        proj.mkdir(parents=True, exist_ok=True)
-        f.rename(proj / "idea.md")
-        (proj / "research.md").write_text(
-            f"---\nslug: {slug}\ntype: research\ncreated: {today}\n"
-            f"engine: ollama:{cfg['model']}\n---\n\n{RESEARCH_DISCLAIMER}\n"
-            + research_body.strip() + "\n",
-            encoding="utf-8",
-        )
-        (proj / "proposed-plan.md").write_text(
-            f"---\nslug: {slug}\nstatus: proposed\ncreated: {today}\n"
-            f"updated: {today}\nengine: ollama:{cfg['model']}\n---\n\n"
-            + plan_body.strip() + "\n\n## Review log\n\n"
-            "<!-- /review appends decisions here: date — what changed — why -->\n",
-            encoding="utf-8",
-        )
-        update_frontmatter(proj / "idea.md", status="proposed")
-        ledger_update(slug, "project", "proposed",
-                      f"pipeline/02-potential-projects/{slug}/", captured)
-        print(f"proposed {slug} -> 02-potential-projects/{slug}/ (draft plan ready)")
-
-    print("\ndrafts ready — review with /review <slug> in Claude Code")
-    return 0
-
-
-# ---------------------------------------------------------------- check
 
 def check():
-    cfg = config()
-    try:
-        with urllib.request.urlopen(cfg["url"] + "/api/tags", timeout=10) as resp:
-            models = [m.get("name", "") for m in json.load(resp).get("models", [])]
-    except Exception as exc:
-        print(f"FAIL  cannot reach Ollama at {cfg['url']}: {exc}")
+    h = eng.health()
+    if not h["server"]:
+        print(f"FAIL  cannot reach Ollama at {h['url']}: {h.get('error', '')}")
         print("      is it running? try: ollama serve")
         return 1
-    print(f"ok    Ollama server at {cfg['url']}")
-    if any(m == cfg["model"] or m.startswith(cfg["model"] + ":") for m in models):
-        print(f"ok    model {cfg['model']} is available")
+    print(f"ok    Ollama server at {h['url']}")
+    if h["ok"]:
+        print(f"ok    model {h['model']} is available")
         return 0
-    print(f"FAIL  model {cfg['model']} not found (have: {', '.join(models) or 'none'})")
-    print(f"      try: ollama pull {cfg['model']}")
+    print(f"FAIL  model {h['model']} not found "
+          f"(have: {', '.join(h.get('models', [])) or 'none'})")
+    print(f"      try: ollama pull {h['model']}")
     return 1
 
-
-# ---------------------------------------------------------------- main
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     args = sys.argv[2:]
     if cmd == "triage":
-        return triage(args)
+        return eng.triage_run(print_event, files=args or None)
     if cmd == "develop":
-        return develop(args)
+        return eng.develop_run(print_event, slugs=args or None)
     if cmd == "check":
         return check()
     print(__doc__.strip())
