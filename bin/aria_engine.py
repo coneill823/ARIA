@@ -34,7 +34,9 @@ def config():
     text = (ROOT / "system" / "config.yml").read_text(encoding="utf-8")
 
     def find(key, default):
-        m = re.search(rf"^\s*{re.escape(key)}:\s*(\S.*?)\s*$", text, re.M)
+        # [ \t]* (not \s*) so an empty value can't swallow the newline and
+        # match the next line as the value
+        m = re.search(rf"^[ \t]*{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$", text, re.M)
         return m.group(1) if m else default
 
     return {
@@ -52,11 +54,16 @@ def config():
 
 
 def chat_stream(cfg, prompt, system=None, force_json=False, on_token=None):
-    """Call Ollama /api/chat with streaming; returns the full reply text."""
+    """Single-prompt convenience wrapper around chat_messages."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+    return chat_messages(cfg, messages, force_json=force_json, on_token=on_token)
+
+
+def chat_messages(cfg, messages, force_json=False, on_token=None):
+    """Call Ollama /api/chat with streaming; returns the full reply text."""
     body = {"model": cfg["model"], "stream": True, "messages": messages}
     if force_json:
         body["format"] = "json"
@@ -584,6 +591,90 @@ def board():
         "open_tasks": open_tasks,
         "active": active,
     }
+
+
+# ---------------------------------------------------------------- voice chat
+
+CHAT_SYSTEM = """You are A.R.I.A. (Autonomous Reasoning & Intelligence \
+Assistant), the voice interface of a personal idea-to-project pipeline. Your \
+replies are spoken aloud, so answer in one to three short conversational \
+sentences — no markdown, no lists, no emoji. Be warm, capable, and lightly \
+witty.
+
+Current pipeline state: {summary}
+
+The app itself executes pipeline commands when the user phrases them \
+directly, for example "capture <idea>", "run triage", or "develop the \
+plans". If the user seems to want one of those actions, tell them the exact \
+phrase to say — never claim you already did it."""
+
+
+def board_summary_text():
+    b = board()
+    unclear = [n["file"] for n in b["inbox"] if n["type"] == "unclear"]
+    proposed = [p["slug"] for p in b["potential"] if not p["approved"]]
+    approved = [p["slug"] for p in b["potential"] if p["approved"]]
+    parts = [f"{len(b['inbox'])} note(s) in inbox"
+             + (f" ({len(unclear)} unclear, waiting on the user)" if unclear else ""),
+             f"{len(b['processing'])} awaiting develop",
+             f"{len(proposed)} proposed plan(s) awaiting review"
+             + (f": {', '.join(proposed)}" if proposed else "")]
+    if approved:
+        parts.append("approved and ready to promote: " + ", ".join(approved))
+    parts.append(f"{b['open_tasks']} open task(s)")
+    if b["active"]:
+        parts.append("active projects: " + ", ".join(
+            f"{p['slug']} ({p['phase']})" for p in b["active"]))
+    return "; ".join(parts)
+
+
+INTENT_CAPTURE = re.compile(
+    r"^\s*(?:capture|remember|note down|add (?:an? )?idea)\b[:,]?\s*(.+)$",
+    re.I | re.S)
+INTENT_TRIAGE = re.compile(r"\b(?:run\s+)?triage\b", re.I)
+INTENT_DEVELOP = re.compile(r"\b(?:run\s+)?develop\b|\bmake (?:the )?plans?\b",
+                            re.I)
+
+
+def detect_intent(text):
+    """Deterministic spoken-command detection, checked before the LLM."""
+    m = INTENT_CAPTURE.match(text)
+    if m and m.group(1).strip():
+        return {"action": "capture", "text": m.group(1).strip()}
+    if INTENT_TRIAGE.search(text):
+        return {"action": "triage"}
+    if INTENT_DEVELOP.search(text):
+        return {"action": "develop"}
+    return None
+
+
+def converse(messages, on_token=None):
+    """Persona chat over the local model, pipeline state in context."""
+    cfg = config()
+    system = CHAT_SYSTEM.format(summary=board_summary_text())
+    trimmed = [m for m in messages if m.get("role") in ("user", "assistant")
+               and isinstance(m.get("content"), str)][-16:]
+    return chat_messages(
+        cfg, [{"role": "system", "content": system}] + trimmed,
+        on_token=on_token)
+
+
+# ---------------------------------------------------------------- config edit
+
+def config_set(key, value):
+    """Update a single allowed key in system/config.yml in place."""
+    allowed = {"obsidian_vault", "auto_pipeline"}
+    if key not in allowed:
+        raise ValueError(f"config key not settable: {key}")
+    path = ROOT / "system" / "config.yml"
+    text = path.read_text(encoding="utf-8")
+    line = f"{key}: {value}".rstrip()
+    pattern = re.compile(rf"^(\s*){re.escape(key)}:.*$", re.M)
+    if pattern.search(text):
+        text = pattern.sub(lambda m: m.group(1) + line, text, count=1)
+    else:
+        text += f"\n  {line}\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def health():

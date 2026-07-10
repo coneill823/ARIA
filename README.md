@@ -70,11 +70,15 @@ This writes the inbox note instantly (no LLM call). The other CLI verbs run
 the pipeline stages headlessly, so they work from cron or any automation:
 
 ```bash
-bin/aria triage      # classify the inbox
-bin/aria develop     # turn processing items into proposed plans
-bin/aria status      # print the pipeline dashboard
-bin/aria ui          # web UI: pipeline board + live AI thought stream
-bin/aria doctor      # sanity-check the setup (folders, engine, models)
+bin/aria triage           # classify the inbox
+bin/aria develop          # turn processing items into proposed plans
+bin/aria auto             # triage + develop in one shot (cron-friendly)
+bin/aria status           # print the pipeline dashboard
+bin/aria ui               # web UI: voice orb + pipeline board
+bin/aria app              # open A.R.I.A. as a desktop app window
+bin/aria install-desktop  # add A.R.I.A. to your application menu
+bin/aria install-skills   # install Anthropic's Agent Skills for Claude Code
+bin/aria doctor           # sanity-check the setup (folders, engine, models)
 ```
 
 Example cron ("scheduled agent" mode — see OpenJarvis below):
@@ -85,13 +89,40 @@ Example cron ("scheduled agent" mode — see OpenJarvis below):
 15 7 * * * cd /path/to/aria && bin/aria develop
 ```
 
-### The web UI — watch A.R.I.A. think
+### The visualization screen — talk to A.R.I.A.
 
 ```bash
 bin/aria ui          # -> http://127.0.0.1:8700  (or: bin/aria ui 9000)
+bin/aria app         # same thing in its own desktop app window
 ```
 
-![A.R.I.A. web UI](docs/ui.png)
+![A.R.I.A. visualization screen](docs/ui-orb.png)
+
+The main screen is A.R.I.A. herself: a wireframe network sphere of dots
+that shifts state as she works — slow cyan drift when idle, green and
+breathing with your mic level while listening, an amber swirl while
+thinking, pulsing while speaking. Around it:
+
+- **Voice in** — click the mic and talk (browser speech recognition;
+  Chrome/Chromium works best — if the mic button is greyed out your browser
+  doesn't support it, so type instead).
+- **Voice out** — replies are spoken aloud via your system's speech
+  synthesis; the 🔊 button mutes her.
+- **Spoken commands** — "capture *(idea)*", "run triage", "develop the
+  plans" are detected deterministically and actually drive the pipeline;
+  anything else is open conversation with the local model, which always
+  has the current pipeline state in context ("what's waiting on me?").
+- **Desktop app** — `bin/aria install-desktop` puts A.R.I.A. in your app
+  menu; launching starts the server if needed and opens a chromeless
+  window.
+
+### The pipeline board — watch A.R.I.A. work
+
+The **Pipeline board →** link (or `/board`) opens the working dashboard,
+styled after the stage-flow it implements: numbered stages, the human gate
+highlighted, anything that needs you glowing amber.
+
+![A.R.I.A. pipeline board](docs/ui.png)
 
 A local dashboard (stdlib-only Python + a single HTML file, binds to
 127.0.0.1, no dependencies, nothing leaves your machine):
@@ -142,6 +173,21 @@ pitch, and wikilinks to copies of the idea, research, and plan — so it drops
 straight into your second-brain graph. The card then shows an `in obsidian`
 badge. This is a lightweight export; the full **approve → promote** exit
 (below) still runs through Claude Code.
+
+#### Agent Skills (anthropics/skills)
+
+```bash
+bin/aria install-skills
+```
+
+Clones [anthropics/skills](https://github.com/anthropics/skills) into
+`vendor/` and links every skill into `.claude/skills/`, so **any Claude Code
+session run from this repo — including the PM of every promoted project —
+can use them**: document creation (docx/pdf/pptx/xlsx), frontend design,
+webapp testing, MCP building, and the rest of the catalogue. Honest caveat:
+skills are executed by Claude Code's agent harness; the local Ollama voice
+chat can't run them — ask A.R.I.A. in a `claude` session for skill-powered
+work. Re-run the installer any time to pull updates.
 
 #### How an idea leaves Potential
 

@@ -6,7 +6,10 @@
 #   aria develop [slug]        ideas -> proposed plans
 #   aria auto                  triage, then develop new projects (idea -> plan)
 #   aria status                pipeline dashboard        (headless Claude Code)
-#   aria ui [port]             web UI: board + live AI thought stream (default :8700)
+#   aria ui [port]             web UI: voice orb + board (default :8700)
+#   aria app [port]            open A.R.I.A. as a desktop app window
+#   aria install-desktop       add A.R.I.A. to your application menu
+#   aria install-skills        install Anthropic's Agent Skills for Claude Code
 #   aria doctor                sanity-check the setup
 #
 # triage/develop/auto run on the engine set in system/config.yml (aria.engine):
@@ -18,7 +21,7 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -109,6 +112,33 @@ EOF
 
   ui)
     exec python3 "$ARIA_ROOT/bin/aria-ui" "$@"
+    ;;
+
+  app)
+    exec "$ARIA_ROOT/bin/aria-app" "$@"
+    ;;
+
+  install-desktop)
+    APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$APPS" "${XDG_STATE_HOME:-$HOME/.local/state}"
+    cat > "$APPS/aria.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=A.R.I.A.
+Comment=Autonomous Reasoning & Intelligence Assistant
+Exec=$ARIA_ROOT/bin/aria-app
+Icon=$ARIA_ROOT/docs/aria-icon.svg
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=ARIA
+DESKTOP
+    update-desktop-database "$APPS" 2>/dev/null || true
+    echo "installed -> $APPS/aria.desktop"
+    echo "A.R.I.A. is now in your application menu"
+    ;;
+
+  install-skills)
+    exec "$ARIA_ROOT/bin/aria-install-skills"
     ;;
 
   doctor)

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Launch A.R.I.A. as a desktop application window.
+# Starts the UI server if it isn't already running, then opens the
+# visualization screen in a chromeless app window (no tabs, no URL bar).
+set -euo pipefail
+
+ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT="${1:-8700}"
+URL="http://127.0.0.1:$PORT"
+
+if ! curl -sf "$URL/api/health" >/dev/null 2>&1; then
+  nohup python3 "$ARIA_ROOT/bin/aria-ui" "$PORT" \
+    >> "${XDG_STATE_HOME:-$HOME/.local/state}/aria-ui.log" 2>&1 &
+  for _ in $(seq 1 40); do
+    curl -sf "$URL/api/health" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+fi
+
+for b in google-chrome-stable google-chrome chromium chromium-browser \
+         brave brave-browser thorium vivaldi microsoft-edge; do
+  if command -v "$b" >/dev/null 2>&1; then
+    exec "$b" --app="$URL" --window-size=1500,900 --class=ARIA \
+      >/dev/null 2>&1
+  fi
+done
+
+# no chromium-family browser found — plain browser tab still works
+exec xdg-open "$URL"

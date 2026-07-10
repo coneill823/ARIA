@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Install Anthropic's public Agent Skills (github.com/anthropics/skills)
+# into this repo so every Claude Code session run from here — including the
+# PMs of promoted projects — can use them (document creation, pdf/docx/pptx/
+# xlsx handling, and the rest of the catalogue).
+#
+# Note: skills are executed by Claude Code's agent harness. The local
+# Ollama voice chat can't run them — talk to A.R.I.A. in a `claude` session
+# for skill-powered work.
+set -euo pipefail
+
+ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENDOR="$ARIA_ROOT/vendor/anthropic-skills"
+SKILLS="$ARIA_ROOT/.claude/skills"
+
+if [ -d "$VENDOR/.git" ]; then
+  echo "updating existing clone…"
+  git -C "$VENDOR" pull --ff-only
+else
+  mkdir -p "$(dirname "$VENDOR")"
+  git clone --depth 1 https://github.com/anthropics/skills "$VENDOR"
+fi
+
+mkdir -p "$SKILLS"
+count=0
+while IFS= read -r skill_md; do
+  dir="$(dirname "$skill_md")"
+  name="$(basename "$dir")"
+  ln -sfn "$dir" "$SKILLS/$name"
+  count=$((count + 1))
+done < <(find "$VENDOR" -name SKILL.md -not -path '*/.git/*' | sort)
+
+echo "linked $count skills into .claude/skills/"
+echo "available in any Claude Code session run from this repo (try /help)"

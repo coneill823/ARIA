@@ -26,7 +26,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aria_engine as eng  # noqa: E402
 
-UI_FILE = eng.ROOT / "ui" / "index.html"
+UI_DIR = eng.ROOT / "ui"
+PAGES = {"/": UI_DIR / "index.html", "/board": UI_DIR / "board.html"}
 RUN_LOCK = threading.Lock()  # one engine run at a time
 
 
@@ -59,8 +60,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
 
-        if url.path == "/":
-            data = UI_FILE.read_bytes()
+        if url.path in PAGES:
+            data = PAGES[url.path].read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -70,6 +71,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(eng.board())
         elif url.path == "/api/health":
             self.send_json(eng.health())
+        elif url.path == "/api/config":
+            cfg = eng.config()
+            self.send_json({"obsidian_vault": cfg["obsidian_vault"],
+                            "auto_pipeline": cfg["auto_pipeline"],
+                            "model": cfg["model"]})
         elif url.path == "/api/note":
             rel = (query.get("path") or [""])[0]
             target = (eng.ROOT / rel).resolve()
@@ -103,10 +109,60 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/export":
                 index = eng.export_obsidian(str(body.get("slug", "")))
                 self.send_json({"ok": True, "path": str(index)})
+            elif url.path == "/api/config":
+                for key in ("obsidian_vault", "auto_pipeline"):
+                    if key in body:
+                        eng.config_set(key, str(body[key]).strip())
+                cfg = eng.config()
+                self.send_json({"ok": True,
+                                "obsidian_vault": cfg["obsidian_vault"],
+                                "auto_pipeline": cfg["auto_pipeline"]})
+            elif url.path == "/api/chat":
+                self.chat(body)
             else:
                 self.send_json({"error": "not found"}, 404)
         except Exception as exc:
             self.send_json({"error": str(exc)}, 400)
+
+    # ------------------------------------------------------------ voice chat
+
+    def chat(self, body):
+        messages = body.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            self.send_json({"error": "messages required"}, 400)
+            return
+        last = str(messages[-1].get("content", ""))
+
+        self.send_sse_headers()
+
+        def emit(ev):
+            try:
+                self.wfile.write(b"data: " + json.dumps(ev).encode() + b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        try:
+            intent = eng.detect_intent(last)
+            if intent and intent["action"] == "capture":
+                path = eng.capture_note(intent["text"], source="voice")
+                auto = eng.config()["auto_pipeline"]
+                say = f"Captured — filed as {path.name}."
+                if auto:
+                    say += " Auto-pipeline is on, so I'm triaging it now."
+                emit({"event": "action",
+                      "action": "auto" if auto else "capture",
+                      "file": path.name, "say": say})
+            elif intent:
+                emit({"event": "action", "action": intent["action"],
+                      "say": f"On it — running {intent['action']} now."})
+            else:
+                eng.converse(messages,
+                             on_token=lambda t: emit({"event": "token",
+                                                      "text": t}))
+        except Exception as exc:
+            emit({"event": "error", "log": str(exc)})
+        emit({"event": "done"})
 
     # ------------------------------------------------------------ engine
 

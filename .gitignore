@@ -4,3 +4,5 @@ Thumbs.db
 .obsidian/workspace*
 .claude/settings.local.json
 __pycache__/
+vendor/
+.claude/skills/

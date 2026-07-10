@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#0a0f16"/>
+  <g stroke="#45d6ff" stroke-width="1" opacity=".45">
+    <line x1="64" y1="20" x2="98" y2="42"/><line x1="98" y1="42" x2="98" y2="86"/>
+    <line x1="98" y1="86" x2="64" y2="108"/><line x1="64" y1="108" x2="30" y2="86"/>
+    <line x1="30" y1="86" x2="30" y2="42"/><line x1="30" y1="42" x2="64" y2="20"/>
+    <line x1="64" y1="20" x2="64" y2="64"/><line x1="98" y1="42" x2="64" y2="64"/>
+    <line x1="98" y1="86" x2="64" y2="64"/><line x1="64" y1="108" x2="64" y2="64"/>
+    <line x1="30" y1="86" x2="64" y2="64"/><line x1="30" y1="42" x2="64" y2="64"/>
+  </g>
+  <g fill="#45d6ff">
+    <circle cx="64" cy="20" r="4"/><circle cx="98" cy="42" r="4"/>
+    <circle cx="98" cy="86" r="4"/><circle cx="64" cy="108" r="4"/>
+    <circle cx="30" cy="86" r="4"/><circle cx="30" cy="42" r="4"/>
+    <circle cx="64" cy="64" r="7"/>
+  </g>
+  <circle cx="64" cy="64" r="13" fill="none" stroke="#45d6ff" stroke-width="2" opacity=".6"/>
+</svg>
