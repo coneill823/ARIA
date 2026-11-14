@@ -102,11 +102,40 @@ def main():
         bad = [f"{t}: {v.get('error', 'model missing')}"
                for t, v in h["tiers"].items() if not v["ok"]]
         if bad:
-            raise Exception("; ".join(bad) +
-                            " — is ollama running? model pulled?")
+            hint = ""
+            ollama_bad = any(v["backend"] == "ollama" and not v["ok"]
+                             for v in h["tiers"].values())
+            if ollama_bad:
+                if not shutil.which("ollama"):
+                    hint = (" || ollama is not installed: "
+                            "curl -fsSL https://ollama.com/install.sh | sh")
+                else:
+                    try:
+                        active = subprocess.run(
+                            ["systemctl", "is-active", "ollama"],
+                            capture_output=True, text=True,
+                            timeout=5).stdout.strip()
+                    except Exception:
+                        active = "unknown"
+                    if active != "active":
+                        hint = (" || ollama installed but not running — fix: "
+                                "sudo systemctl start ollama && "
+                                "sudo systemctl enable ollama "
+                                "(or run: ollama serve)")
+                    else:
+                        hint = (" || ollama service is active but not "
+                                "answering on the configured URL — check "
+                                "aria.backends in system/config.yml, and "
+                                "that the model is pulled (ollama list)")
+            raise Exception("; ".join(bad) + hint)
+        state["backends_ok"] = True
         return f"all tiers reachable; {h['skills']} skills, " \
                f"agents: {', '.join(h['agents'])}"
     check("backends reachable", c_backends)
+
+    def need_backend():
+        if not state.get("backends_ok"):
+            raise SkipTest("backend down — fix 'backends reachable' first")
 
     def c_capture():
         p = eng.capture_note(TEST_IDEA, source="selftest")
@@ -151,7 +180,41 @@ def main():
                 f"{len(cfg['webhooks'])} webhooks allowlisted")
     check("backends/webhooks config", c_backends_cfg)
 
+    def c_webhook():
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        got = {}
+
+        class R(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                got["body"] = self.rfile.read(
+                    int(self.headers.get("Content-Length") or 0)).decode()
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = HTTPServer(("127.0.0.1", 0), R)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        cfgp = os.path.join(sandbox, "system", "config.yml")
+        with open(cfgp) as f:
+            txt = f.read()
+        with open(cfgp, "w") as f:
+            f.write(txt.replace(
+                "  webhooks:\n",
+                f"  webhooks:\n    selftest-live: http://127.0.0.1:{port}/hook\n"))
+        status = eng.trigger_webhook("selftest-live", "self-test payload")
+        srv.shutdown()
+        assert status == 200, f"receiver answered {status}"
+        assert "self-test payload" in got.get("body", ""), got
+        return "payload delivered to a local receiver (HTTP 200)"
+    check("webhook delivery", c_webhook)
+
     def c_triage():
+        need_backend()
         events = []
         res = eng.triage_run(events.append, files=[str(state["capture"])])
         assert res["failures"] == 0, "triage errored — see engine logs"
@@ -162,6 +225,7 @@ def main():
     check("triage — live model", c_triage)
 
     def c_develop():
+        need_backend()
         # force a known project note so this check is independent of triage
         slug = "selftest-photo-renamer"
         note = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
@@ -220,6 +284,7 @@ def main():
     check("board + ledger", c_board)
 
     def c_chat():
+        need_backend()
         toks = []
         eng.converse([{"role": "user", "content":
                        "in one short sentence, say you are operational"}],
@@ -230,6 +295,7 @@ def main():
     check("chat persona — live model", c_chat)
 
     def c_agent():
+        need_backend()
         agents = eng.list_agents()
         assert agents, "no agents defined in system/agents/"
         toks = []
@@ -265,6 +331,19 @@ def main():
         assert os.path.isfile(crew)
         return "crew.py generated from the plan's team"
     check("crew generation", c_crew)
+
+    def c_handoff():
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        out = subprocess.run(
+            [sys.executable, os.path.join(sandbox, "bin", "aria-handoff"),
+             state["slug"]], capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0, out.stderr.strip()[-200:]
+        sh = os.path.join(sandbox, "pipeline/02-potential-projects",
+                          state["slug"], "openhands.sh")
+        assert os.path.isfile(sh) and os.access(sh, os.X_OK)
+        return "openhands.sh generated (review before running)"
+    check("openhands handoff", c_handoff)
 
     def c_stt():
         try:
