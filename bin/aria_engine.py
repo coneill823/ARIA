@@ -141,7 +141,9 @@ def chat_messages(target, messages, force_json=False, on_token=None):
         headers={"Content-Type": "application/json"},
     )
     parts = []
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    # generous timeout: a larger-than-RAM "giant" model can sit silent for
+    # many minutes processing the prompt before the first token streams
+    with urllib.request.urlopen(req, timeout=3600) as resp:
         for raw in resp:
             raw = raw.strip()
             if not raw:
@@ -170,7 +172,7 @@ def _openai_stream(target, messages, force_json=False, on_token=None):
                  "Authorization": "Bearer " + target.get("key", "local")},
     )
     parts = []
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=3600) as resp:
         for raw in resp:
             raw = raw.strip()
             if not raw.startswith(b"data:"):

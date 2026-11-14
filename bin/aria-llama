@@ -15,14 +15,21 @@
 #           flags: -ngl 999 --n-cpu-moe 8
 #   deep    vendor/models/deep.gguf   — e.g. gpt-oss-120b class (~63GB)
 #           flags: -ngl 999 --n-cpu-moe 30
+#   giant   vendor/models/giant.gguf  — BIGGER THAN RAM (DeepSeek 671B,
+#           Kimi K2 1T...): every expert on CPU, weights mmap-streamed
+#           from NVMe by the OS. Works, but think 0.5-2 tok/s — run it as
+#           the `deep` tier for overnight planning, not chat. Needs the
+#           low-bit "dynamic" quants (see docs/BIG-MODELS.md); for a
+#           multi-part GGUF pass the first part's path to `serve`.
 # Download e.g.:
 #   aria-llama get https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf smart.gguf
 # If VRAM overflows raise the --n-cpu-moe number (env: ARIA_NCPU_MOE);
 # if there's VRAM to spare, lower it for more speed.
 #
-# Simplest alternative (no llama.cpp): let Ollama manage the big models —
+# Simplest alternative (no llama.cpp): let Ollama manage big models —
 #   ollama pull qwen3:30b && ollama pull gpt-oss:120b
-# and set the tiers to ollama/qwen3:30b and ollama/gpt-oss:120b.
+# — but NOT giant ones: Ollama disables mmap on CPU loads, so
+# larger-than-RAM models need this script (or colibri) instead.
 set -euo pipefail
 
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,7 +38,7 @@ MODELS="$ARIA_ROOT/vendor/models"
 PORT="${ARIA_LLAMACPP_PORT:-8080}"
 CTX="${ARIA_LLAMACPP_CTX:-16384}"
 
-usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 server_bin() {
   for b in "$VENDOR/bin/llama-server" "$VENDOR/llama-server" \
@@ -81,14 +88,27 @@ case "$cmd" in
   serve)
     what="${1:-smart}"
     bin="$(server_bin)" || { echo "run 'aria-llama install' first" >&2; exit 1; }
+    giant=0
     case "$what" in
       smart) gguf="$MODELS/smart.gguf"; ncpu="${ARIA_NCPU_MOE:-8}" ;;
       deep)  gguf="$MODELS/deep.gguf";  ncpu="${ARIA_NCPU_MOE:-30}" ;;
+      giant) gguf="${2:-$MODELS/giant.gguf}"; ncpu="${ARIA_NCPU_MOE:-999}"
+             giant=1 ;;
       *)     gguf="$what";              ncpu="${ARIA_NCPU_MOE:-0}" ;;
     esac
     [ -f "$gguf" ] || { echo "model not found: $gguf (use 'aria-llama get …')" >&2; exit 1; }
     moe_flags=""
     [ "$ncpu" -gt 0 ] 2>/dev/null && moe_flags="--n-cpu-moe $ncpu"
+    if [ "$giant" = 1 ]; then
+      # larger-than-RAM: keep mmap ON so the OS streams expert weights
+      # from NVMe; small context + quantized KV cache to save real RAM
+      ctx="${ARIA_LLAMACPP_CTX:-8192}"
+      echo "serving GIANT $(basename "$gguf") on http://127.0.0.1:$PORT"
+      echo "weights stream from disk — expect ~0.5-2 tok/s; first reply is slowest"
+      exec "$bin" -m "$gguf" --host 127.0.0.1 --port "$PORT" \
+        -ngl 999 --n-cpu-moe 999 --ctx-size "$ctx" \
+        --cache-type-k q8_0 --cache-type-v q8_0 --jinja
+    fi
     echo "serving $(basename "$gguf") on http://127.0.0.1:$PORT (OpenAI API)"
     echo "flags: -ngl 999 $moe_flags --ctx-size $CTX"
     exec "$bin" -m "$gguf" --host 127.0.0.1 --port "$PORT" \
