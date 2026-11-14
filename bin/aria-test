@@ -128,8 +128,28 @@ def main():
         if "critic" in agents:
             got = (eng.detect_intent("ask the critic to review it") or {})
             assert got.get("action") == "agent" and got.get("name") == "critic"
-        return f"{len(cases)+1} intents correct"
+        # webhook intents obey the allowlist: unknown name -> plain chat
+        assert eng.detect_intent("trigger not-a-real-hook") is None
+        with open(os.path.join(sandbox, "system", "config.yml")) as f:
+            cfgtext = f.read()
+        with open(os.path.join(sandbox, "system", "config.yml"), "w") as f:
+            f.write(cfgtext.replace(
+                "  webhooks:\n",
+                "  webhooks:\n    selftest-hook: http://127.0.0.1:1/x\n"))
+        got = eng.detect_intent("trigger selftest-hook: hello")
+        assert got and got["action"] == "webhook" \
+            and got["name"] == "selftest-hook", got
+        return f"{len(cases)+3} intents correct (webhook allowlist enforced)"
     check("intent detection (no-LLM)", c_intents)
+
+    def c_backends_cfg():
+        cfg = eng.config()
+        assert "ollama" in cfg["backend_urls"] and "llamacpp" in cfg["backend_urls"]
+        assert isinstance(cfg["webhooks"], dict)
+        assert isinstance(cfg["backend_keys"], dict)
+        return (f"{len(cfg['backend_urls'])} backends, "
+                f"{len(cfg['webhooks'])} webhooks allowlisted")
+    check("backends/webhooks config", c_backends_cfg)
 
     def c_triage():
         events = []

@@ -207,6 +207,17 @@ class Handler(BaseHTTPRequestHandler):
             elif intent and intent["action"] == "drop-skill":
                 emit({"event": "action", "action": "drop-skill",
                       "say": "Skill unloaded."})
+            elif intent and intent["action"] == "webhook":
+                try:
+                    status = eng.trigger_webhook(intent["name"],
+                                                 intent.get("message", ""))
+                    emit({"event": "action", "action": "webhook",
+                          "name": intent["name"],
+                          "say": f"Triggered {intent['name']} — "
+                                 f"it answered {status}."})
+                except Exception as exc:
+                    emit({"event": "action", "action": "webhook",
+                          "say": f"Couldn't trigger {intent['name']}: {exc}"})
             elif intent and intent["action"] == "agent":
                 emit({"event": "action", "action": "agent",
                       "name": intent["name"], "task": intent["task"],

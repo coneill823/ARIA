@@ -27,9 +27,31 @@ aria:
     fast: ollama/llama3.1:8b
     smart: ollama/llama3.1:8b
     deep:
+  # Backends: any name -> base URL. "ollama" speaks Ollama's native API;
+  # every other name is treated as OpenAI-compatible (/v1/chat/completions):
+  # llama.cpp llama-server, LM Studio, vLLM, OmniRoute, colibri (coli serve),
+  # soup serve... If one needs an API key, add it under backend_keys with
+  # the same name (or env ARIA_KEY_<NAME>); keys here are stored in plain
+  # text, so prefer the env var for anything sensitive.
   backends:
     ollama: http://localhost:11434
     llamacpp: http://localhost:8080
+    # omniroute: http://localhost:20128
+    # colibri: http://localhost:8338
+  backend_keys:
+    # omniroute: your-omniroute-key
+
+  # ---- reach: webhooks & monitoring --------------------------------
+  # Webhooks A.R.I.A. is ALLOWED to fire — say "trigger <name>" in chat or
+  # run `aria trigger <name>`. Point these at n8n webhook nodes, Home
+  # Assistant, deploy hooks... She can only ever reach names listed here.
+  webhooks:
+    # morning-digest: http://localhost:5678/webhook/morning-digest
+    # deploy-site: http://localhost:5678/webhook/deploy-site
+
+  # Uptime Kuma "push" monitor URL — pinged after each successful
+  # auto-pipeline pass so your monitoring notices if A.R.I.A. stops.
+  heartbeat_url:
 
   # Legacy single-model keys — still honored as the default for `fast`.
   ollama:

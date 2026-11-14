@@ -353,6 +353,20 @@ aria/
 └── bin/aria                   # capture + headless automation CLI
 ```
 
+## Integrations & reach
+
+A.R.I.A.'s control model is **capability through named allowlists**: she
+can fire the webhooks you list (n8n flows, Home Assistant, deploy hooks —
+"trigger deploy-site" in chat or `aria trigger`), report her health to an
+Uptime Kuma push monitor, run against any OpenAI-compatible backend you
+name (OmniRoute, colibri, soup serve, LM Studio…) with per-backend API
+keys, install skills from multiple repos (`system/skill-sources.txt` —
+Anthropic, prompt-master, Karpathy guidelines, 53 marketing skills), and
+hand a promoted project to OpenHands for autonomous execution
+(`aria handoff <slug>`). No shell access, no arbitrary URLs, server stays
+on 127.0.0.1. Full per-project details and the reasoning:
+**[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
+
 ## Design notes & prior art
 
 - **[open-jarvis/OpenJarvis](https://github.com/open-jarvis/OpenJarvis)** —

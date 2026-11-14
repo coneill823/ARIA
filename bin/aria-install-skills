@@ -1,34 +1,52 @@
 #!/usr/bin/env bash
-# Install Anthropic's public Agent Skills (github.com/anthropics/skills)
-# into this repo so every Claude Code session run from here — including the
-# PMs of promoted projects — can use them (document creation, pdf/docx/pptx/
-# xlsx handling, and the rest of the catalogue).
+# Install Agent Skills from every repo listed in system/skill-sources.txt
+# (Anthropic's official skills, prompt-master, Karpathy guidelines,
+# marketing skills — add your own lines). Each repo is cloned into
+# vendor/ and every folder containing a SKILL.md is linked into
+# .claude/skills/, where Claude Code sessions — and, after
+# `aria skills convert`, A.R.I.A.'s own agents and chat — can use them.
 #
-# Note: skills are executed by Claude Code's agent harness. The local
-# Ollama voice chat can't run them — talk to A.R.I.A. in a `claude` session
-# for skill-powered work.
+# First source wins on name collisions. Re-run any time to update.
 set -euo pipefail
 
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENDOR="$ARIA_ROOT/vendor/anthropic-skills"
+SOURCES="$ARIA_ROOT/system/skill-sources.txt"
 SKILLS="$ARIA_ROOT/.claude/skills"
 
-if [ -d "$VENDOR/.git" ]; then
-  echo "updating existing clone…"
-  git -C "$VENDOR" pull --ff-only
-else
-  mkdir -p "$(dirname "$VENDOR")"
-  git clone --depth 1 https://github.com/anthropics/skills "$VENDOR"
-fi
+mkdir -p "$SKILLS" "$ARIA_ROOT/vendor"
+total=0 repos=0
 
-mkdir -p "$SKILLS"
-count=0
-while IFS= read -r skill_md; do
-  dir="$(dirname "$skill_md")"
-  name="$(basename "$dir")"
-  ln -sfn "$dir" "$SKILLS/$name"
-  count=$((count + 1))
-done < <(find "$VENDOR" -name SKILL.md -not -path '*/.git/*' | sort)
+while IFS= read -r line; do
+  url="$(echo "$line" | sed 's/#.*//' | tr -d '[:space:]')"
+  [ -n "$url" ] || continue
+  name="$(basename "${url%.git}" | tr '[:upper:]' '[:lower:]')"
+  dir="$ARIA_ROOT/vendor/$name"
+  if [ -d "$dir/.git" ]; then
+    echo "updating $name…"
+    git -C "$dir" pull --ff-only -q || echo "  (update failed — keeping current copy)"
+  else
+    echo "cloning $url…"
+    git clone --depth 1 -q "$url" "$dir" || { echo "  clone failed — skipping"; continue; }
+  fi
+  repos=$((repos + 1))
+  count=0
+  while IFS= read -r skill_md; do
+    sdir="$(dirname "$skill_md")"
+    sname="$(basename "$sdir")"
+    # repo root SKILL.md: name the skill after the repo
+    [ "$sdir" = "$dir" ] && sname="$name"
+    if [ -e "$SKILLS/$sname" ] && [ "$(readlink "$SKILLS/$sname" 2>/dev/null)" != "$sdir" ]; then
+      echo "  skip $sname (name already taken by an earlier source)"
+      continue
+    fi
+    ln -sfn "$sdir" "$SKILLS/$sname"
+    count=$((count + 1))
+  done < <(find "$dir" -name SKILL.md -not -path '*/.git/*' | sort)
+  echo "  $count skill(s) from $name"
+  total=$((total + count))
+done < "$SOURCES"
 
-echo "linked $count skills into .claude/skills/"
-echo "available in any Claude Code session run from this repo (try /help)"
+echo
+echo "linked $total skills from $repos source(s) into .claude/skills/"
+echo "next: bin/aria skills convert   (universal pack for agents & chat)"
+echo "available in any Claude Code session run from this repo"

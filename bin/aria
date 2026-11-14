@@ -8,6 +8,8 @@
 #   aria agent <name> "task"   run one agent (role + skills + model tier)
 #   aria skills <cmd>          list|convert|prompt — universal skills pack
 #   aria crew <slug>           generate a CrewAI project for a project
+#   aria handoff <slug>        generate an OpenHands launch script for a project
+#   aria trigger <name> [msg]  fire an allowlisted webhook (n8n, HA, ...)
 #   aria llama <cmd>           llama.cpp Vulkan helper (install|get|serve|service)
 #   aria status                pipeline dashboard        (headless Claude Code)
 #   aria ui [port]             web UI (Claude-style app shell, default :8700)
@@ -27,7 +29,7 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -180,6 +182,22 @@ print()
 
   crew)
     exec python3 "$ARIA_ROOT/bin/aria-crew" "$@"
+    ;;
+
+  handoff)
+    exec python3 "$ARIA_ROOT/bin/aria-handoff" "$@"
+    ;;
+
+  trigger)
+    name="${1:-}"; shift || true
+    [ -n "$name" ] || { echo "usage: aria trigger <webhook-name> [message]" >&2; exit 1; }
+    exec python3 -c "
+import sys
+sys.path.insert(0, '$ARIA_ROOT/bin')
+import aria_engine as eng
+status = eng.trigger_webhook(sys.argv[1], ' '.join(sys.argv[2:]))
+print(f'triggered {sys.argv[1]} -> HTTP {status}')
+" "$name" "$@"
     ;;
 
   llama)

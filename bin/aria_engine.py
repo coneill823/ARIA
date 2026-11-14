@@ -39,6 +39,33 @@ def config():
         m = re.search(rf"^[ \t]*{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$", text, re.M)
         return m.group(1) if m else default
 
+    def block(key):
+        """key: value pairs nested under a `<key>:` heading."""
+        lines = text.splitlines()
+        out = {}
+        for i, ln in enumerate(lines):
+            m = re.match(rf"^([ \t]*){re.escape(key)}:[ \t]*(?:#.*)?$", ln)
+            if not m:
+                continue
+            indent = len(m.group(1))
+            for sub in lines[i + 1:]:
+                if not sub.strip() or sub.lstrip().startswith("#"):
+                    continue
+                sm = re.match(r"^([ \t]*)([\w.-]+):[ \t]*(\S.*?)[ \t]*$", sub)
+                if not sm or len(sm.group(1)) <= indent:
+                    break
+                out[sm.group(2)] = sm.group(3).split(" #")[0].strip()
+            break
+        return out
+
+    backends = {"ollama": "http://localhost:11434",
+                "llamacpp": "http://localhost:8080"}
+    backends.update(block("backends"))
+    if os.environ.get("ARIA_OLLAMA_URL"):
+        backends["ollama"] = os.environ["ARIA_OLLAMA_URL"]
+    if os.environ.get("ARIA_LLAMACPP_URL"):
+        backends["llamacpp"] = os.environ["ARIA_LLAMACPP_URL"]
+
     return {
         "url": os.environ.get(
             "ARIA_OLLAMA_URL", find("base_url", "http://localhost:11434")
@@ -53,14 +80,10 @@ def config():
         "stt_model": find("stt_model", "base"),
         "tiers": {"fast": find("fast", ""), "smart": find("smart", ""),
                   "deep": find("deep", "")},
-        "backend_urls": {
-            "ollama": os.environ.get(
-                "ARIA_OLLAMA_URL", find("ollama", "http://localhost:11434")
-            ).rstrip("/"),
-            "llamacpp": os.environ.get(
-                "ARIA_LLAMACPP_URL", find("llamacpp", "http://localhost:8080")
-            ).rstrip("/"),
-        },
+        "backend_urls": {k: v.rstrip("/") for k, v in backends.items()},
+        "backend_keys": block("backend_keys"),
+        "webhooks": block("webhooks"),
+        "heartbeat_url": find("heartbeat_url", ""),
     }
 
 
@@ -82,11 +105,14 @@ def resolve_tier(tier, cfg=None):
     if not model:  # bare model name means ollama
         backend, model = "ollama", backend
     url = cfg["backend_urls"].get(backend)
-    if url is None:  # unknown backend name — treat it as OpenAI-compatible URL? no: fail soft to legacy
+    if url is None:  # unknown backend name — fail soft to legacy ollama
         return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
                 "tier": tier}
     kind = "ollama" if backend == "ollama" else "openai"
-    return {"kind": kind, "url": url, "model": model, "tier": tier}
+    key = (os.environ.get(f"ARIA_KEY_{backend.upper()}")
+           or cfg["backend_keys"].get(backend) or "local")
+    return {"kind": kind, "url": url, "model": model, "tier": tier,
+            "backend": backend, "key": key}
 
 
 def chat_stream(target, prompt, system=None, force_json=False, on_token=None):
@@ -141,7 +167,7 @@ def _openai_stream(target, messages, force_json=False, on_token=None):
         target["url"].rstrip("/") + "/v1/chat/completions",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer local"},
+                 "Authorization": "Bearer " + target.get("key", "local")},
     )
     parts = []
     with urllib.request.urlopen(req, timeout=600) as resp:
@@ -386,11 +412,43 @@ def triage_run(emit, files=None):
 
 def auto_run(emit, files=None):
     """Capture-to-plan automation: triage, then develop whatever became a
-    project — the 'idea goes in, proposed plan comes out' path."""
+    project — the 'idea goes in, proposed plan comes out' path. Pings the
+    configured heartbeat URL (e.g. an Uptime Kuma push monitor) when a
+    pass completes without failures."""
     result = triage_run(emit, files=files)
     if result["projects"]:
         develop_run(emit, slugs=result["projects"])
+    heartbeat = config()["heartbeat_url"]
+    if heartbeat and not result["failures"]:
+        try:
+            with urllib.request.urlopen(heartbeat, timeout=10):
+                pass
+            emit({"event": "heartbeat",
+                  "log": "heartbeat sent (monitoring knows I'm alive)"})
+        except Exception as exc:
+            emit({"event": "error",
+                  "log": f"heartbeat failed (non-fatal): {exc}"})
     return result
+
+
+# ---------------------------------------------------------------- webhooks
+
+def trigger_webhook(name, message=""):
+    """POST to a webhook from the allowlist in system/config.yml
+    (aria.webhooks). This is A.R.I.A.'s hand into the outside world —
+    n8n flows, Home Assistant, deploy hooks — and she can only reach the
+    ones YOU name there."""
+    cfg = config()
+    url = cfg["webhooks"].get(name)
+    if not url:
+        have = ", ".join(sorted(cfg["webhooks"])) or "none configured"
+        raise ValueError(f"no webhook named '{name}' (configured: {have})")
+    req = urllib.request.Request(
+        url, data=json.dumps({"source": "aria", "webhook": name,
+                              "message": message}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.status
 
 
 # ---------------------------------------------------------------- develop
@@ -716,6 +774,9 @@ INTENT_SKILL_OFF = re.compile(
 INTENT_AGENT = re.compile(
     r"^\s*(?:ask|tell|have|get)\s+(?:the\s+)?(\w[\w-]*)\s+(?:agent\s+)?to\s+(.+)$",
     re.I | re.S)
+INTENT_TRIGGER = re.compile(
+    r"^\s*(?:trigger|fire|run webhook|launch webhook)\s+([\w.-]+)"
+    r"(?:\s*[:,]?\s*(.*))?$", re.I | re.S)
 
 
 def detect_intent(text):
@@ -725,6 +786,10 @@ def detect_intent(text):
         return {"action": "use-skill", "name": m.group(1).lower()}
     if INTENT_SKILL_OFF.match(text):
         return {"action": "drop-skill"}
+    m = INTENT_TRIGGER.match(text)
+    if m and m.group(1).lower() in config()["webhooks"]:
+        return {"action": "webhook", "name": m.group(1).lower(),
+                "message": (m.group(2) or "").strip()}
     m = INTENT_AGENT.match(text)
     if m and m.group(1).lower() in {a["name"] for a in list_agents()}:
         return {"action": "agent", "name": m.group(1).lower(),

@@ -1,0 +1,21 @@
+# Skill sources — one git repo per line; # disables a line.
+# `aria install-skills` clones/updates each into vendor/ and links every
+# folder containing a SKILL.md into .claude/skills/ (first source wins on
+# name collisions). Then `aria skills convert` rebuilds the universal pack.
+
+# Anthropic's official Agent Skills (docx/pdf/pptx/xlsx, design, mcp...)
+https://github.com/anthropics/skills
+
+# Turns rough requests into optimized prompts for any AI tool
+https://github.com/nidhinjs/prompt-master
+
+# Karpathy-derived coding discipline (think first, surgical changes...)
+https://github.com/multica-ai/andrej-karpathy-skills
+
+# 53 marketing skills (copywriting, SEO, launches, pricing, ads...)
+https://github.com/coreyhaines31/marketingskills
+
+# ECC: 300+ engineering skills + 71 agents. HUGE — enable deliberately.
+# In Claude Code it's better installed as a plugin:
+#   /plugin marketplace add https://github.com/affaan-m/ECC
+# https://github.com/affaan-m/ecc
