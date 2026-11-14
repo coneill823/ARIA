@@ -45,8 +45,11 @@ promoted or executed without an approved `requirements.md`.
 
 ```bash
 git clone https://github.com/coneill823/ARIA && cd ARIA
-claude            # start Claude Code; it reads CLAUDE.md and becomes A.R.I.A.
+./install.sh      # desktop app + always-on service + skills, in one shot
 ```
+
+Or piecemeal: `claude` from the repo root starts Claude Code as A.R.I.A.
+with the slash commands below; `bin/aria ui` runs just the web app.
 
 Then drive the pipeline with slash commands:
 
@@ -70,51 +73,118 @@ This writes the inbox note instantly (no LLM call). The other CLI verbs run
 the pipeline stages headlessly, so they work from cron or any automation:
 
 ```bash
-bin/aria triage           # classify the inbox
-bin/aria develop          # turn processing items into proposed plans
-bin/aria auto             # triage + develop in one shot (cron-friendly)
-bin/aria status           # print the pipeline dashboard
-bin/aria ui               # web UI: voice orb + pipeline board
-bin/aria app              # open A.R.I.A. as a desktop app window
-bin/aria install-desktop  # add A.R.I.A. to your application menu
-bin/aria install-skills   # install Anthropic's Agent Skills for Claude Code
-bin/aria doctor           # sanity-check the setup (folders, engine, models)
+bin/aria triage             # classify the inbox
+bin/aria develop            # turn processing items into proposed plans
+bin/aria auto               # triage + develop in one shot
+bin/aria agent critic "..." # run one agent (role + skills + model tier)
+bin/aria skills list        # universal skills pack (convert / prompt too)
+bin/aria crew <slug>        # generate a CrewAI project for a project
+bin/aria llama install      # llama.cpp Vulkan speed path
+bin/aria status             # print the pipeline dashboard
+bin/aria ui                 # the app (Claude-style shell on :8700)
+bin/aria app                # same, in its own desktop window
+bin/aria install-desktop    # add A.R.I.A. to your application menu
+bin/aria install-service    # always-on: server at login + hourly pipeline
+bin/aria install-skills     # install Anthropic's Agent Skills
+bin/aria doctor             # sanity-check the setup
 ```
 
-Example cron ("scheduled agent" mode — see OpenJarvis below):
+### Always-on (recursive) mode
 
-```cron
-# triage the inbox every morning at 7am, develop plans at 7:15
-0 7 * * *  cd /path/to/aria && bin/aria triage
-15 7 * * * cd /path/to/aria && bin/aria develop
-```
+`./install.sh` (or `bin/aria install-service`) installs two systemd user
+units: **aria.service** keeps the server running from login, and
+**aria-auto.timer** runs the pipeline every hour — capture from your phone
+via Obsidian sync or any file drop, and ideas become proposed plans while
+you're away, entirely on your own hardware. Pause with
+`systemctl --user stop aria-auto.timer`.
 
-### The visualization screen — talk to A.R.I.A.
+### The app — a Claude-style shell
 
 ```bash
 bin/aria ui          # -> http://127.0.0.1:8700  (or: bin/aria ui 9000)
 bin/aria app         # same thing in its own desktop app window
 ```
 
-![A.R.I.A. visualization screen](docs/ui-orb.png)
+![A.R.I.A. app shell](docs/ui-shell.png)
 
-The main screen is A.R.I.A. herself: a wireframe network sphere of dots
-that shifts state as she works — slow cyan drift when idle, green and
-breathing with your mic level while listening, an amber swirl while
-thinking, pulsing while speaking. Around it:
+The main screen works like claude.ai: a sidebar with your chat history and
+navigation (Chat / Pipeline board / Agents / Orb focus mode / Settings), a
+centred conversation with A.R.I.A., and a mini orb avatar that shifts state
+as she works. The chat is the whole interface — plain talk, plus:
 
-- **Voice in** — click the mic and talk (browser speech recognition;
-  Chrome/Chromium works best — if the mic button is greyed out your browser
-  doesn't support it, so type instead).
+- **Pipeline commands** — "capture *(idea)*", "run triage", "develop the
+  plans" are detected deterministically and really run; file moves stream
+  into the thread.
+- **Agent handoffs** — "ask the researcher to find competitors for X" runs
+  that agent with its assigned skills and model tier, streaming into an
+  inline card.
+- **Skills** — "use skill internal-comms" loads a converted skill into the
+  conversation (chip shows above the composer; "drop skill" unloads).
+- **Settings** (⚙) — Obsidian vault path, model tiers, auto-pipeline, all
+  without touching YAML.
+
+Chats are stored in your browser only. The full-screen network-sphere
+visualization lives on as **Orb (focus mode)**:
+
+![A.R.I.A. orb focus mode](docs/ui-orb.png)
+
+- **Voice in** — click the mic and talk. Browsers with Web Speech API
+  (Chrome) transcribe natively; browsers without it (**Firefox**) record
+  and transcribe **locally** through faster-whisper
+  (`pip install faster-whisper`, model set by `aria.stt_model`). Nothing
+  leaves your machine either way with whisper.
 - **Voice out** — replies are spoken aloud via your system's speech
   synthesis; the 🔊 button mutes her.
-- **Spoken commands** — "capture *(idea)*", "run triage", "develop the
-  plans" are detected deterministically and actually drive the pipeline;
-  anything else is open conversation with the local model, which always
-  has the current pipeline state in context ("what's waiting on me?").
 - **Desktop app** — `bin/aria install-desktop` puts A.R.I.A. in your app
   menu; launching starts the server if needed and opens a chromeless
   window.
+
+### Agents — roles with assigned skills and models
+
+![A.R.I.A. agents](docs/ui-agents.png)
+
+Agents are plain markdown files in `system/agents/` — frontmatter assigns
+each a **role**, a list of **skills** (from the universal pack below) and a
+**model tier** (fast / smart / deep). Four ship by default: `researcher`,
+`planner`, `critic`, `scribe`. Run them from chat ("ask the critic to…"),
+the Agents page, or the CLI (`bin/aria agent critic "…"`), and add your own
+by dropping another file in the folder. On promotion, each project also
+gets a generated **CrewAI** team (`crew/`) built from its requirements and
+wired to your local model server — `bin/aria crew <slug>` regenerates it.
+
+### Universal skills — Claude skills for any AI
+
+```bash
+bin/aria install-skills    # clone anthropics/skills for Claude Code
+bin/aria skills convert    # -> skills/ pack usable by ANY AI system
+bin/aria skills prompt docx | wl-copy   # paste into anything
+```
+
+The converter turns each Claude skill into `skills/<name>/` with a
+`PROMPT.md` (universal system-prompt form, wording generalised), a
+`manifest.json`, the bundled `resources/`, and a pack-wide `index.json`
+for agent frameworks. Instruction-only skills work everywhere as-is;
+skills marked `requires-code-execution` (docx/pdf/pptx/xlsx…) need
+something that can run their scripts — Claude Code, a CrewAI code tool, or
+you. A.R.I.A.'s own agents and chat load them directly.
+
+### Models — fast, smart, and deep tiers
+
+Every stage picks a tier from `system/config.yml` (editable in ⚙ Settings):
+**fast** (triage, chat), **smart** (plans, agents), **deep** (optional
+heavy thinker; agents opt in with `model: deep`). Each tier is
+`backend/model`, where a backend is Ollama or any OpenAI-compatible server.
+On a 16GB-VRAM / 64GB-RAM box, the private-and-local upgrade path:
+
+```bash
+ollama pull qwen3:30b        # MoE ~30B: near-70B quality, fast   -> smart
+ollama pull gpt-oss:120b     # ~117B MoE, slow but deep           -> deep
+bin/aria llama install       # optional: llama.cpp Vulkan (fastest on AMD)
+```
+
+MoE models keep attention on the GPU and park expert weights in system
+RAM (`--n-cpu-moe` — presets in `bin/aria-llama serve smart|deep`), which
+is what makes 30B fast and ~120B possible on this hardware.
 
 ### The pipeline board — watch A.R.I.A. work
 

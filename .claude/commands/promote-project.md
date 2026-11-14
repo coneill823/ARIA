@@ -35,13 +35,19 @@ Steps:
    unchecked items, phase set to "Not started".
 6. Initialize the project as a git repository (`git init`) unless it's being
    promoted into an existing repo (a parent directory already has `.git`).
-7. Update `pipeline/LEDGER.md`: `status: promoted`, with the new location.
+7. Generate the local-model crew: run `bin/aria-crew $ARGUMENTS` from the
+   aria root. This emits `<target>/$ARGUMENTS/crew/` — a CrewAI project
+   wired to the user's local model server, built from the requirements'
+   Recommended team. If the script fails, say so and continue; it's an
+   optional execution path alongside the Claude Code PM.
+8. Update `pipeline/LEDGER.md`: `status: promoted`, with the new location.
 
 Finish with the handover message:
 
 - where the project now lives
 - the PM team that was created (one line per subagent)
 - next step: `cd <target>/$ARGUMENTS && claude`, then tell the PM
-  "begin execution"
+  "begin execution" — or, for the fully-local path, follow
+  `crew/README.md` to run the CrewAI team on local models
 - reminder that the PM in that directory — not A.R.I.A. — is now the
   interface for this project's whole lifespan.

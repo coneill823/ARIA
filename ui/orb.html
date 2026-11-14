@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A.R.I.A.</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%2345d6ff' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2345d6ff'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #060a10; --panel: #101823; --card: #16202e; --line: #22314a;
+    --text: #d7e2ee; --dim: #7d8fa5; --accent: #45d6ff; --accent-dim: #1b4a5e;
+    --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+    --mono: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text);
+         font: 14px/1.5 system-ui, "Segoe UI", sans-serif;
+         height: 100vh; overflow: hidden;
+         background-image: radial-gradient(rgba(125,143,165,.10) 1px, transparent 1px);
+         background-size: 28px 28px; }
+
+  #orb { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  #top {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+  }
+  #top h1 { font-size: 18px; letter-spacing: 4px; color: var(--accent);
+            text-shadow: 0 0 14px rgba(69,214,255,.45); font-weight: 600; }
+  #top .sub { color: var(--dim); font-size: 12px; }
+  #top .right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+  #health { font-size: 12px; color: var(--dim);
+            display: flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err);
+         box-shadow: 0 0 8px currentColor; }
+  .dot.ok { background: var(--ok); }
+  a.nav { color: var(--accent); font-size: 13px; text-decoration: none;
+          border: 1px solid var(--accent-dim); border-radius: 8px;
+          padding: 6px 12px; background: rgba(16,24,35,.6); }
+  a.nav:hover { filter: brightness(1.3); }
+
+  #state-label {
+    position: absolute; top: 54%; left: 50%; transform: translateX(-50%);
+    color: var(--dim); font-size: 12px; letter-spacing: 3px;
+    text-transform: uppercase; pointer-events: none;
+    padding-top: 24vh;
+  }
+
+  #transcript {
+    position: absolute; left: 18px; bottom: 92px; width: min(430px, 40vw);
+    max-height: 46vh; overflow-y: auto; display: flex;
+    flex-direction: column; gap: 8px; mask-image: linear-gradient(
+      to bottom, transparent, black 24px);
+  }
+  .msg { border-radius: 10px; padding: 8px 12px; font-size: 13px;
+         background: rgba(16,24,35,.82); border: 1px solid var(--line);
+         backdrop-filter: blur(3px); overflow-wrap: anywhere; }
+  .msg.you  { border-color: #2a3a52; color: #b8c8da; }
+  .msg.aria { border-color: var(--accent-dim); }
+  .msg.aria b, .msg.you b { color: var(--accent); font-size: 11px;
+                            letter-spacing: 1.5px; display: block; }
+  .msg.you b { color: var(--dim); }
+  .msg.sys { color: var(--dim); font-size: 12px; background: transparent;
+             border: none; padding: 2px 12px; }
+
+  #bar {
+    position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+    display: flex; gap: 10px; align-items: center; width: min(720px, 92vw);
+  }
+  #say {
+    flex: 1; background: rgba(22,32,46,.9); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px;
+    font: inherit; outline: none; backdrop-filter: blur(3px);
+  }
+  #say:focus { border-color: var(--accent-dim); }
+  button { background: var(--accent-dim); color: var(--accent);
+           border: 1px solid #2a6b85; border-radius: 12px; padding: 11px 16px;
+           font: inherit; cursor: pointer; }
+  button:hover { filter: brightness(1.25); }
+  button:disabled { opacity: .4; cursor: default; }
+  #mic.on { background: #14532d; color: var(--ok); border-color: #1e7a42;
+            box-shadow: 0 0 14px rgba(74,222,128,.35); }
+  #mute.off { color: var(--dim); border-color: var(--line);
+              background: var(--card); }
+</style>
+</head>
+<body>
+<canvas id="orb"></canvas>
+<div id="state-label">idle</div>
+
+<div id="top">
+  <h1>A.R.I.A.</h1>
+  <span class="sub">Autonomous Reasoning &amp; Intelligence Assistant</span>
+  <div class="right">
+    <span id="health"><span class="dot" id="dot"></span><span id="health-txt">checking…</span></span>
+    <a class="nav" href="/">← Chat</a>
+    <a class="nav" href="/board">Board →</a>
+  </div>
+</div>
+
+<div id="transcript"></div>
+
+<div id="bar">
+  <button id="mic" title="hold a conversation — click to listen">🎤</button>
+  <input id="say" placeholder='Talk to A.R.I.A… try "capture an idea", "run triage", or just chat' autocomplete="off">
+  <button id="send">Send</button>
+  <button id="mute" title="voice replies on/off">🔊</button>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+/* ================================================= the orb
+   A sphere of dots (fibonacci lattice) rotating in 3D, projected to 2D.
+   State changes speed, colour, pulse and jitter:
+     idle      slow cyan drift
+     listening green, breathes with your mic level
+     thinking  amber, fast swirl
+     speaking  cyan, pulses with the voice                     */
+const canvas = $('#orb'), ctx = canvas.getContext('2d');
+let W, H; const DPR = Math.min(devicePixelRatio || 1, 2);
+function resize() {
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize);
+
+const N = 520, pts = [];
+for (let i = 0; i < N; i++) {          // fibonacci sphere
+  const y = 1 - (i / (N - 1)) * 2;
+  const r = Math.sqrt(1 - y * y);
+  const th = i * 2.399963229728653;    // golden angle
+  pts.push({ x: Math.cos(th) * r, y, z: Math.sin(th) * r,
+             tw: Math.random() * Math.PI * 2,
+             hub: Math.random() < .06 });   // a few bright "hub" nodes
+}
+// wireframe: link each point to its near neighbours (like the reel's
+// constellation sphere)
+const links = [];
+for (let i = 0; i < N; i++) {
+  for (let j = i + 1; j < N; j++) {
+    const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y,
+          dz = pts[i].z - pts[j].z;
+    if (dx * dx + dy * dy + dz * dz < .026) links.push([i, j]);
+  }
+}
+
+const STATES = {
+  idle:      { speed: .12, color: [69, 214, 255],  pulse: .015, jitter: 0 },
+  listening: { speed: .25, color: [74, 222, 128],  pulse: .05,  jitter: 0 },
+  thinking:  { speed: .95, color: [251, 191, 36],  pulse: .03,  jitter: .012 },
+  speaking:  { speed: .35, color: [69, 214, 255],  pulse: .09,  jitter: .004 },
+};
+let state = 'idle', micLevel = 0, cur = { ...STATES.idle };
+
+function setState(s) {
+  state = s in STATES ? s : 'idle';
+  $('#state-label').textContent = state;
+}
+
+let a1 = 0, a2 = 0, t = 0;
+function frame() {
+  requestAnimationFrame(frame);
+  const tgt = STATES[state];
+  cur.speed += (tgt.speed - cur.speed) * .05;   // ease between states
+  cur.pulse += (tgt.pulse - cur.pulse) * .08;
+  cur.jitter += (tgt.jitter - cur.jitter) * .08;
+  for (let i = 0; i < 3; i++)
+    cur.color[i] += (tgt.color[i] - cur.color[i]) * .06;
+
+  t += .016; a1 += .004 * (1 + cur.speed * 6); a2 += .0017 * (1 + cur.speed * 6);
+  ctx.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+  const base = Math.min(W, H) * .27;
+  const breathe = 1 + Math.sin(t * 2.1) * cur.pulse
+                    + (state === 'listening' ? micLevel * .35 : 0);
+  const R = base * breathe;
+  const [cr, cg, cb] = cur.color.map(Math.round);
+
+  const s1 = Math.sin(a1), c1 = Math.cos(a1), s2 = Math.sin(a2), c2 = Math.cos(a2);
+  const proj = new Array(N);
+  for (let i = 0; i < N; i++) {
+    const p = pts[i];
+    let x = p.x * c1 + p.z * s1, z = -p.x * s1 + p.z * c1, y = p.y;
+    let y2 = y * c2 - z * s2;  z = y * s2 + z * c2;
+    if (cur.jitter) {
+      x += Math.sin(t * 13 + p.tw) * cur.jitter;
+      y2 += Math.cos(t * 11 + p.tw) * cur.jitter;
+    }
+    const persp = 1.6 / (1.6 + z);            // z in [-1,1]
+    proj[i] = { px: cx + x * R * persp, py: cy + y2 * R * persp,
+                depth: (z + 1) / 2 };          // 0 near … 1 far
+  }
+  // wireframe lines first, then nodes on top
+  ctx.lineWidth = .6;
+  for (const [i, j] of links) {
+    const a = proj[i], b = proj[j];
+    const d = (a.depth + b.depth) / 2;
+    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${((1 - d) * .16 + .02).toFixed(3)})`;
+    ctx.beginPath(); ctx.moveTo(a.px, a.py); ctx.lineTo(b.px, b.py); ctx.stroke();
+  }
+  for (let i = 0; i < N; i++) {
+    const p = pts[i], q = proj[i];
+    const twinkle = .75 + Math.sin(t * 3 + p.tw) * .25;
+    const alpha = (0.14 + (1 - q.depth) * .6) * twinkle;
+    const size = ((1 - q.depth) * 2.1 + .4) * (p.hub ? 1.9 : 1);
+    if (p.hub) {  // glowing hub nodes, like the reel
+      ctx.fillStyle = `rgba(${cr},${cg},${cb},${(alpha * .35).toFixed(3)})`;
+      ctx.beginPath(); ctx.arc(q.px, q.py, size * 2.6, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = `rgba(${cr},${cg},${cb},${alpha.toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(q.px, q.py, size, 0, 7); ctx.fill();
+  }
+  // soft core glow
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * .8);
+  g.addColorStop(0, `rgba(${cr},${cg},${cb},.10)`);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+}
+resize(); frame();
+
+/* ================================================= transcript */
+const transcript = $('#transcript');
+function line(cls, who, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  if (who) { const b = document.createElement('b'); b.textContent = who; d.appendChild(b); }
+  d.appendChild(document.createTextNode(text));
+  transcript.appendChild(d);
+  while (transcript.children.length > 40) transcript.firstChild.remove();
+  transcript.scrollTop = transcript.scrollHeight;
+  return d;
+}
+
+/* ================================================= voice out */
+let voiceOn = true, chosenVoice = null;
+function pickVoice() {
+  const vs = speechSynthesis.getVoices();
+  chosenVoice = vs.find(v => /en/i.test(v.lang) && /female|aria|zira|samantha|karen/i.test(v.name))
+             || vs.find(v => /^en/i.test(v.lang)) || vs[0] || null;
+}
+if ('speechSynthesis' in window) {
+  pickVoice(); speechSynthesis.onvoiceschanged = pickVoice;
+}
+function speak(text, done) {
+  if (!voiceOn || !('speechSynthesis' in window) || !text.trim()) { done?.(); return; }
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  if (chosenVoice) u.voice = chosenVoice;
+  u.rate = 1.04; u.pitch = 1.05;
+  u.onstart = () => setState('speaking');
+  u.onend = u.onerror = () => { if (state === 'speaking') setState('idle'); done?.(); };
+  speechSynthesis.speak(u);
+}
+$('#mute').onclick = () => {
+  voiceOn = !voiceOn;
+  $('#mute').textContent = voiceOn ? '🔊' : '🔇';
+  $('#mute').classList.toggle('off', !voiceOn);
+  if (!voiceOn) speechSynthesis?.cancel();
+};
+
+/* ================================================= voice in */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, listening = false, audioCtx = null;
+async function micMeter() {  // orb breathes with your voice
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new AudioContext();
+    const src = audioCtx.createMediaStreamSource(stream);
+    const an = audioCtx.createAnalyser(); an.fftSize = 256;
+    src.connect(an);
+    const buf = new Uint8Array(an.frequencyBinCount);
+    (function loop() {
+      if (!listening) { stream.getTracks().forEach(t => t.stop()); return; }
+      an.getByteFrequencyData(buf);
+      micLevel = buf.reduce((a, b) => a + b, 0) / buf.length / 255;
+      requestAnimationFrame(loop);
+    })();
+  } catch { /* no meter, orb still works */ }
+}
+if (SR) {
+  rec = new SR();
+  rec.lang = navigator.language || 'en-GB';
+  rec.interimResults = true;
+  let interim = null;
+  rec.onresult = e => {
+    let final = '', part = '';
+    for (const r of e.results) (r.isFinal ? final += r[0].transcript : part += r[0].transcript);
+    if (part) { if (!interim) interim = line('sys', '', ''); interim.textContent = '… ' + part; }
+    if (final) { interim?.remove(); interim = null; stopListening(); submit(final.trim()); }
+  };
+  rec.onend = () => { if (listening) stopListening(); };
+  rec.onerror = ev => {
+    stopListening();
+    line('sys', '', 'mic: ' + ev.error + (ev.error === 'not-allowed'
+      ? ' — allow microphone access and try again' : ''));
+  };
+} else {
+  $('#mic').disabled = true;
+  $('#mic').title = 'speech recognition not available in this browser — type instead';
+}
+function startListening() {
+  if (!rec || listening) return;
+  listening = true; setState('listening');
+  $('#mic').classList.add('on');
+  micMeter(); try { rec.start(); } catch {}
+}
+function stopListening() {
+  listening = false; micLevel = 0;
+  $('#mic').classList.remove('on');
+  if (state === 'listening') setState('idle');
+  try { rec.stop(); } catch {}
+}
+$('#mic').onclick = () => listening ? stopListening() : startListening();
+
+/* ================================================= chat */
+const history = [];
+let busy = false;
+
+async function submit(text) {
+  if (!text || busy) return;
+  busy = true; $('#send').disabled = true;
+  line('you', 'YOU', text);
+  history.push({ role: 'user', content: text });
+  setState('thinking');
+  let reply = '';
+  const el = line('aria', 'A.R.I.A.', '');
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({ messages: history.slice(-16) })
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        if (!chunk.startsWith('data: ')) continue;
+        const ev = JSON.parse(chunk.slice(6));
+        if (ev.event === 'token') {
+          reply += ev.text;
+          el.lastChild.textContent = reply;
+          transcript.scrollTop = transcript.scrollHeight;
+        } else if (ev.event === 'action') {
+          reply = ev.say || reply;
+          el.lastChild.textContent = reply;
+          runAction(ev);
+        } else if (ev.event === 'error') {
+          el.lastChild.textContent = reply = '⚠ ' + ev.log;
+        }
+      }
+    }
+  } catch (e) {
+    el.lastChild.textContent = reply = '⚠ can\'t reach A.R.I.A. — is the server running?';
+  }
+  history.push({ role: 'assistant', content: reply });
+  setState('idle');
+  speak(reply);
+  busy = false; $('#send').disabled = false;
+}
+
+function runAction(ev) {
+  // pipeline stages stream on the board page in full detail; here the orb
+  // just shows working state and reports the outcome
+  if (!['triage', 'develop', 'auto'].includes(ev.action)) return;
+  const qs = new URLSearchParams({ stage: ev.action });
+  if (ev.file) qs.set('file', ev.file);
+  setState('thinking');
+  const es = new EventSource('/api/run?' + qs);
+  const sys = line('sys', '', '→ running ' + ev.action + '…');
+  es.onmessage = m => {
+    const e2 = JSON.parse(m.data);
+    if (e2.event === 'moved' || e2.event === 'file_written')
+      line('sys', '', '→ ' + e2.to);
+    if (e2.event === 'done') {
+      es.close(); setState('idle');
+      sys.textContent = '✓ ' + ev.action + ' finished — see the board for details';
+      speak(ev.action + ' finished.');
+    }
+  };
+  es.onerror = () => { es.close(); setState('idle');
+                       sys.textContent = '⚠ ' + ev.action + ' stream ended'; };
+}
+
+$('#send').onclick = () => { const v = $('#say').value.trim(); $('#say').value = ''; submit(v); };
+$('#say').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { const v = $('#say').value.trim(); $('#say').value = ''; submit(v); }
+});
+
+/* ================================================= health */
+async function health() {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    $('#dot').className = 'dot' + (h.ok ? ' ok' : '');
+    $('#health-txt').textContent = h.ok ? `ollama · ${h.model}`
+      : (h.server ? `model ${h.model} missing` : 'ollama unreachable');
+  } catch { $('#health-txt').textContent = 'server unreachable'; }
+}
+health(); setInterval(health, 15000);
+
+line('sys', '', 'A.R.I.A. online. Click the mic and speak, or type below.');
+</script>
+</body>
+</html>

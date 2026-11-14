@@ -50,25 +50,67 @@ def config():
             in ("true", "yes", "on", "1"),
         "obsidian_vault": os.environ.get(
             "ARIA_OBSIDIAN_VAULT", find("obsidian_vault", "")),
+        "stt_model": find("stt_model", "base"),
+        "tiers": {"fast": find("fast", ""), "smart": find("smart", ""),
+                  "deep": find("deep", "")},
+        "backend_urls": {
+            "ollama": os.environ.get(
+                "ARIA_OLLAMA_URL", find("ollama", "http://localhost:11434")
+            ).rstrip("/"),
+            "llamacpp": os.environ.get(
+                "ARIA_LLAMACPP_URL", find("llamacpp", "http://localhost:8080")
+            ).rstrip("/"),
+        },
     }
 
 
-def chat_stream(cfg, prompt, system=None, force_json=False, on_token=None):
+def resolve_tier(tier, cfg=None):
+    """Turn a tier name (fast/smart/deep) into a callable backend target:
+    {"kind": "ollama"|"openai", "url", "model", "tier"}. Unset tiers fall
+    back deep -> smart -> fast -> legacy ollama keys."""
+    cfg = cfg or config()
+    order = {"deep": ("deep", "smart", "fast"),
+             "smart": ("smart", "fast"),
+             "fast": ("fast",)}.get(tier, ("fast",))
+    spec = next((cfg["tiers"][t] for t in order if cfg["tiers"].get(t)), "")
+    if not spec:  # legacy single-model config
+        return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
+                "tier": tier}
+    backend, _, model = spec.partition("/")
+    backend = backend.strip().lower()
+    model = model.strip()
+    if not model:  # bare model name means ollama
+        backend, model = "ollama", backend
+    url = cfg["backend_urls"].get(backend)
+    if url is None:  # unknown backend name — treat it as OpenAI-compatible URL? no: fail soft to legacy
+        return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
+                "tier": tier}
+    kind = "ollama" if backend == "ollama" else "openai"
+    return {"kind": kind, "url": url, "model": model, "tier": tier}
+
+
+def chat_stream(target, prompt, system=None, force_json=False, on_token=None):
     """Single-prompt convenience wrapper around chat_messages."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    return chat_messages(cfg, messages, force_json=force_json, on_token=on_token)
+    return chat_messages(target, messages, force_json=force_json,
+                         on_token=on_token)
 
 
-def chat_messages(cfg, messages, force_json=False, on_token=None):
-    """Call Ollama /api/chat with streaming; returns the full reply text."""
-    body = {"model": cfg["model"], "stream": True, "messages": messages}
+def chat_messages(target, messages, force_json=False, on_token=None):
+    """Stream a chat completion from the target backend; returns the full
+    reply text. `target` comes from resolve_tier() — a legacy config dict
+    (url+model, no kind) is treated as Ollama."""
+    kind = target.get("kind", "ollama")
+    if kind == "openai":
+        return _openai_stream(target, messages, force_json, on_token)
+    body = {"model": target["model"], "stream": True, "messages": messages}
     if force_json:
         body["format"] = "json"
     req = urllib.request.Request(
-        cfg["url"] + "/api/chat",
+        target["url"] + "/api/chat",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -86,6 +128,37 @@ def chat_messages(cfg, messages, force_json=False, on_token=None):
                     on_token(tok)
             if data.get("done"):
                 break
+    return "".join(parts)
+
+
+def _openai_stream(target, messages, force_json=False, on_token=None):
+    """Streaming client for any OpenAI-compatible server (llama.cpp
+    llama-server, LM Studio, vLLM...)."""
+    body = {"model": target["model"], "stream": True, "messages": messages}
+    if force_json:
+        body["response_format"] = {"type": "json_object"}
+    req = urllib.request.Request(
+        target["url"].rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer local"},
+    )
+    parts = []
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        for raw in resp:
+            raw = raw.strip()
+            if not raw.startswith(b"data:"):
+                continue
+            payload = raw[5:].strip()
+            if payload == b"[DONE]":
+                break
+            data = json.loads(payload)
+            choices = data.get("choices") or [{}]
+            tok = (choices[0].get("delta") or {}).get("content") or ""
+            if tok:
+                parts.append(tok)
+                if on_token:
+                    on_token(tok)
     return "".join(parts)
 
 
@@ -202,8 +275,8 @@ Respond with ONLY a JSON object, no other text:
  "reasoning": "<one sentence>", "questions": ["<only when unclear>"]}"""
 
 
-def classify(cfg, body, on_token=None):
-    reply = chat_stream(cfg, "Classify this note:\n\n" + body.strip(),
+def classify(target, body, on_token=None):
+    reply = chat_stream(target, "Classify this note:\n\n" + body.strip(),
                         TRIAGE_SYSTEM, force_json=True, on_token=on_token)
     data = json.loads(reply)
     if data.get("type") not in CATEGORIES:
@@ -214,6 +287,7 @@ def classify(cfg, body, on_token=None):
 
 def triage_run(emit, files=None):
     cfg = config()
+    target = resolve_tier("fast", cfg)
     if files:
         files = [Path(f) if Path(f).is_absolute() else ROOT / f for f in files]
     else:
@@ -225,7 +299,7 @@ def triage_run(emit, files=None):
         return {"failures": 0, "projects": []}
 
     emit({"event": "start", "stage": "triage", "count": len(files),
-          "log": f"triaging {len(files)} inbox note(s) with {cfg['model']}"})
+          "log": f"triaging {len(files)} inbox note(s) with {target['model']}"})
     failures = 0
     projects = []
     for f in files:
@@ -237,7 +311,7 @@ def triage_run(emit, files=None):
               "text": TRIAGE_SYSTEM + "\n\n---\n\nClassify this note:\n\n" + body.strip()})
         emit({"event": "thinking", "label": "classifying"})
         try:
-            result = classify(cfg, body,
+            result = classify(target, body,
                               on_token=lambda t: emit({"event": "token", "text": t}))
         except Exception as exc:  # leave the note untouched on any failure
             emit({"event": "error", "file": f.name,
@@ -355,6 +429,7 @@ RESEARCH_DISCLAIMER = """> **Generated by the local engine (no web access).**
 
 def develop_run(emit, slugs=None):
     cfg = config()
+    target = resolve_tier("smart", cfg)
     files = sorted(p for p in PROCESSING.glob("*.md") if p.name != "README.md")
     if slugs:
         wanted = set(slugs)
@@ -365,7 +440,7 @@ def develop_run(emit, slugs=None):
         return 0
 
     emit({"event": "start", "stage": "develop", "count": len(files),
-          "log": f"developing {len(files)} idea(s) with {cfg['model']}"})
+          "log": f"developing {len(files)} idea(s) with {target['model']}"})
     today = datetime.date.today().isoformat()
     for f in files:
         fm, _, body = parse_note(f)
@@ -379,14 +454,14 @@ def develop_run(emit, slugs=None):
                           + body.strip()})
             emit({"event": "thinking", "label": "drafting proposed plan"})
             plan_body = chat_stream(
-                cfg, "Write the proposed plan for this idea:\n\n" + body.strip(),
+                target, "Write the proposed plan for this idea:\n\n" + body.strip(),
                 PLANNER_SYSTEM,
                 on_token=lambda t: emit({"event": "token", "text": t}))
             emit({"event": "prompt", "label": "research prompt",
                   "text": RESEARCH_PROMPT + body.strip()})
             emit({"event": "thinking", "label": "recalling prior art (unverified — no web access)"})
             research_body = chat_stream(
-                cfg, RESEARCH_PROMPT + body.strip(),
+                target, RESEARCH_PROMPT + body.strip(),
                 on_token=lambda t: emit({"event": "token", "text": t}))
         except Exception as exc:
             emit({"event": "error", "file": f.name,
@@ -398,13 +473,13 @@ def develop_run(emit, slugs=None):
         f.rename(proj / "idea.md")
         (proj / "research.md").write_text(
             f"---\nslug: {slug}\ntype: research\ncreated: {today}\n"
-            f"engine: ollama:{cfg['model']}\n---\n\n{RESEARCH_DISCLAIMER}\n"
+            f"engine: {target['kind']}:{target['model']}\n---\n\n{RESEARCH_DISCLAIMER}\n"
             + research_body.strip() + "\n",
             encoding="utf-8",
         )
         (proj / "proposed-plan.md").write_text(
             f"---\nslug: {slug}\nstatus: proposed\ncreated: {today}\n"
-            f"updated: {today}\nengine: ollama:{cfg['model']}\n---\n\n"
+            f"updated: {today}\nengine: {target['kind']}:{target['model']}\n---\n\n"
             + plan_body.strip() + "\n\n## Review log\n\n"
             "<!-- /review appends decisions here: date — what changed — why -->\n",
             encoding="utf-8",
@@ -634,10 +709,26 @@ INTENT_CAPTURE = re.compile(
 INTENT_TRIAGE = re.compile(r"\b(?:run\s+)?triage\b", re.I)
 INTENT_DEVELOP = re.compile(r"\b(?:run\s+)?develop\b|\bmake (?:the )?plans?\b",
                             re.I)
+INTENT_SKILL_ON = re.compile(
+    r"^\s*(?:use|load|activate)\s+(?:the\s+)?skill\s+([\w-]+)", re.I)
+INTENT_SKILL_OFF = re.compile(
+    r"^\s*(?:drop|unload|clear|deactivate)\s+(?:the\s+)?skill\b", re.I)
+INTENT_AGENT = re.compile(
+    r"^\s*(?:ask|tell|have|get)\s+(?:the\s+)?(\w[\w-]*)\s+(?:agent\s+)?to\s+(.+)$",
+    re.I | re.S)
 
 
 def detect_intent(text):
     """Deterministic spoken-command detection, checked before the LLM."""
+    m = INTENT_SKILL_ON.match(text)
+    if m:
+        return {"action": "use-skill", "name": m.group(1).lower()}
+    if INTENT_SKILL_OFF.match(text):
+        return {"action": "drop-skill"}
+    m = INTENT_AGENT.match(text)
+    if m and m.group(1).lower() in {a["name"] for a in list_agents()}:
+        return {"action": "agent", "name": m.group(1).lower(),
+                "task": m.group(2).strip()}
     m = INTENT_CAPTURE.match(text)
     if m and m.group(1).strip():
         return {"action": "capture", "text": m.group(1).strip()}
@@ -648,22 +739,153 @@ def detect_intent(text):
     return None
 
 
-def converse(messages, on_token=None):
-    """Persona chat over the local model, pipeline state in context."""
+def converse(messages, on_token=None, skill=None):
+    """Persona chat (fast tier). With `skill`, that skill's instructions are
+    loaded into the system prompt so any model — not just Claude — can
+    follow them."""
     cfg = config()
     system = CHAT_SYSTEM.format(summary=board_summary_text())
+    if skill:
+        system += (f"\n\nACTIVE SKILL: {skill}. Follow these skill "
+                   "instructions when they apply (you cannot run scripts "
+                   "or code they mention — say so if asked):\n\n"
+                   + skill_text(skill)[:6000])
     trimmed = [m for m in messages if m.get("role") in ("user", "assistant")
                and isinstance(m.get("content"), str)][-16:]
     return chat_messages(
-        cfg, [{"role": "system", "content": system}] + trimmed,
+        resolve_tier("fast", cfg),
+        [{"role": "system", "content": system}] + trimmed,
         on_token=on_token)
+
+
+# ---------------------------------------------------------------- local STT
+
+_WHISPER = None
+
+
+def transcribe_audio(data, suffix=".webm"):
+    """Local speech-to-text via faster-whisper (optional dependency) —
+    the voice-input path for browsers without Web Speech API (Firefox)."""
+    global _WHISPER
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise RuntimeError(
+            "local speech-to-text needs the faster-whisper package — "
+            "install it with: pip install faster-whisper")
+    if _WHISPER is None:
+        _WHISPER = WhisperModel(config()["stt_model"],
+                                device="cpu", compute_type="int8")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(data)
+        tmp = f.name
+    try:
+        segments, _info = _WHISPER.transcribe(tmp)
+        return " ".join(s.text.strip() for s in segments).strip()
+    finally:
+        os.unlink(tmp)
+
+
+# ---------------------------------------------------------------- skills
+
+def skill_text(name):
+    """Instructions for a named skill: prefers the converted universal pack
+    (skills/<name>/PROMPT.md), falls back to the raw Claude skill."""
+    if not re.fullmatch(r"[\w-]+", name):
+        raise ValueError(f"invalid skill name: {name}")
+    for f in (ROOT / "skills" / name / "PROMPT.md",
+              ROOT / ".claude" / "skills" / name / "SKILL.md"):
+        if f.is_file():
+            return f.read_text(encoding="utf-8")
+    raise ValueError(f"skill not found: {name} — run: aria install-skills "
+                     "then aria skills convert")
+
+
+def list_skill_names():
+    names = set()
+    for base in (ROOT / "skills", ROOT / ".claude" / "skills"):
+        if base.is_dir():
+            for d in base.iterdir():
+                if (d / "PROMPT.md").is_file() or (d / "SKILL.md").is_file():
+                    names.add(d.name)
+    return sorted(names)
+
+
+# ---------------------------------------------------------------- agents
+
+AGENTS_DIR = ROOT / "system" / "agents"
+
+AGENT_HEADER = """You are {name}, a specialist agent inside A.R.I.A., a
+personal idea-to-project system. Work autonomously on the task you are
+given and reply with your finished work product in markdown — no preamble,
+no questions back unless genuinely blocked. You have no internet access and
+cannot run code; reason from the task, your role, and your skills, and flag
+anything that needs verification."""
+
+
+def list_agents():
+    """Agent definitions from system/agents/*.md (frontmatter: name, role,
+    skills, model tier) — editable markdown, CrewAI-shaped on purpose."""
+    agents = []
+    if not AGENTS_DIR.is_dir():
+        return agents
+    for p in sorted(AGENTS_DIR.glob("*.md")):
+        fm, _, body = parse_note(p)
+        skills = [s.strip() for s in
+                  re.split(r"[,\s]+", fm.get("skills", "").strip("[] "))
+                  if s.strip()]
+        agents.append({
+            "name": fm.get("name", p.stem).lower(),
+            "role": fm.get("role", ""),
+            "skills": skills,
+            "model": fm.get("model", "smart"),
+            "body": body.strip(),
+            "path": str(p.relative_to(ROOT)),
+        })
+    return agents
+
+
+def run_agent(name, task, emit):
+    """Run one agent on one task: role + assigned skills + assigned model
+    tier. Streams thinking via emit; returns the agent's reply."""
+    agent = next((a for a in list_agents() if a["name"] == name.lower()), None)
+    if agent is None:
+        raise ValueError(f"no such agent: {name} (defined in system/agents/)")
+    cfg = config()
+    target = resolve_tier(agent["model"] if agent["model"] in
+                          ("fast", "smart", "deep") else "smart", cfg)
+    system = AGENT_HEADER.format(name=agent["name"])
+    if agent["role"]:
+        system += f"\n\nYour role: {agent['role']}"
+    if agent["body"]:
+        system += "\n\n" + agent["body"]
+    loaded = []
+    for sk in agent["skills"]:
+        try:
+            system += (f"\n\n--- SKILL: {sk} ---\n" + skill_text(sk)[:4000])
+            loaded.append(sk)
+        except ValueError:
+            emit({"event": "error",
+                  "log": f"skill '{sk}' not installed — continuing without it"})
+    emit({"event": "start", "stage": "agent", "agent": agent["name"],
+          "log": f"agent {agent['name']} ({target['model']}"
+                 + (f", skills: {', '.join(loaded)}" if loaded else "")
+                 + f") working on: {task[:120]}"})
+    emit({"event": "thinking", "label": f"{agent['name']} thinking"})
+    reply = chat_stream(target, task, system,
+                        on_token=lambda t: emit({"event": "token", "text": t}))
+    emit({"event": "stage_done", "stage": "agent", "agent": agent["name"],
+          "log": f"agent {agent['name']} finished"})
+    return reply
 
 
 # ---------------------------------------------------------------- config edit
 
 def config_set(key, value):
     """Update a single allowed key in system/config.yml in place."""
-    allowed = {"obsidian_vault", "auto_pipeline"}
+    allowed = {"obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
+               "stt_model"}
     if key not in allowed:
         raise ValueError(f"config key not settable: {key}")
     path = ROOT / "system" / "config.yml"
@@ -677,17 +899,45 @@ def config_set(key, value):
     path.write_text(text, encoding="utf-8")
 
 
+def _probe_backend(target):
+    """Is this tier's backend up, and does it have the model (ollama only)?"""
+    try:
+        if target["kind"] == "ollama":
+            with urllib.request.urlopen(target["url"] + "/api/tags",
+                                        timeout=5) as resp:
+                models = [m.get("name", "")
+                          for m in json.load(resp).get("models", [])]
+            ok = any(m == target["model"]
+                     or m.startswith(target["model"] + ":") for m in models)
+            return {"server": True, "ok": ok, "models": models}
+        with urllib.request.urlopen(target["url"] + "/v1/models",
+                                    timeout=5) as resp:
+            resp.read()
+        return {"server": True, "ok": True, "models": []}
+    except Exception as exc:
+        return {"server": False, "ok": False, "error": str(exc)}
+
+
 def health():
     cfg = config()
-    extras = {"auto_pipeline": cfg["auto_pipeline"],
-              "obsidian": bool(cfg["obsidian_vault"])}
-    try:
-        with urllib.request.urlopen(cfg["url"] + "/api/tags", timeout=5) as resp:
-            models = [m.get("name", "") for m in json.load(resp).get("models", [])]
-        model_ok = any(m == cfg["model"] or m.startswith(cfg["model"] + ":")
-                       for m in models)
-        return {"ok": model_ok, "server": True, "model": cfg["model"],
-                "url": cfg["url"], "models": models, **extras}
-    except Exception as exc:
-        return {"ok": False, "server": False, "model": cfg["model"],
-                "url": cfg["url"], "error": str(exc), **extras}
+    tiers = {}
+    probes = {}
+    for tier in ("fast", "smart", "deep"):
+        target = resolve_tier(tier, cfg)
+        key = (target["kind"], target["url"], target["model"])
+        if key not in probes:
+            probes[key] = _probe_backend(target)
+        tiers[tier] = {"backend": target["kind"], "model": target["model"],
+                       "url": target["url"], **{k: v for k, v in
+                       probes[key].items() if k != "models"}}
+    fast = resolve_tier("fast", cfg)
+    fast_probe = probes[(fast["kind"], fast["url"], fast["model"])]
+    return {"ok": fast_probe["ok"], "server": fast_probe["server"],
+            "model": fast["model"], "url": fast["url"],
+            "models": fast_probe.get("models", []),
+            "error": fast_probe.get("error", ""),
+            "tiers": tiers,
+            "auto_pipeline": cfg["auto_pipeline"],
+            "obsidian": bool(cfg["obsidian_vault"]),
+            "skills": len(list_skill_names()),
+            "agents": [a["name"] for a in list_agents()]}

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# aria-llama — llama.cpp (Vulkan) helper for the RX 9070 XT-class setup:
+# llama-server speaks the OpenAI API, so once it's serving a model you just
+# set a tier in system/config.yml, e.g.  smart: llamacpp/qwen3-30b
+#
+#   aria-llama install             fetch a prebuilt Vulkan llama.cpp build
+#   aria-llama get <url> [name]    download a GGUF into vendor/models/
+#                                  (resumes; HuggingFace "resolve" URLs work)
+#   aria-llama serve <preset|gguf> run llama-server on :8080
+#   aria-llama service <preset>    install a systemd user service for it
+#
+# Presets (tuned for 16GB VRAM + 64GB RAM; models are MoE so the expert
+# weights can live in system RAM via --n-cpu-moe):
+#   smart   vendor/models/smart.gguf  — e.g. Qwen3-30B-A3B class (~19GB)
+#           flags: -ngl 999 --n-cpu-moe 8
+#   deep    vendor/models/deep.gguf   — e.g. gpt-oss-120b class (~63GB)
+#           flags: -ngl 999 --n-cpu-moe 30
+# Download e.g.:
+#   aria-llama get https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf smart.gguf
+# If VRAM overflows raise the --n-cpu-moe number (env: ARIA_NCPU_MOE);
+# if there's VRAM to spare, lower it for more speed.
+#
+# Simplest alternative (no llama.cpp): let Ollama manage the big models —
+#   ollama pull qwen3:30b && ollama pull gpt-oss:120b
+# and set the tiers to ollama/qwen3:30b and ollama/gpt-oss:120b.
+set -euo pipefail
+
+ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENDOR="$ARIA_ROOT/vendor/llama.cpp"
+MODELS="$ARIA_ROOT/vendor/models"
+PORT="${ARIA_LLAMACPP_PORT:-8080}"
+CTX="${ARIA_LLAMACPP_CTX:-16384}"
+
+usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+server_bin() {
+  for b in "$VENDOR/bin/llama-server" "$VENDOR/llama-server" \
+           "$(command -v llama-server 2>/dev/null || true)"; do
+    [ -n "$b" ] && [ -x "$b" ] && { echo "$b"; return; }
+  done
+  return 1
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  install)
+    if server_bin >/dev/null 2>&1; then
+      echo "llama-server already available: $(server_bin)"; exit 0
+    fi
+    mkdir -p "$VENDOR"
+    echo "fetching latest llama.cpp Vulkan build…"
+    api="https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+    url="$(curl -fsSL "$api" \
+      | grep -o '"browser_download_url": *"[^"]*ubuntu-vulkan-x64[^"]*"' \
+      | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
+    if [ -z "$url" ]; then
+      echo "could not find a prebuilt Vulkan asset." >&2
+      echo "alternatives: your package manager (AUR: llama.cpp-vulkan)," >&2
+      echo "or build from source: https://github.com/ggml-org/llama.cpp" >&2
+      exit 1
+    fi
+    echo "downloading $url"
+    curl -fL --progress-bar -o "$VENDOR/llama.zip" "$url"
+    (cd "$VENDOR" && unzip -oq llama.zip && rm llama.zip)
+    bin="$(server_bin)" || { echo "unzip finished but llama-server not found" >&2; exit 1; }
+    echo "installed -> $bin"
+    "$bin" --version 2>/dev/null || true
+    echo "note: needs Vulkan drivers (on Arch: vulkan-radeon or amdvlk)"
+    ;;
+
+  get)
+    url="${1:-}"; name="${2:-}"
+    [ -n "$url" ] || { echo "usage: aria-llama get <gguf-url> [saved-name]"; exit 1; }
+    mkdir -p "$MODELS"
+    [ -n "$name" ] || name="$(basename "${url%%\?*}")"
+    echo "downloading to vendor/models/$name (resumable — rerun if interrupted)"
+    curl -fL -C - --progress-bar -o "$MODELS/$name" "$url"
+    echo "done: $MODELS/$name"
+    ;;
+
+  serve)
+    what="${1:-smart}"
+    bin="$(server_bin)" || { echo "run 'aria-llama install' first" >&2; exit 1; }
+    case "$what" in
+      smart) gguf="$MODELS/smart.gguf"; ncpu="${ARIA_NCPU_MOE:-8}" ;;
+      deep)  gguf="$MODELS/deep.gguf";  ncpu="${ARIA_NCPU_MOE:-30}" ;;
+      *)     gguf="$what";              ncpu="${ARIA_NCPU_MOE:-0}" ;;
+    esac
+    [ -f "$gguf" ] || { echo "model not found: $gguf (use 'aria-llama get …')" >&2; exit 1; }
+    moe_flags=""
+    [ "$ncpu" -gt 0 ] 2>/dev/null && moe_flags="--n-cpu-moe $ncpu"
+    echo "serving $(basename "$gguf") on http://127.0.0.1:$PORT (OpenAI API)"
+    echo "flags: -ngl 999 $moe_flags --ctx-size $CTX"
+    exec "$bin" -m "$gguf" --host 127.0.0.1 --port "$PORT" \
+      -ngl 999 $moe_flags --ctx-size "$CTX" --jinja
+    ;;
+
+  service)
+    what="${1:-smart}"
+    server_bin >/dev/null || { echo "run 'aria-llama install' first" >&2; exit 1; }
+    SYSD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$SYSD"
+    cat > "$SYSD/aria-llama.service" <<UNIT
+[Unit]
+Description=A.R.I.A. llama.cpp server ($what)
+
+[Service]
+ExecStart=$ARIA_ROOT/bin/aria-llama serve $what
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now aria-llama.service
+    echo "aria-llama.service enabled (serving '$what' at login)"
+    echo "logs: journalctl --user -u aria-llama -f"
+    ;;
+
+  ""|-h|--help|help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 1 ;;
+esac

@@ -1,16 +1,45 @@
 # A.R.I.A. pipeline configuration
 aria:
   # Which engine bin/aria uses for the automated stages (triage, develop).
-  #   ollama — fully local & private via your Ollama server; great for
-  #            triage, produces *draft* plans without web research
+  #   ollama — fully local & private; great for triage, drafts plans
   #   claude — full capability via headless Claude Code (web research,
   #            subagents)
   # Slash commands inside a Claude Code session always use Claude.
   # Override per-run with the ARIA_ENGINE environment variable.
   engine: ollama
+
+  # ---- model tiers -------------------------------------------------
+  # Each tier is  <backend>/<model>.  Backends are defined below:
+  #   ollama   — Ollama's native API (handles model downloads for you)
+  #   llamacpp — any OpenAI-compatible server (llama.cpp llama-server
+  #              with Vulkan — see bin/aria-llama — LM Studio, vLLM…)
+  # Which tier runs what:
+  #   fast  — triage, voice chat, quick replies
+  #   smart — develop (plans/research) and agents
+  #   deep  — optional heavy thinker for long planning runs; agents can
+  #           request it with  model: deep.  Empty = falls back to smart.
+  # Upgrade path on a 16GB-VRAM / 64GB-RAM box (fully local, private):
+  #   ollama pull qwen3:30b      ->  smart: ollama/qwen3:30b
+  #   ollama pull gpt-oss:120b   ->  deep:  ollama/gpt-oss:120b
+  # Faster still: bin/aria-llama install && bin/aria-llama serve smart,
+  # then                             smart: llamacpp/qwen3-30b
+  models:
+    fast: ollama/llama3.1:8b
+    smart: ollama/llama3.1:8b
+    deep:
+  backends:
+    ollama: http://localhost:11434
+    llamacpp: http://localhost:8080
+
+  # Legacy single-model keys — still honored as the default for `fast`.
   ollama:
     base_url: http://localhost:11434
     model: llama3.1:8b
+
+  # Whisper model for local speech-to-text (voice input on Firefox and
+  # other browsers without Web Speech API). Needs: pip install faster-whisper
+  # Sizes: tiny, base, small, medium (bigger = more accurate, slower).
+  stt_model: base
 
   # When capturing from the web UI, automatically run triage and then
   # develop whatever became a project — idea in, proposed plan out.

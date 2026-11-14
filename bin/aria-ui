@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""A.R.I.A. web UI — a local dashboard for the pipeline that streams the
-engine's thought process (prompts, tokens, decisions, file moves) live.
+"""A.R.I.A. web UI server — Claude-style app shell at /, pipeline board at
+/board, orb focus mode at /orb, agents at /agents.
 
   aria-ui [port]     default port 8700, binds to 127.0.0.1 only
 
 Stdlib only. Endpoints:
-  GET  /              the app (ui/index.html)
+  GET  /  /board  /orb  /agents             the app pages
   GET  /api/board     pipeline state as JSON
-  GET  /api/health    Ollama reachability + model
+  GET  /api/health    backend/tier reachability
+  GET  /api/agents    agent definitions (name, role, skills, model tier)
+  GET  /api/skills    universal skills index
   GET  /api/note?path=<repo-relative .md>   note content
   GET  /api/run?stage=triage|develop|auto   Server-Sent Events stream
        (&file=<inbox note> scopes triage/auto, &slug=<slug> scopes develop)
   POST /api/capture   {"text": "..."} -> new inbox note
   POST /api/refine    {"slug", "feedback"} -> idea goes back to processing
   POST /api/export    {"slug"} -> publish project into the Obsidian vault
+  POST /api/chat      {"messages", "skill"?} -> streamed reply / action
+  POST /api/agent     {"name", "task"} -> streamed agent run
+  POST /api/stt       raw audio body -> {"text"} via local faster-whisper
 """
 
 import json
@@ -27,8 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aria_engine as eng  # noqa: E402
 
 UI_DIR = eng.ROOT / "ui"
-PAGES = {"/": UI_DIR / "index.html", "/board": UI_DIR / "board.html"}
+PAGES = {"/": UI_DIR / "index.html", "/board": UI_DIR / "board.html",
+         "/orb": UI_DIR / "orb.html", "/agents": UI_DIR / "agents.html"}
 RUN_LOCK = threading.Lock()  # one engine run at a time
+AUDIO_SUFFIX = {"audio/webm": ".webm", "audio/ogg": ".ogg",
+                "audio/wav": ".wav", "audio/mp4": ".m4a"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,7 +83,25 @@ class Handler(BaseHTTPRequestHandler):
             cfg = eng.config()
             self.send_json({"obsidian_vault": cfg["obsidian_vault"],
                             "auto_pipeline": cfg["auto_pipeline"],
-                            "model": cfg["model"]})
+                            "model": cfg["model"],
+                            "tiers": {t: (eng.resolve_tier(t, cfg)["kind"]
+                                          + "/" +
+                                          eng.resolve_tier(t, cfg)["model"])
+                                      for t in ("fast", "smart", "deep")},
+                            "stt_model": cfg["stt_model"]})
+        elif url.path == "/api/agents":
+            self.send_json({"agents": [
+                {k: a[k] for k in ("name", "role", "skills", "model", "path")}
+                for a in eng.list_agents()]})
+        elif url.path == "/api/skills":
+            idx = eng.ROOT / "skills" / "index.json"
+            if idx.is_file():
+                self.send_json({"skills":
+                                json.loads(idx.read_text(encoding="utf-8"))})
+            else:
+                self.send_json({"skills": [{"name": n, "description": "",
+                                            "execution": "claude-only"}
+                                           for n in eng.list_skill_names()]})
         elif url.path == "/api/note":
             rel = (query.get("path") or [""])[0]
             target = (eng.ROOT / rel).resolve()
@@ -95,6 +121,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
+        if url.path == "/api/stt":  # raw audio, not JSON
+            try:
+                suffix = AUDIO_SUFFIX.get(
+                    (self.headers.get("Content-Type") or "").split(";")[0],
+                    ".webm")
+                text = eng.transcribe_audio(self.rfile.read(length), suffix)
+                self.send_json({"text": text})
+            except RuntimeError as exc:   # faster-whisper not installed
+                self.send_json({"error": str(exc)}, 501)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
+            return
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
             if url.path == "/api/capture":
@@ -110,7 +148,8 @@ class Handler(BaseHTTPRequestHandler):
                 index = eng.export_obsidian(str(body.get("slug", "")))
                 self.send_json({"ok": True, "path": str(index)})
             elif url.path == "/api/config":
-                for key in ("obsidian_vault", "auto_pipeline"):
+                for key in ("obsidian_vault", "auto_pipeline",
+                            "fast", "smart", "deep", "stt_model"):
                     if key in body:
                         eng.config_set(key, str(body[key]).strip())
                 cfg = eng.config()
@@ -119,6 +158,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "auto_pipeline": cfg["auto_pipeline"]})
             elif url.path == "/api/chat":
                 self.chat(body)
+            elif url.path == "/api/agent":
+                self.agent(body)
             else:
                 self.send_json({"error": "not found"}, 404)
         except Exception as exc:
@@ -153,16 +194,61 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"event": "action",
                       "action": "auto" if auto else "capture",
                       "file": path.name, "say": say})
+            elif intent and intent["action"] == "use-skill":
+                try:
+                    eng.skill_text(intent["name"])  # validates it exists
+                    emit({"event": "action", "action": "use-skill",
+                          "name": intent["name"],
+                          "say": f"Skill {intent['name']} loaded — it stays "
+                                 "active until you say 'drop skill'."})
+                except ValueError as exc:
+                    emit({"event": "action", "action": "drop-skill",
+                          "say": str(exc)})
+            elif intent and intent["action"] == "drop-skill":
+                emit({"event": "action", "action": "drop-skill",
+                      "say": "Skill unloaded."})
+            elif intent and intent["action"] == "agent":
+                emit({"event": "action", "action": "agent",
+                      "name": intent["name"], "task": intent["task"],
+                      "say": f"Passing that to the {intent['name']} agent."})
             elif intent:
                 emit({"event": "action", "action": intent["action"],
                       "say": f"On it — running {intent['action']} now."})
             else:
-                eng.converse(messages,
+                eng.converse(messages, skill=body.get("skill") or None,
                              on_token=lambda t: emit({"event": "token",
                                                       "text": t}))
         except Exception as exc:
             emit({"event": "error", "log": str(exc)})
         emit({"event": "done"})
+
+    def agent(self, body):
+        name = str(body.get("name", "")).strip()
+        task = str(body.get("task", "")).strip()
+        if not name or not task:
+            self.send_json({"error": "name and task required"}, 400)
+            return
+        if not RUN_LOCK.acquire(blocking=False):
+            self.send_json({"error": "a run is already in progress"}, 409)
+            return
+        try:
+            self.send_sse_headers()
+
+            def emit(ev):
+                try:
+                    self.wfile.write(b"data: " + json.dumps(ev).encode()
+                                     + b"\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            try:
+                eng.run_agent(name, task, emit)
+            except Exception as exc:
+                emit({"event": "error", "log": str(exc)})
+            emit({"event": "done"})
+        finally:
+            RUN_LOCK.release()
 
     # ------------------------------------------------------------ engine
 

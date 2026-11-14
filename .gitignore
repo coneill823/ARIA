@@ -6,3 +6,4 @@ Thumbs.db
 __pycache__/
 vendor/
 .claude/skills/
+skills/

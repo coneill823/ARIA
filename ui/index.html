@@ -7,277 +7,341 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%2345d6ff' stroke-width='2'/%3E%3Ccircle cx='8' cy='8' r='2' fill='%2345d6ff'/%3E%3C/svg%3E">
 <style>
   :root {
-    --bg: #060a10; --panel: #101823; --card: #16202e; --line: #22314a;
+    --bg: #0a0f16; --panel: #0d141d; --card: #16202e; --line: #22314a;
     --text: #d7e2ee; --dim: #7d8fa5; --accent: #45d6ff; --accent-dim: #1b4a5e;
     --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
     --mono: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text);
-         font: 14px/1.5 system-ui, "Segoe UI", sans-serif;
-         height: 100vh; overflow: hidden;
-         background-image: radial-gradient(rgba(125,143,165,.10) 1px, transparent 1px);
-         background-size: 28px 28px; }
+         font: 14px/1.6 system-ui, "Segoe UI", sans-serif;
+         height: 100vh; display: flex; overflow: hidden; }
+  button { background: none; border: none; color: inherit; font: inherit;
+           cursor: pointer; }
 
-  #orb { position: absolute; inset: 0; width: 100%; height: 100%; }
-
-  #top {
-    position: absolute; top: 0; left: 0; right: 0;
-    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
-  }
-  #top h1 { font-size: 18px; letter-spacing: 4px; color: var(--accent);
-            text-shadow: 0 0 14px rgba(69,214,255,.45); font-weight: 600; }
-  #top .sub { color: var(--dim); font-size: 12px; }
-  #top .right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
-  #health { font-size: 12px; color: var(--dim);
-            display: flex; align-items: center; gap: 6px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err);
-         box-shadow: 0 0 8px currentColor; }
+  /* ---------------- sidebar ---------------- */
+  #side { width: 258px; flex: none; background: var(--panel);
+          border-right: 1px solid var(--line); display: flex;
+          flex-direction: column; }
+  #brand { display: flex; align-items: center; gap: 10px; padding: 14px 16px; }
+  #brand canvas { width: 30px; height: 30px; }
+  #brand h1 { font-size: 15px; letter-spacing: 3px; color: var(--accent);
+              text-shadow: 0 0 12px rgba(69,214,255,.4); }
+  #new-chat { margin: 2px 12px 10px; padding: 8px 12px; border-radius: 10px;
+              border: 1px solid var(--accent-dim); color: var(--accent);
+              background: rgba(27,74,94,.25); text-align: left; }
+  #new-chat:hover { background: rgba(27,74,94,.5); }
+  nav { padding: 0 8px; }
+  nav a, nav button.navlink {
+    display: flex; gap: 10px; align-items: center; width: 100%;
+    padding: 7px 10px; border-radius: 8px; color: var(--text);
+    text-decoration: none; font-size: 13px; }
+  nav a:hover, nav button.navlink:hover { background: var(--card); }
+  nav .ico { width: 18px; text-align: center; color: var(--dim); }
+  #recents-h { padding: 14px 18px 4px; font-size: 11px; letter-spacing: 1.5px;
+               text-transform: uppercase; color: var(--dim); }
+  #recents { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+  .recent { display: flex; width: 100%; padding: 6px 10px; border-radius: 8px;
+            font-size: 13px; color: var(--dim); text-align: left; gap: 6px; }
+  .recent:hover { background: var(--card); color: var(--text); }
+  .recent.active { background: var(--card); color: var(--text); }
+  .recent span { overflow: hidden; text-overflow: ellipsis;
+                 white-space: nowrap; flex: 1; }
+  .recent .del { opacity: 0; color: var(--dim); }
+  .recent:hover .del { opacity: 1; }
+  #side-foot { padding: 10px 16px; border-top: 1px solid var(--line);
+               font-size: 11.5px; color: var(--dim); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: var(--err); box-shadow: 0 0 6px currentColor;
+         margin-right: 6px; }
   .dot.ok { background: var(--ok); }
-  a.nav { color: var(--accent); font-size: 13px; text-decoration: none;
-          border: 1px solid var(--accent-dim); border-radius: 8px;
-          padding: 6px 12px; background: rgba(16,24,35,.6); }
-  a.nav:hover { filter: brightness(1.3); }
 
-  #state-label {
-    position: absolute; top: 54%; left: 50%; transform: translateX(-50%);
-    color: var(--dim); font-size: 12px; letter-spacing: 3px;
-    text-transform: uppercase; pointer-events: none;
-    padding-top: 24vh;
-  }
+  /* ---------------- main ---------------- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0;
+          background-image: radial-gradient(rgba(125,143,165,.07) 1px, transparent 1px);
+          background-size: 28px 28px; }
+  #thread { flex: 1; overflow-y: auto; }
+  #col { max-width: 780px; margin: 0 auto; padding: 28px 24px 12px; }
+  #greet { text-align: center; margin-top: 16vh; color: var(--dim); }
+  #greet .big { font-size: 26px; color: var(--text); margin-bottom: 8px; }
+  #greet .big em { color: var(--accent); font-style: normal; }
+  .turn { margin-bottom: 20px; }
+  .turn.you { display: flex; justify-content: flex-end; }
+  .turn.you .bubble { background: var(--card); border: 1px solid var(--line);
+                      border-radius: 14px; padding: 10px 14px;
+                      max-width: 82%; white-space: pre-wrap;
+                      overflow-wrap: anywhere; }
+  .turn.aria .who { font-size: 11px; letter-spacing: 2px; color: var(--accent);
+                    margin-bottom: 4px; }
+  .turn.aria .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .turn.sys { color: var(--dim); font-size: 12.5px;
+              font-family: var(--mono); }
+  .agentcard { border: 1px solid var(--accent-dim); border-radius: 10px;
+               background: rgba(14,26,36,.7); padding: 10px 14px;
+               margin-top: 6px; }
+  .agentcard .ah { font-size: 11px; letter-spacing: 2px; color: var(--warn);
+                   margin-bottom: 4px; }
+  .agentcard pre { white-space: pre-wrap; overflow-wrap: anywhere;
+                   font-family: inherit; font-size: 13.5px; }
 
-  #transcript {
-    position: absolute; left: 18px; bottom: 92px; width: min(430px, 40vw);
-    max-height: 46vh; overflow-y: auto; display: flex;
-    flex-direction: column; gap: 8px; mask-image: linear-gradient(
-      to bottom, transparent, black 24px);
-  }
-  .msg { border-radius: 10px; padding: 8px 12px; font-size: 13px;
-         background: rgba(16,24,35,.82); border: 1px solid var(--line);
-         backdrop-filter: blur(3px); overflow-wrap: anywhere; }
-  .msg.you  { border-color: #2a3a52; color: #b8c8da; }
-  .msg.aria { border-color: var(--accent-dim); }
-  .msg.aria b, .msg.you b { color: var(--accent); font-size: 11px;
-                            letter-spacing: 1.5px; display: block; }
-  .msg.you b { color: var(--dim); }
-  .msg.sys { color: var(--dim); font-size: 12px; background: transparent;
-             border: none; padding: 2px 12px; }
+  /* ---------------- composer ---------------- */
+  #composer { flex: none; padding: 10px 24px 18px; }
+  #box { max-width: 780px; margin: 0 auto; background: var(--card);
+         border: 1px solid var(--line); border-radius: 16px;
+         padding: 10px 12px; }
+  #box:focus-within { border-color: var(--accent-dim); }
+  #chips { display: flex; gap: 6px; }
+  .chip { font-size: 11px; color: var(--warn); border: 1px solid #57430e;
+          padding: 1px 8px; border-radius: 99px; margin-bottom: 6px; }
+  #say { width: 100%; background: none; border: none; outline: none;
+         color: var(--text); font: inherit; resize: none; max-height: 160px; }
+  #box-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  #box-row .hint { flex: 1; font-size: 11px; color: var(--dim); }
+  .iconbtn { width: 34px; height: 34px; border-radius: 10px;
+             border: 1px solid var(--line); color: var(--dim);
+             background: var(--panel); }
+  .iconbtn:hover { color: var(--accent); border-color: var(--accent-dim); }
+  #mic.on { color: var(--ok); border-color: #1e7a42;
+            box-shadow: 0 0 12px rgba(74,222,128,.3); }
+  #send { background: var(--accent-dim); color: var(--accent);
+          border: 1px solid #2a6b85; }
+  #send:disabled { opacity: .4; }
 
-  #bar {
-    position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
-    display: flex; gap: 10px; align-items: center; width: min(720px, 92vw);
-  }
-  #say {
-    flex: 1; background: rgba(22,32,46,.9); color: var(--text);
-    border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px;
-    font: inherit; outline: none; backdrop-filter: blur(3px);
-  }
-  #say:focus { border-color: var(--accent-dim); }
-  button { background: var(--accent-dim); color: var(--accent);
-           border: 1px solid #2a6b85; border-radius: 12px; padding: 11px 16px;
-           font: inherit; cursor: pointer; }
-  button:hover { filter: brightness(1.25); }
-  button:disabled { opacity: .4; cursor: default; }
-  #mic.on { background: #14532d; color: var(--ok); border-color: #1e7a42;
-            box-shadow: 0 0 14px rgba(74,222,128,.35); }
-  #mute.off { color: var(--dim); border-color: var(--line);
-              background: var(--card); }
+  /* ---------------- settings modal ---------------- */
+  .overlay { position: fixed; inset: 0; background: rgba(4,8,14,.8);
+             display: none; align-items: center; justify-content: center; }
+  .overlay.open { display: flex; }
+  .overlay .boxm { background: var(--panel); border: 1px solid var(--line);
+                   border-radius: 14px; width: min(560px, 92vw);
+                   max-height: 86vh; overflow-y: auto; padding: 18px 20px; }
+  .boxm h3 { color: var(--accent); font-size: 14px; letter-spacing: 1px;
+             margin-bottom: 14px; }
+  .boxm label { display: block; font-size: 12px; color: var(--dim);
+                margin: 12px 0 4px; }
+  .boxm input[type=text] { width: 100%; background: var(--card);
+      border: 1px solid var(--line); border-radius: 8px; color: var(--text);
+      font: inherit; padding: 8px 10px; outline: none; }
+  .boxm input[type=text]:focus { border-color: var(--accent-dim); }
+  .boxm .row { display: flex; gap: 10px; align-items: center; }
+  .boxm .note { font-size: 11.5px; color: var(--dim); margin-top: 4px; }
+  .boxm .foot { display: flex; justify-content: flex-end; gap: 8px;
+                margin-top: 18px; }
+  .boxm .foot button { padding: 8px 14px; border-radius: 10px;
+      border: 1px solid var(--line); color: var(--dim); }
+  .boxm .foot .primary { background: var(--accent-dim); color: var(--accent);
+      border-color: #2a6b85; }
 </style>
 </head>
 <body>
-<canvas id="orb"></canvas>
-<div id="state-label">idle</div>
 
-<div id="top">
-  <h1>A.R.I.A.</h1>
-  <span class="sub">Autonomous Reasoning &amp; Intelligence Assistant</span>
-  <div class="right">
-    <span id="health"><span class="dot" id="dot"></span><span id="health-txt">checking…</span></span>
-    <a class="nav" href="/board">Pipeline board →</a>
+<aside id="side">
+  <div id="brand"><canvas id="avatar" width="60" height="60"></canvas>
+    <h1>A.R.I.A.</h1></div>
+  <button id="new-chat">＋ &nbsp;New chat</button>
+  <nav>
+    <a href="/"        ><span class="ico">◆</span> Chat</a>
+    <a href="/board"   ><span class="ico">▦</span> Pipeline board</a>
+    <a href="/agents"  ><span class="ico">⬡</span> Agents</a>
+    <a href="/orb"     ><span class="ico">◉</span> Orb (focus mode)</a>
+    <button class="navlink" id="open-settings"><span class="ico">⚙</span> Settings</button>
+  </nav>
+  <div id="recents-h">Recents</div>
+  <div id="recents"></div>
+  <div id="side-foot"><span class="dot" id="dot"></span><span id="health-txt">checking…</span></div>
+</aside>
+
+<main id="main">
+  <div id="thread"><div id="col">
+    <div id="greet">
+      <div class="big">How can <em>A.R.I.A.</em> help today?</div>
+      <div>Capture an idea, run the pipeline, hand a task to an agent —<br>
+      or just talk. Everything runs locally.</div>
+    </div>
+  </div></div>
+  <div id="composer"><div id="box">
+    <div id="chips"></div>
+    <textarea id="say" rows="1"
+      placeholder="Message A.R.I.A…  (“capture …”, “run triage”, “ask the critic to review my plan”, “use skill docx”)"></textarea>
+    <div id="box-row">
+      <span class="hint" id="hint"></span>
+      <button class="iconbtn" id="mic" title="voice input">🎤</button>
+      <button class="iconbtn" id="mute" title="voice replies on/off">🔊</button>
+      <button class="iconbtn" id="send" title="send">↑</button>
+    </div>
+  </div></div>
+</main>
+
+<div class="overlay" id="settings"><div class="boxm">
+  <h3>Settings</h3>
+  <label>Obsidian vault path <span style="color:#46587288">(enables → Obsidian export)</span></label>
+  <input type="text" id="set-vault" placeholder="/home/you/Documents/SecondBrain">
+  <label>Model tiers <span style="color:#46587288">(backend/model — backends: ollama, llamacpp)</span></label>
+  <div class="row"><span style="width:52px;color:var(--dim);font-size:12px">fast</span><input type="text" id="set-fast"></div>
+  <div class="row" style="margin-top:6px"><span style="width:52px;color:var(--dim);font-size:12px">smart</span><input type="text" id="set-smart"></div>
+  <div class="row" style="margin-top:6px"><span style="width:52px;color:var(--dim);font-size:12px">deep</span><input type="text" id="set-deep"></div>
+  <div class="note">Upgrade path: <code>ollama pull qwen3:30b</code> → smart: <code>ollama/qwen3:30b</code>;
+  <code>ollama pull gpt-oss:120b</code> → deep: <code>ollama/gpt-oss:120b</code>.
+  For Vulkan speed see <code>bin/aria-llama</code>.</div>
+  <label>Auto-pipeline <span style="color:#46587288">(triage + develop on every capture)</span></label>
+  <div class="row"><input type="checkbox" id="set-auto"> <span class="note" style="margin:0">idea in → proposed plan out, hands-free</span></div>
+  <div class="foot">
+    <button id="set-cancel">Cancel</button>
+    <button class="primary" id="set-save">Save</button>
   </div>
-</div>
-
-<div id="transcript"></div>
-
-<div id="bar">
-  <button id="mic" title="hold a conversation — click to listen">🎤</button>
-  <input id="say" placeholder='Talk to A.R.I.A… try "capture an idea", "run triage", or just chat' autocomplete="off">
-  <button id="send">Send</button>
-  <button id="mute" title="voice replies on/off">🔊</button>
-</div>
+</div></div>
 
 <script>
 const $ = s => document.querySelector(s);
 
-/* ================================================= the orb
-   A sphere of dots (fibonacci lattice) rotating in 3D, projected to 2D.
-   State changes speed, colour, pulse and jitter:
-     idle      slow cyan drift
-     listening green, breathes with your mic level
-     thinking  amber, fast swirl
-     speaking  cyan, pulses with the voice                     */
-const canvas = $('#orb'), ctx = canvas.getContext('2d');
-let W, H; const DPR = Math.min(devicePixelRatio || 1, 2);
-function resize() {
-  W = canvas.clientWidth; H = canvas.clientHeight;
-  canvas.width = W * DPR; canvas.height = H * DPR;
-  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+/* ============================== mini orb avatar */
+const av = $('#avatar'), actx = av.getContext('2d');
+const AP = []; const AN = 90;
+for (let i = 0; i < AN; i++) {
+  const y = 1 - (i / (AN - 1)) * 2, r = Math.sqrt(1 - y * y),
+        th = i * 2.399963229728653;
+  AP.push({ x: Math.cos(th) * r, y, z: Math.sin(th) * r });
 }
-addEventListener('resize', resize);
+const ACOLORS = { idle: [69,214,255], listening: [74,222,128],
+                  thinking: [251,191,36], speaking: [69,214,255] };
+let state = 'idle', acur = [69,214,255], aa = 0;
+function setState(s) { state = s in ACOLORS ? s : 'idle'; }
+(function aframe() {
+  requestAnimationFrame(aframe);
+  const tgt = ACOLORS[state];
+  for (let i = 0; i < 3; i++) acur[i] += (tgt[i] - acur[i]) * .08;
+  aa += state === 'thinking' ? .06 : state === 'speaking' ? .035 : .012;
+  actx.clearRect(0, 0, 60, 60);
+  const [r, g, b] = acur.map(Math.round);
+  for (const p of AP) {
+    const x = p.x * Math.cos(aa) + p.z * Math.sin(aa);
+    const z = -p.x * Math.sin(aa) + p.z * Math.cos(aa);
+    const persp = 1.6 / (1.6 + z);
+    const alpha = .25 + (1 - (z + 1) / 2) * .65;
+    actx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+    actx.beginPath();
+    actx.arc(30 + x * 24 * persp, 30 + p.y * 24 * persp,
+             (1 - (z + 1) / 2) * 1.6 + .4, 0, 7);
+    actx.fill();
+  }
+})();
 
-const N = 520, pts = [];
-for (let i = 0; i < N; i++) {          // fibonacci sphere
-  const y = 1 - (i / (N - 1)) * 2;
-  const r = Math.sqrt(1 - y * y);
-  const th = i * 2.399963229728653;    // golden angle
-  pts.push({ x: Math.cos(th) * r, y, z: Math.sin(th) * r,
-             tw: Math.random() * Math.PI * 2,
-             hub: Math.random() < .06 });   // a few bright "hub" nodes
+/* ============================== chats (localStorage) */
+let chats = [], current = null;
+try { chats = JSON.parse(localStorage.getItem('aria_chats') || '[]'); } catch {}
+function saveChats() {
+  try { localStorage.setItem('aria_chats', JSON.stringify(chats.slice(0, 30))); }
+  catch {}
 }
-// wireframe: link each point to its near neighbours (like the reel's
-// constellation sphere)
-const links = [];
-for (let i = 0; i < N; i++) {
-  for (let j = i + 1; j < N; j++) {
-    const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y,
-          dz = pts[i].z - pts[j].z;
-    if (dx * dx + dy * dy + dz * dz < .026) links.push([i, j]);
+function newChat() {
+  current = { id: Date.now().toString(36), title: 'New chat',
+              messages: [], skill: null };
+  chats.unshift(current); saveChats(); render(); renderRecents();
+}
+function openChat(id) {
+  const c = chats.find(c => c.id === id);
+  if (c) { current = c; render(); renderRecents(); updateChips(); }
+}
+function renderRecents() {
+  const el = $('#recents'); el.replaceChildren();
+  for (const c of chats) {
+    const b = document.createElement('button');
+    b.className = 'recent' + (current && c.id === current.id ? ' active' : '');
+    const s = document.createElement('span'); s.textContent = c.title;
+    const d = document.createElement('span'); d.className = 'del';
+    d.textContent = '✕';
+    d.onclick = e => { e.stopPropagation();
+      chats = chats.filter(x => x.id !== c.id); saveChats();
+      if (current && current.id === c.id) newChat(); else renderRecents(); };
+    b.append(s, d); b.onclick = () => openChat(c.id);
+    el.appendChild(b);
   }
 }
+$('#new-chat').onclick = newChat;
 
-const STATES = {
-  idle:      { speed: .12, color: [69, 214, 255],  pulse: .015, jitter: 0 },
-  listening: { speed: .25, color: [74, 222, 128],  pulse: .05,  jitter: 0 },
-  thinking:  { speed: .95, color: [251, 191, 36],  pulse: .03,  jitter: .012 },
-  speaking:  { speed: .35, color: [69, 214, 255],  pulse: .09,  jitter: .004 },
-};
-let state = 'idle', micLevel = 0, cur = { ...STATES.idle };
-
-function setState(s) {
-  state = s in STATES ? s : 'idle';
-  $('#state-label').textContent = state;
+/* ============================== thread rendering */
+const col = $('#col'), thread = $('#thread');
+function scrollEnd() { thread.scrollTop = thread.scrollHeight; }
+function el(tag, cls, text) {
+  const d = document.createElement(tag); d.className = cls || '';
+  if (text) d.textContent = text; return d;
 }
-
-let a1 = 0, a2 = 0, t = 0;
-function frame() {
-  requestAnimationFrame(frame);
-  const tgt = STATES[state];
-  cur.speed += (tgt.speed - cur.speed) * .05;   // ease between states
-  cur.pulse += (tgt.pulse - cur.pulse) * .08;
-  cur.jitter += (tgt.jitter - cur.jitter) * .08;
-  for (let i = 0; i < 3; i++)
-    cur.color[i] += (tgt.color[i] - cur.color[i]) * .06;
-
-  t += .016; a1 += .004 * (1 + cur.speed * 6); a2 += .0017 * (1 + cur.speed * 6);
-  ctx.clearRect(0, 0, W, H);
-  const cx = W / 2, cy = H / 2;
-  const base = Math.min(W, H) * .27;
-  const breathe = 1 + Math.sin(t * 2.1) * cur.pulse
-                    + (state === 'listening' ? micLevel * .35 : 0);
-  const R = base * breathe;
-  const [cr, cg, cb] = cur.color.map(Math.round);
-
-  const s1 = Math.sin(a1), c1 = Math.cos(a1), s2 = Math.sin(a2), c2 = Math.cos(a2);
-  const proj = new Array(N);
-  for (let i = 0; i < N; i++) {
-    const p = pts[i];
-    let x = p.x * c1 + p.z * s1, z = -p.x * s1 + p.z * c1, y = p.y;
-    let y2 = y * c2 - z * s2;  z = y * s2 + z * c2;
-    if (cur.jitter) {
-      x += Math.sin(t * 13 + p.tw) * cur.jitter;
-      y2 += Math.cos(t * 11 + p.tw) * cur.jitter;
-    }
-    const persp = 1.6 / (1.6 + z);            // z in [-1,1]
-    proj[i] = { px: cx + x * R * persp, py: cy + y2 * R * persp,
-                depth: (z + 1) / 2 };          // 0 near … 1 far
-  }
-  // wireframe lines first, then nodes on top
-  ctx.lineWidth = .6;
-  for (const [i, j] of links) {
-    const a = proj[i], b = proj[j];
-    const d = (a.depth + b.depth) / 2;
-    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${((1 - d) * .16 + .02).toFixed(3)})`;
-    ctx.beginPath(); ctx.moveTo(a.px, a.py); ctx.lineTo(b.px, b.py); ctx.stroke();
-  }
-  for (let i = 0; i < N; i++) {
-    const p = pts[i], q = proj[i];
-    const twinkle = .75 + Math.sin(t * 3 + p.tw) * .25;
-    const alpha = (0.14 + (1 - q.depth) * .6) * twinkle;
-    const size = ((1 - q.depth) * 2.1 + .4) * (p.hub ? 1.9 : 1);
-    if (p.hub) {  // glowing hub nodes, like the reel
-      ctx.fillStyle = `rgba(${cr},${cg},${cb},${(alpha * .35).toFixed(3)})`;
-      ctx.beginPath(); ctx.arc(q.px, q.py, size * 2.6, 0, 7); ctx.fill();
-    }
-    ctx.fillStyle = `rgba(${cr},${cg},${cb},${alpha.toFixed(3)})`;
-    ctx.beginPath(); ctx.arc(q.px, q.py, size, 0, 7); ctx.fill();
-  }
-  // soft core glow
-  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * .8);
-  g.addColorStop(0, `rgba(${cr},${cg},${cb},.10)`);
-  g.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = g; ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+function addYou(text) {
+  $('#greet')?.remove();
+  const t = el('div', 'turn you'); t.appendChild(el('div', 'bubble', text));
+  col.appendChild(t); scrollEnd();
 }
-resize(); frame();
-
-/* ================================================= transcript */
-const transcript = $('#transcript');
-function line(cls, who, text) {
-  const d = document.createElement('div');
-  d.className = 'msg ' + cls;
-  if (who) { const b = document.createElement('b'); b.textContent = who; d.appendChild(b); }
-  d.appendChild(document.createTextNode(text));
-  transcript.appendChild(d);
-  while (transcript.children.length > 40) transcript.firstChild.remove();
-  transcript.scrollTop = transcript.scrollHeight;
+function addAria() {
+  $('#greet')?.remove();
+  const t = el('div', 'turn aria');
+  t.appendChild(el('div', 'who', 'A.R.I.A.'));
+  const b = el('div', 'body'); t.appendChild(b);
+  col.appendChild(t); scrollEnd(); return b;
+}
+function addSys(text) {
+  $('#greet')?.remove();
+  const d = el('div', 'turn sys', text); col.appendChild(d); scrollEnd();
   return d;
 }
+function addAgentCard(name) {
+  $('#greet')?.remove();
+  const c = el('div', 'agentcard');
+  c.appendChild(el('div', 'ah', '⬡ ' + name + ' — working'));
+  const p = el('pre'); c.appendChild(p);
+  col.appendChild(c); scrollEnd(); return { card: c, pre: p };
+}
+function render() {
+  col.replaceChildren();
+  if (!current || !current.messages.length) {
+    const g = el('div', '', ''); g.id = 'greet';
+    g.innerHTML = '<div class="big">How can <em>A.R.I.A.</em> help today?</div>' +
+      '<div>Capture an idea, run the pipeline, hand a task to an agent —<br>or just talk. Everything runs locally.</div>';
+    col.appendChild(g); return;
+  }
+  for (const m of current.messages) {
+    if (m.role === 'user') addYou(m.content);
+    else if (m.role === 'assistant') addAria().textContent = m.content;
+    else if (m.role === 'agent') {
+      const { card, pre } = addAgentCard(m.name);
+      card.querySelector('.ah').textContent = '⬡ ' + m.name + ' — done';
+      pre.textContent = m.content;
+    } else addSys(m.content);
+  }
+}
+function updateChips() {
+  const el2 = $('#chips'); el2.replaceChildren();
+  if (current && current.skill) {
+    const c = el('span', 'chip', 'skill: ' + current.skill);
+    el2.appendChild(c);
+  }
+}
 
-/* ================================================= voice out */
+/* ============================== voice out */
 let voiceOn = true, chosenVoice = null;
 function pickVoice() {
   const vs = speechSynthesis.getVoices();
   chosenVoice = vs.find(v => /en/i.test(v.lang) && /female|aria|zira|samantha|karen/i.test(v.name))
              || vs.find(v => /^en/i.test(v.lang)) || vs[0] || null;
 }
-if ('speechSynthesis' in window) {
-  pickVoice(); speechSynthesis.onvoiceschanged = pickVoice;
-}
-function speak(text, done) {
-  if (!voiceOn || !('speechSynthesis' in window) || !text.trim()) { done?.(); return; }
+if ('speechSynthesis' in window) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
+function speak(text) {
+  if (!voiceOn || !('speechSynthesis' in window) || !text.trim()) return;
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   if (chosenVoice) u.voice = chosenVoice;
   u.rate = 1.04; u.pitch = 1.05;
   u.onstart = () => setState('speaking');
-  u.onend = u.onerror = () => { if (state === 'speaking') setState('idle'); done?.(); };
+  u.onend = u.onerror = () => { if (state === 'speaking') setState('idle'); };
   speechSynthesis.speak(u);
 }
 $('#mute').onclick = () => {
   voiceOn = !voiceOn;
   $('#mute').textContent = voiceOn ? '🔊' : '🔇';
-  $('#mute').classList.toggle('off', !voiceOn);
   if (!voiceOn) speechSynthesis?.cancel();
 };
 
-/* ================================================= voice in */
+/* ============================== voice in: Web Speech OR recorder+whisper */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, listening = false, audioCtx = null;
-async function micMeter() {  // orb breathes with your voice
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioCtx = new AudioContext();
-    const src = audioCtx.createMediaStreamSource(stream);
-    const an = audioCtx.createAnalyser(); an.fftSize = 256;
-    src.connect(an);
-    const buf = new Uint8Array(an.frequencyBinCount);
-    (function loop() {
-      if (!listening) { stream.getTracks().forEach(t => t.stop()); return; }
-      an.getByteFrequencyData(buf);
-      micLevel = buf.reduce((a, b) => a + b, 0) / buf.length / 255;
-      requestAnimationFrame(loop);
-    })();
-  } catch { /* no meter, orb still works */ }
-}
+let listening = false, rec = null, mediaRec = null;
 if (SR) {
   rec = new SR();
   rec.lang = navigator.language || 'en-GB';
@@ -286,53 +350,77 @@ if (SR) {
   rec.onresult = e => {
     let final = '', part = '';
     for (const r of e.results) (r.isFinal ? final += r[0].transcript : part += r[0].transcript);
-    if (part) { if (!interim) interim = line('sys', '', ''); interim.textContent = '… ' + part; }
+    if (part) { if (!interim) interim = addSys(''); interim.textContent = '… ' + part; }
     if (final) { interim?.remove(); interim = null; stopListening(); submit(final.trim()); }
   };
   rec.onend = () => { if (listening) stopListening(); };
-  rec.onerror = ev => {
-    stopListening();
-    line('sys', '', 'mic: ' + ev.error + (ev.error === 'not-allowed'
-      ? ' — allow microphone access and try again' : ''));
-  };
-} else {
+  rec.onerror = ev => { stopListening(); addSys('mic: ' + ev.error); };
+} else if (!navigator.mediaDevices) {
   $('#mic').disabled = true;
-  $('#mic').title = 'speech recognition not available in this browser — type instead';
+  $('#mic').title = 'no microphone access in this browser';
+}
+async function startRecorder() {   // Firefox path: record -> local whisper
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm'
+             : 'audio/ogg';
+  const chunks = [];
+  mediaRec = new MediaRecorder(stream, { mimeType: mime });
+  mediaRec.ondataavailable = e => chunks.push(e.data);
+  mediaRec.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    setState('thinking');
+    const note = addSys('… transcribing locally');
+    try {
+      const r = await fetch('/api/stt', { method: 'POST',
+        headers: { 'Content-Type': mime },
+        body: new Blob(chunks, { type: mime }) });
+      const j = await r.json();
+      note.remove();
+      if (r.ok && j.text) submit(j.text);
+      else { addSys('voice: ' + (j.error || 'no speech detected'));
+             setState('idle'); }
+    } catch { note.textContent = 'voice: transcription failed'; setState('idle'); }
+  };
+  mediaRec.start();
 }
 function startListening() {
-  if (!rec || listening) return;
-  listening = true; setState('listening');
-  $('#mic').classList.add('on');
-  micMeter(); try { rec.start(); } catch {}
+  if (listening) return;
+  listening = true; setState('listening'); $('#mic').classList.add('on');
+  if (rec) { try { rec.start(); } catch {} }
+  else startRecorder().catch(e => { stopListening(); addSys('mic: ' + e.message); });
 }
 function stopListening() {
-  listening = false; micLevel = 0;
-  $('#mic').classList.remove('on');
+  listening = false; $('#mic').classList.remove('on');
   if (state === 'listening') setState('idle');
-  try { rec.stop(); } catch {}
+  if (rec) { try { rec.stop(); } catch {} }
+  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
 }
 $('#mic').onclick = () => listening ? stopListening() : startListening();
+$('#hint').textContent = SR ? '' :
+  'voice input runs locally via whisper — click 🎤, speak, click again to stop';
 
-/* ================================================= chat */
-const history = [];
+/* ============================== chat */
 let busy = false;
-
 async function submit(text) {
   if (!text || busy) return;
+  if (!current) newChat();
   busy = true; $('#send').disabled = true;
-  line('you', 'YOU', text);
-  history.push({ role: 'user', content: text });
+  if (current.messages.length === 0) {
+    current.title = text.slice(0, 42) + (text.length > 42 ? '…' : '');
+    renderRecents();
+  }
+  addYou(text);
+  current.messages.push({ role: 'user', content: text });
   setState('thinking');
   let reply = '';
-  const el = line('aria', 'A.R.I.A.', '');
+  const body = addAria();
   try {
-    const resp = await fetch('/api/chat', {
-      method: 'POST',
-      body: JSON.stringify({ messages: history.slice(-16) })
-    });
+    const resp = await fetch('/api/chat', { method: 'POST',
+      body: JSON.stringify({
+        messages: current.messages.filter(m => m.role === 'user' || m.role === 'assistant').slice(-16),
+        skill: current.skill || undefined }) });
     const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
+    const dec = new TextDecoder(); let buf = '';
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -343,67 +431,145 @@ async function submit(text) {
         if (!chunk.startsWith('data: ')) continue;
         const ev = JSON.parse(chunk.slice(6));
         if (ev.event === 'token') {
-          reply += ev.text;
-          el.lastChild.textContent = reply;
-          transcript.scrollTop = transcript.scrollHeight;
+          reply += ev.text; body.textContent = reply; scrollEnd();
         } else if (ev.event === 'action') {
-          reply = ev.say || reply;
-          el.lastChild.textContent = reply;
-          runAction(ev);
+          reply = ev.say || reply; body.textContent = reply;
+          handleAction(ev);
         } else if (ev.event === 'error') {
-          el.lastChild.textContent = reply = '⚠ ' + ev.log;
+          reply = '⚠ ' + ev.log; body.textContent = reply;
         }
       }
     }
-  } catch (e) {
-    el.lastChild.textContent = reply = '⚠ can\'t reach A.R.I.A. — is the server running?';
+  } catch {
+    reply = '⚠ can\'t reach the A.R.I.A. server';
+    body.textContent = reply;
   }
-  history.push({ role: 'assistant', content: reply });
-  setState('idle');
-  speak(reply);
+  current.messages.push({ role: 'assistant', content: reply });
+  saveChats(); setState('idle'); speak(reply);
   busy = false; $('#send').disabled = false;
 }
 
-function runAction(ev) {
-  // pipeline stages stream on the board page in full detail; here the orb
-  // just shows working state and reports the outcome
+function handleAction(ev) {
+  if (ev.action === 'use-skill' && ev.name) {
+    current.skill = ev.name; updateChips(); saveChats(); return;
+  }
+  if (ev.action === 'drop-skill') {
+    current.skill = null; updateChips(); saveChats(); return;
+  }
+  if (ev.action === 'agent') { runAgent(ev.name, ev.task); return; }
   if (!['triage', 'develop', 'auto'].includes(ev.action)) return;
   const qs = new URLSearchParams({ stage: ev.action });
   if (ev.file) qs.set('file', ev.file);
   setState('thinking');
   const es = new EventSource('/api/run?' + qs);
-  const sys = line('sys', '', '→ running ' + ev.action + '…');
+  const sys = addSys('→ running ' + ev.action + '…');
   es.onmessage = m => {
     const e2 = JSON.parse(m.data);
-    if (e2.event === 'moved' || e2.event === 'file_written')
-      line('sys', '', '→ ' + e2.to);
+    if (e2.event === 'moved' || e2.event === 'file_written') addSys('→ ' + e2.to);
     if (e2.event === 'done') {
       es.close(); setState('idle');
-      sys.textContent = '✓ ' + ev.action + ' finished — see the board for details';
-      speak(ev.action + ' finished.');
+      sys.textContent = '✓ ' + ev.action + ' finished — details on the board';
+      current.messages.push({ role: 'sys',
+        content: '✓ ' + ev.action + ' finished' });
+      saveChats(); speak(ev.action + ' finished.');
     }
   };
   es.onerror = () => { es.close(); setState('idle');
                        sys.textContent = '⚠ ' + ev.action + ' stream ended'; };
 }
 
-$('#send').onclick = () => { const v = $('#say').value.trim(); $('#say').value = ''; submit(v); };
-$('#say').addEventListener('keydown', e => {
-  if (e.key === 'Enter') { const v = $('#say').value.trim(); $('#say').value = ''; submit(v); }
-});
+async function runAgent(name, task) {
+  setState('thinking');
+  const { card, pre } = addAgentCard(name);
+  let out = '';
+  try {
+    const resp = await fetch('/api/agent', { method: 'POST',
+      body: JSON.stringify({ name, task }) });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        if (!chunk.startsWith('data: ')) continue;
+        const ev = JSON.parse(chunk.slice(6));
+        if (ev.event === 'token') { out += ev.text; pre.textContent = out; scrollEnd(); }
+        if (ev.event === 'error') { out += '\n⚠ ' + ev.log; pre.textContent = out; }
+      }
+    }
+  } catch { out += '\n⚠ agent stream failed'; pre.textContent = out; }
+  card.querySelector('.ah').textContent = '⬡ ' + name + ' — done';
+  current.messages.push({ role: 'agent', name, content: out });
+  saveChats(); setState('idle');
+  speak('The ' + name + ' is done.');
+}
 
-/* ================================================= health */
+/* ============================== composer */
+const say = $('#say');
+say.addEventListener('input', () => {
+  say.style.height = 'auto'; say.style.height = say.scrollHeight + 'px';
+});
+say.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const v = say.value.trim(); say.value = ''; say.style.height = 'auto';
+    submit(v);
+  }
+});
+$('#send').onclick = () => {
+  const v = say.value.trim(); say.value = ''; say.style.height = 'auto';
+  submit(v);
+};
+
+/* ============================== settings */
+$('#open-settings').onclick = async () => {
+  const c = await (await fetch('/api/config')).json();
+  $('#set-vault').value = c.obsidian_vault || '';
+  $('#set-fast').value = (c.tiers && c.tiers.fast) || '';
+  $('#set-smart').value = (c.tiers && c.tiers.smart) || '';
+  $('#set-deep').value = (c.tiers && c.tiers.deep) || '';
+  $('#set-auto').checked = !!c.auto_pipeline;
+  $('#settings').classList.add('open');
+};
+$('#set-cancel').onclick = () => $('#settings').classList.remove('open');
+$('#settings').onclick = e => {
+  if (e.target.id === 'settings') $('#settings').classList.remove('open');
+};
+$('#set-save').onclick = async () => {
+  const body = { obsidian_vault: $('#set-vault').value.trim(),
+                 auto_pipeline: $('#set-auto').checked ? 'true' : 'false' };
+  for (const t of ['fast', 'smart', 'deep']) {
+    const v = $('#set-' + t).value.trim();
+    body[t] = v.replace(/^openai\//, 'llamacpp/');
+  }
+  const r = await fetch('/api/config', { method: 'POST',
+                                         body: JSON.stringify(body) });
+  $('#settings').classList.remove('open');
+  addSys(r.ok ? '⚙ settings saved' : '⚠ settings not saved');
+  health();
+};
+
+/* ============================== health */
 async function health() {
   try {
     const h = await (await fetch('/api/health')).json();
     $('#dot').className = 'dot' + (h.ok ? ' ok' : '');
-    $('#health-txt').textContent = h.ok ? `ollama · ${h.model}`
-      : (h.server ? `model ${h.model} missing` : 'ollama unreachable');
+    const smart = h.tiers && h.tiers.smart;
+    $('#health-txt').textContent = h.ok
+      ? h.model + (smart && smart.model !== h.model ? ' · ' + smart.model : '')
+        + (h.auto_pipeline ? ' · auto' : '')
+      : (h.server ? 'model missing' : 'engine offline');
   } catch { $('#health-txt').textContent = 'server unreachable'; }
 }
 health(); setInterval(health, 15000);
 
-line('sys', '', 'A.R.I.A. online. Click the mic and speak, or type below.');
+/* ============================== boot */
+if (chats.length) { current = chats[0]; render(); updateChips(); }
+else newChat();
+renderRecents();
 </script>
 </body>
 </html>

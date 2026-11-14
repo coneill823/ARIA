@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""aria-skills — convert Claude Agent Skills into a universal skills pack
+usable by ANY AI system (A.R.I.A.'s local agents, ChatGPT, Gemini, CrewAI,
+LangChain... anything that takes a system prompt or instructions file).
+
+  aria-skills list               skills found (converted pack + raw Claude)
+  aria-skills convert            build skills/ from .claude/skills/*
+  aria-skills prompt <name>      print a skill's universal prompt (pipe it
+                                 anywhere: into another model, a crew, ...)
+
+What convert produces, per skill, in skills/<name>/:
+  PROMPT.md        the skill as a plain system-prompt block: a universal
+                   header, then the original instructions with
+                   Claude-specific wording lightly generalised
+  manifest.json    name, description, execution needs, resource list
+  resources/       the skill's bundled files (scripts, templates, refs)
+plus a top-level skills/index.json and skills/README.md.
+
+Skills whose power comes from bundled scripts (docx/pdf/pptx/xlsx...) are
+marked "requires-code-execution": a chat-only model can follow their
+guidance but something must run the scripts (a human, an agent harness, a
+CrewAI code tool). Instruction-only skills work everywhere as-is.
+"""
+
+import json
+import re
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / ".claude" / "skills"
+OUT = ROOT / "skills"
+
+UNIVERSAL_HEADER = """<!-- Universal skill converted from Anthropic's Agent
+Skills (github.com/anthropics/skills) by A.R.I.A. Use it with any AI
+system: paste this file as (part of) the system prompt, or attach it as
+instructions. Files it references live in ./resources/ next to this file.
+If the instructions tell "the assistant" to run scripts or code, your AI
+needs a code-execution tool (or a human) to do that part. -->
+
+"""
+
+# light-touch generalisation — wording only, never structure
+REPLACEMENTS = [
+    (re.compile(r"Claude Code", re.I), "the AI coding agent"),
+    (re.compile(r"\bClaude\.ai\b", re.I), "the AI platform"),
+    (re.compile(r"\bClaude\b"), "the assistant"),
+]
+
+
+def parse_skill(skill_md):
+    text = skill_md.read_text(encoding="utf-8")
+    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+    meta, body = ({}, text) if not m else (
+        dict(re.findall(r"^([\w-]+):[ \t]*(.*)$", m.group(1), re.M)),
+        m.group(2))
+    return meta, body.strip()
+
+
+def generalise(body):
+    for pattern, repl in REPLACEMENTS:
+        body = pattern.sub(repl, body)
+    return body
+
+
+def skill_dirs():
+    if not SRC.is_dir():
+        return []
+    return sorted(d for d in SRC.iterdir()
+                  if (d.resolve() / "SKILL.md").is_file())
+
+
+def convert():
+    dirs = skill_dirs()
+    if not dirs:
+        print("no Claude skills found — run: aria install-skills")
+        return 1
+    OUT.mkdir(exist_ok=True)
+    index = []
+    for d in dirs:
+        src = d.resolve()
+        meta, body = parse_skill(src / "SKILL.md")
+        name = d.name
+        dest = OUT / name
+        dest.mkdir(exist_ok=True)
+
+        resources = []
+        res_dest = dest / "resources"
+        if res_dest.exists():
+            shutil.rmtree(res_dest)
+        for f in sorted(src.rglob("*")):
+            if f.is_file() and f.name != "SKILL.md":
+                rel = f.relative_to(src)
+                target = res_dest / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+                resources.append(str(rel))
+
+        needs_exec = any(r.endswith((".py", ".sh", ".js", ".ts"))
+                         for r in resources)
+        execution = "requires-code-execution" if needs_exec \
+            else "instructions-only"
+
+        title = meta.get("name", name)
+        description = generalise(meta.get("description", ""))
+        (dest / "PROMPT.md").write_text(
+            UNIVERSAL_HEADER
+            + f"# Skill: {title}\n\n"
+            + (f"**When to use it:** {description}\n\n" if description else "")
+            + f"**Execution:** {execution}\n\n---\n\n"
+            + generalise(body) + "\n",
+            encoding="utf-8")
+        manifest = {"name": name, "title": title, "description": description,
+                    "execution": execution, "resources": resources,
+                    "source": "anthropics/skills"}
+        (dest / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        index.append({k: manifest[k] for k in
+                      ("name", "description", "execution")})
+        print(f"converted {name:24} [{execution}]"
+              f" ({len(resources)} resource file(s))")
+
+    (OUT / "index.json").write_text(
+        json.dumps(index, indent=2) + "\n", encoding="utf-8")
+    (OUT / "README.md").write_text(README_OUT, encoding="utf-8")
+    print(f"\n{len(index)} skills -> skills/  (index.json for programmatic use)")
+    print('A.R.I.A. agents use them via their frontmatter, chat via '
+          '"use skill <name>".')
+    return 0
+
+
+README_OUT = """# Universal skills pack (generated)
+
+Converted from [anthropics/skills](https://github.com/anthropics/skills) by
+`aria skills convert` — regenerate any time; don't edit by hand.
+
+Use with **any** AI system:
+
+- **A.R.I.A. agents** — list a skill in an agent's `skills:` frontmatter
+  (`system/agents/*.md`), or say `use skill <name>` in chat.
+- **Any other model** — paste a skill's `PROMPT.md` into the system prompt,
+  or `aria skills prompt <name> | wl-copy`.
+- **Agent frameworks** (CrewAI, LangChain...) — read `index.json`, feed each
+  `PROMPT.md` in as agent instructions/knowledge.
+
+Skills marked `requires-code-execution` bundle scripts under `resources/`;
+a chat-only model can follow the guidance but needs a code-execution tool
+(or you) to run those.
+"""
+
+
+def cmd_list():
+    rows = []
+    if OUT.is_dir():
+        for d in sorted(OUT.iterdir()):
+            mf = d / "manifest.json"
+            if mf.is_file():
+                m = json.loads(mf.read_text(encoding="utf-8"))
+                rows.append((d.name, "universal", m.get("execution", "")))
+    converted = {r[0] for r in rows}
+    for d in skill_dirs():
+        if d.name not in converted:
+            rows.append((d.name, "claude-only", "run: aria skills convert"))
+    if not rows:
+        print("no skills installed — run: aria install-skills")
+        return 1
+    for name, kind, note in rows:
+        print(f"{name:26} {kind:12} {note}")
+    return 0
+
+
+def cmd_prompt(name):
+    f = OUT / name / "PROMPT.md"
+    if not f.is_file():
+        print(f"not converted: {name} — run: aria skills convert",
+              file=sys.stderr)
+        return 1
+    print(f.read_text(encoding="utf-8"))
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "convert":
+        return convert()
+    if cmd == "list":
+        return cmd_list()
+    if cmd == "prompt" and len(sys.argv) > 2:
+        return cmd_prompt(sys.argv[2])
+    print(__doc__.strip())
+    return 0 if cmd in ("", "-h", "--help", "help") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
