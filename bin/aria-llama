@@ -4,10 +4,16 @@
 # set a tier in system/config.yml, e.g.  smart: llamacpp/qwen3-30b
 #
 #   aria-llama install             fetch a prebuilt Vulkan llama.cpp build
+#   aria-llama build               build llama-server from source (fallback)
 #   aria-llama get <url> [name]    download a GGUF into vendor/models/
 #                                  (resumes; HuggingFace "resolve" URLs work)
 #   aria-llama serve <preset|gguf> run llama-server on :8080
 #   aria-llama service <preset>    install a systemd user service for it
+#
+# A distro-packaged llama-server also works: anything on PATH is detected
+# (e.g. pacman -Ss llama.cpp — pick the vulkan variant). And for GIANT
+# models the GPU barely matters (experts stream from disk), so even a
+# CPU-only llama-server build is fine there.
 #
 # Presets (tuned for 16GB VRAM + 64GB RAM; models are MoE so the expert
 # weights can live in system RAM via --n-cpu-moe):
@@ -38,10 +44,12 @@ MODELS="$ARIA_ROOT/vendor/models"
 PORT="${ARIA_LLAMACPP_PORT:-8080}"
 CTX="${ARIA_LLAMACPP_CTX:-16384}"
 
-usage() { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 server_bin() {
   for b in "$VENDOR/bin/llama-server" "$VENDOR/llama-server" \
+           "$VENDOR/build/bin/llama-server" \
+           "$ARIA_ROOT/vendor/llama.cpp-src/build/bin/llama-server" \
            "$(command -v llama-server 2>/dev/null || true)"; do
     [ -n "$b" ] && [ -x "$b" ] && { echo "$b"; return; }
   done
@@ -55,24 +63,60 @@ case "$cmd" in
       echo "llama-server already available: $(server_bin)"; exit 0
     fi
     mkdir -p "$VENDOR"
-    echo "fetching latest llama.cpp Vulkan build…"
-    api="https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-    url="$(curl -fsSL "$api" \
-      | grep -o '"browser_download_url": *"[^"]*ubuntu-vulkan-x64[^"]*"' \
-      | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
+    echo "searching recent llama.cpp builds for a Vulkan linux binary…"
+    # binaries live in nightly releases (bNNNN tags), not releases/latest
+    url="$(curl -fsSL \
+      "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=15" \
+      2>/dev/null \
+      | grep -o '"browser_download_url": *"[^"]*bin-ubuntu-vulkan-x64[^"]*"' \
+      | head -1 | sed 's/.*"\(https[^"]*\)"/\1/' || true)"
     if [ -z "$url" ]; then
-      echo "could not find a prebuilt Vulkan asset." >&2
-      echo "alternatives: your package manager (AUR: llama.cpp-vulkan)," >&2
-      echo "or build from source: https://github.com/ggml-org/llama.cpp" >&2
+      echo "couldn't find a prebuilt Vulkan asset via the GitHub API." >&2
+      echo "easiest alternatives:" >&2
+      echo "  1) distro package:   pacman -Ss llama.cpp   — install the" >&2
+      echo "     vulkan variant; a 'llama-server' on PATH is auto-detected" >&2
+      echo "  2) build from source: aria-llama build" >&2
       exit 1
     fi
-    echo "downloading $url"
-    curl -fL --progress-bar -o "$VENDOR/llama.zip" "$url"
-    (cd "$VENDOR" && unzip -oq llama.zip && rm llama.zip)
-    bin="$(server_bin)" || { echo "unzip finished but llama-server not found" >&2; exit 1; }
+    file="$VENDOR/$(basename "${url%%\?*}")"
+    echo "downloading $(basename "$file")"
+    curl -fL --progress-bar -o "$file" "$url"
+    case "$file" in
+      *.tar.gz|*.tgz) tar -xzf "$file" -C "$VENDOR" ;;
+      *.zip)          unzip -oq "$file" -d "$VENDOR" ;;
+      *) echo "unknown archive type: $file" >&2; exit 1 ;;
+    esac
+    rm -f "$file"
+    bin="$(server_bin)" || {
+      echo "extracted, but llama-server not found — try: aria-llama build" >&2
+      exit 1
+    }
     echo "installed -> $bin"
     "$bin" --version 2>/dev/null || true
-    echo "note: needs Vulkan drivers (on Arch: vulkan-radeon or amdvlk)"
+    echo "note: needs Vulkan drivers (on Arch: vulkan-radeon)"
+    ;;
+
+  build)
+    command -v cmake >/dev/null 2>&1 || {
+      echo "needs cmake (and for Vulkan: vulkan-headers + shaderc)." >&2
+      echo "on Arch: sudo pacman -S --needed cmake vulkan-headers shaderc" >&2
+      exit 1
+    }
+    SRC="$ARIA_ROOT/vendor/llama.cpp-src"
+    if [ -d "$SRC/.git" ]; then
+      git -C "$SRC" pull --ff-only
+    else
+      git clone --depth 1 https://github.com/ggml-org/llama.cpp "$SRC"
+    fi
+    vk=ON
+    command -v glslc >/dev/null 2>&1 || {
+      echo "glslc (shaderc) not found — building CPU-only llama-server."
+      echo "(fine for giant models; install shaderc and rerun for Vulkan)"
+      vk=OFF
+    }
+    cmake -S "$SRC" -B "$SRC/build" -DGGML_VULKAN=$vk -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$SRC/build" --target llama-server -j"$(nproc)"
+    echo "built -> $SRC/build/bin/llama-server (auto-detected by serve)"
     ;;
 
   get)
