@@ -224,6 +224,26 @@ def main():
                f"({decision.get('confidence', 0):.0%})"
     check("triage — live model", c_triage)
 
+    def c_gpu():
+        fast = eng.resolve_tier("fast")
+        if fast["kind"] != "ollama" or not shutil.which("ollama"):
+            raise SkipTest("fast tier isn't local ollama")
+        if not state.get("backends_ok"):
+            raise SkipTest("backend down")
+        # triage just ran, so the model is loaded — ask where it's running
+        out = subprocess.run(["ollama", "ps"], capture_output=True,
+                             text=True, timeout=10).stdout
+        if not out.strip() or "NAME" not in out:
+            raise SkipTest("couldn't read ollama ps")
+        if "GPU" not in out:
+            raise Exception(
+                "model is running on CPU — your ollama build has no GPU "
+                "backend. On Arch: pacman -Ss '^ollama' and install the "
+                "vulkan (or rocm) variant; or use the official installer "
+                "which bundles all backends")
+        return "model is running on the GPU"
+    check("gpu acceleration", c_gpu, required=False)
+
     def c_develop():
         need_backend()
         # force a known project note so this check is independent of triage
