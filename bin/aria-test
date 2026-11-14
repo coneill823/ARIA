@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""aria-test — A.R.I.A. end-to-end self-test.
+
+  aria test [--keep]
+
+Builds a throwaway sandbox copy of A.R.I.A. in a temp directory (your real
+pipeline, ledger and vault are never touched) and runs every capability
+against your REAL configured backends and models:
+
+  config/tiers, capture, intents, triage (live model), develop (live),
+  refine, Obsidian export, board+ledger, chat persona (live), agent run
+  (live), skills loading, crew generation, the web server and its API,
+  local STT availability, services/desktop presence.
+
+Live-model checks cost ~5 LLM calls (a minute or two on a local 8B).
+PASS/FAIL per check; non-zero exit if anything required failed.
+--keep leaves the sandbox on disk for inspection.
+"""
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+REAL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KEEP = "--keep" in sys.argv
+
+GREEN, RED, YELLOW, DIM, END = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+results = []
+
+
+def check(name, fn, required=True):
+    t0 = time.time()
+    try:
+        detail = fn() or ""
+        results.append((name, "PASS", detail))
+        print(f"{GREEN}PASS{END}  {name:34} {DIM}{detail} "
+              f"({time.time()-t0:.1f}s){END}")
+    except SkipTest as exc:
+        results.append((name, "SKIP", str(exc)))
+        print(f"{YELLOW}SKIP{END}  {name:34} {DIM}{exc}{END}")
+    except Exception as exc:
+        results.append((name, "FAIL" if required else "WARN", str(exc)))
+        tag = RED + "FAIL" + END if required else YELLOW + "WARN" + END
+        print(f"{tag}  {name:34} {exc}")
+
+
+class SkipTest(Exception):
+    pass
+
+
+TEST_IDEA = ("build a small command line tool that renames my photo files "
+             "by the date they were taken, needs a plan, parser and tests")
+
+
+def main():
+    print(f"A.R.I.A. self-test — sandbox copy, real models\n{DIM}"
+          f"source: {REAL_ROOT}{END}\n")
+    sandbox = tempfile.mkdtemp(prefix="aria-selftest-")
+    vault = os.path.join(sandbox, "_test-vault")
+    os.makedirs(vault)
+    os.environ["ARIA_OBSIDIAN_VAULT"] = vault
+
+    # ---- build the sandbox ------------------------------------------
+    for sub in ("bin", "system", "ui"):
+        shutil.copytree(os.path.join(REAL_ROOT, sub),
+                        os.path.join(sandbox, sub), symlinks=False)
+    for d in ("pipeline/00-inbox", "pipeline/01-processing",
+              "pipeline/02-potential-projects", "pipeline/knowledge/lists",
+              "pipeline/knowledge/notes", "pipeline/knowledge/content-ideas",
+              "pipeline/knowledge/someday", "pipeline/archive",
+              "active-projects"):
+        os.makedirs(os.path.join(sandbox, d), exist_ok=True)
+    for src in (".claude/skills", "skills"):
+        s = os.path.join(REAL_ROOT, src)
+        if os.path.isdir(s):
+            shutil.copytree(s, os.path.join(sandbox, src), symlinks=False,
+                            dirs_exist_ok=True)
+
+    spec = importlib.util.spec_from_file_location(
+        "aria_engine", os.path.join(sandbox, "bin", "aria_engine.py"))
+    eng = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(eng)
+
+    state = {}
+
+    # ---- engine-level checks ----------------------------------------
+    def c_config():
+        cfg = eng.config()
+        tiers = {t: eng.resolve_tier(t, cfg) for t in ("fast", "smart", "deep")}
+        return " ".join(f"{t}={v['kind']}/{v['model']}"
+                        for t, v in tiers.items())
+    check("config + tier resolution", c_config)
+
+    def c_backends():
+        h = eng.health()
+        bad = [f"{t}: {v.get('error', 'model missing')}"
+               for t, v in h["tiers"].items() if not v["ok"]]
+        if bad:
+            raise Exception("; ".join(bad) +
+                            " — is ollama running? model pulled?")
+        return f"all tiers reachable; {h['skills']} skills, " \
+               f"agents: {', '.join(h['agents'])}"
+    check("backends reachable", c_backends)
+
+    def c_capture():
+        p = eng.capture_note(TEST_IDEA, source="selftest")
+        state["capture"] = p
+        assert p.exists() and "Raw capture" in p.read_text()
+        return p.name
+    check("capture (no-LLM)", c_capture)
+
+    def c_intents():
+        cases = [("capture buy a new kettle", "capture"),
+                 ("run triage please", "triage"),
+                 ("develop the plans", "develop"),
+                 ("use skill docx", "use-skill"),
+                 ("drop skill", "drop-skill")]
+        for text, want in cases:
+            got = (eng.detect_intent(text) or {}).get("action")
+            assert got == want, f"'{text}' -> {got}, wanted {want}"
+        agents = {a["name"] for a in eng.list_agents()}
+        if "critic" in agents:
+            got = (eng.detect_intent("ask the critic to review it") or {})
+            assert got.get("action") == "agent" and got.get("name") == "critic"
+        return f"{len(cases)+1} intents correct"
+    check("intent detection (no-LLM)", c_intents)
+
+    def c_triage():
+        events = []
+        res = eng.triage_run(events.append, files=[str(state["capture"])])
+        assert res["failures"] == 0, "triage errored — see engine logs"
+        decision = next((e for e in events if e["event"] == "decision"), {})
+        state["triage_projects"] = res["projects"]
+        return f"decision: {decision.get('type')} " \
+               f"({decision.get('confidence', 0):.0%})"
+    check("triage — live model", c_triage)
+
+    def c_develop():
+        # force a known project note so this check is independent of triage
+        slug = "selftest-photo-renamer"
+        note = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
+        with open(note, "w") as f:
+            f.write(f"---\nslug: {slug}\nstatus: processing\ntype: project\n"
+                    f"captured: 2026-11-14\n---\n\n## Raw capture\n\n"
+                    f"{TEST_IDEA}\n")
+        eng.develop_run(lambda e: None, slugs=[slug])
+        proj = os.path.join(sandbox, "pipeline/02-potential-projects", slug)
+        plan = os.path.join(proj, "proposed-plan.md")
+        assert os.path.isfile(plan), "no proposed-plan.md written"
+        assert os.path.isfile(os.path.join(proj, "research.md"))
+        state["slug"] = slug
+        size = os.path.getsize(plan)
+        assert size > 300, f"plan suspiciously small ({size} bytes)"
+        return f"plan + research written ({size} bytes)"
+    check("develop — live model", c_develop)
+
+    def c_refine():
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        slug = state["slug"]
+        eng.refine(slug, "selftest feedback: keep it under 200 lines of code")
+        proj = os.path.join(sandbox, "pipeline/02-potential-projects", slug)
+        assert os.path.isfile(os.path.join(proj, "proposed-plan.v1.md")), \
+            "old plan not versioned"
+        back = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
+        assert os.path.isfile(back) and "Refinement request" in open(back).read()
+        # put it back so later checks have a potential project
+        os.rename(back, os.path.join(proj, "idea.md"))
+        shutil.copy(os.path.join(proj, "proposed-plan.v1.md"),
+                    os.path.join(proj, "proposed-plan.md"))
+        shutil.copy(os.path.join(proj, "research.v1.md"),
+                    os.path.join(proj, "research.md"))
+        return "feedback attached, plan versioned, idea requeued"
+    check("refine loop", c_refine)
+
+    def c_export():
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        idx = eng.export_obsidian(state["slug"])
+        assert os.path.isfile(idx)
+        n = len(os.listdir(os.path.join(vault, "ARIA", state["slug"])))
+        return f"index + {n} notes in test vault"
+    check("obsidian export", c_export)
+
+    def c_board():
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        b = eng.board()
+        assert any(p["slug"] == state["slug"] for p in b["potential"])
+        ledger = open(os.path.join(sandbox, "pipeline/LEDGER.md")).read()
+        assert state["slug"] in ledger, "ledger missing the test project"
+        return (f"inbox {len(b['inbox'])}, processing {len(b['processing'])}, "
+                f"potential {len(b['potential'])}; ledger consistent")
+    check("board + ledger", c_board)
+
+    def c_chat():
+        toks = []
+        eng.converse([{"role": "user", "content":
+                       "in one short sentence, say you are operational"}],
+                     on_token=lambda t: toks.append(t))
+        reply = "".join(toks).strip()
+        assert reply, "empty reply"
+        return f'"{reply[:70]}"'
+    check("chat persona — live model", c_chat)
+
+    def c_agent():
+        agents = eng.list_agents()
+        assert agents, "no agents defined in system/agents/"
+        toks = []
+        eng.run_agent("critic",
+                      "In two sentences, critique: 'rewrite everything in "
+                      "assembly for speed'.",
+                      lambda e: toks.append(e["text"])
+                      if e.get("event") == "token" else None)
+        assert "".join(toks).strip(), "agent produced no output"
+        return f"{len(agents)} agents; critic replied " \
+               f"({len(''.join(toks))} chars)"
+    check("agent run — live model", c_agent)
+
+    def c_skills():
+        names = eng.list_skill_names()
+        if not names:
+            raise SkipTest("none installed — run: aria install-skills "
+                           "&& aria skills convert")
+        text = eng.skill_text(names[0])
+        assert len(text) > 100
+        return f"{len(names)} loadable, e.g. {names[0]}"
+    check("skills loading", c_skills, required=False)
+
+    def c_crew():
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        out = subprocess.run(
+            [sys.executable, os.path.join(sandbox, "bin", "aria-crew"),
+             state["slug"]], capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr.strip()[-200:]
+        crew = os.path.join(sandbox, "pipeline/02-potential-projects",
+                            state["slug"], "crew", "crew.py")
+        assert os.path.isfile(crew)
+        return "crew.py generated from the plan's team"
+    check("crew generation", c_crew)
+
+    def c_stt():
+        try:
+            import faster_whisper  # noqa: F401
+            return "faster-whisper installed (Firefox voice input ready)"
+        except ImportError:
+            raise SkipTest("optional — pip install faster-whisper")
+    check("local speech-to-text", c_stt, required=False)
+
+    # ---- server-level checks ----------------------------------------
+    port = 8799
+    srv = subprocess.Popen(
+        [sys.executable, os.path.join(sandbox, "bin", "aria-ui"), str(port)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=os.environ.copy())
+    base = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(40):
+            try:
+                urllib.request.urlopen(base + "/api/health", timeout=2)
+                break
+            except Exception:
+                time.sleep(0.25)
+
+        def c_pages():
+            for p in ("/", "/board", "/orb", "/agents"):
+                with urllib.request.urlopen(base + p, timeout=10) as r:
+                    assert r.status == 200, f"{p} -> {r.status}"
+            return "/, /board, /orb, /agents all 200"
+        check("web pages", c_pages)
+
+        def c_api():
+            for p in ("/api/board", "/api/health", "/api/config",
+                      "/api/agents", "/api/skills"):
+                with urllib.request.urlopen(base + p, timeout=15) as r:
+                    json.load(r)
+            return "board, health, config, agents, skills respond"
+        check("api endpoints", c_api)
+
+        def c_chat_http():
+            req = urllib.request.Request(
+                base + "/api/chat", method="POST",
+                data=json.dumps({"messages": [
+                    {"role": "user",
+                     "content": "capture selftest http capture note"}]}).encode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read().decode()
+            assert '"action"' in body and "capture" in body, body[:200]
+            inbox = os.listdir(os.path.join(sandbox, "pipeline/00-inbox"))
+            assert any("selftest-http" in f or "selftest" in f for f in inbox)
+            return "chat intent -> capture executed over HTTP"
+        check("chat API + spoken command", c_chat_http)
+    finally:
+        srv.terminate()
+
+    # ---- machine integration (informational) ------------------------
+    def c_install():
+        found = []
+        apps = os.path.expanduser("~/.local/share/applications/aria.desktop")
+        unit = os.path.expanduser("~/.config/systemd/user/aria.service")
+        if os.path.isfile(apps):
+            found.append("desktop entry")
+        if os.path.isfile(unit):
+            found.append("systemd service")
+        if not found:
+            raise SkipTest("not installed — run ./install.sh")
+        return ", ".join(found)
+    check("desktop/service install", c_install, required=False)
+
+    # ---- summary -----------------------------------------------------
+    fails = [r for r in results if r[1] == "FAIL"]
+    warns = [r for r in results if r[1] == "WARN"]
+    skips = [r for r in results if r[1] == "SKIP"]
+    print(f"\n{'='*62}")
+    print(f"{len(results)} checks: "
+          f"{GREEN}{len(results)-len(fails)-len(warns)-len(skips)} passed{END}"
+          + (f", {RED}{len(fails)} failed{END}" if fails else "")
+          + (f", {YELLOW}{len(warns)} warnings{END}" if warns else "")
+          + (f", {len(skips)} skipped" if skips else ""))
+    for name, _, detail in fails:
+        print(f"  {RED}✗{END} {name}: {detail}")
+    if KEEP:
+        print(f"sandbox kept: {sandbox}")
+    else:
+        shutil.rmtree(sandbox, ignore_errors=True)
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

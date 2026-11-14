@@ -86,8 +86,26 @@ bin/aria app                # same, in its own desktop window
 bin/aria install-desktop    # add A.R.I.A. to your application menu
 bin/aria install-service    # always-on: server at login + hourly pipeline
 bin/aria install-skills     # install Anthropic's Agent Skills
+bin/aria test               # self-test: run EVERYTHING in a sandbox copy
 bin/aria doctor             # sanity-check the setup
 ```
+
+### Self-test — prove the whole system works
+
+```bash
+bin/aria test          # ~5 live model calls, a minute or two locally
+bin/aria test --keep   # leave the sandbox on disk to inspect
+```
+
+Builds a throwaway sandbox copy (your real pipeline, ledger and vault are
+never touched) and runs **every capability against your real models**:
+config/tiers, backend reachability, capture, intent detection, live triage,
+live develop, the refine loop, Obsidian export (to a temp vault), board +
+ledger consistency, live chat, a live agent run, skills loading, crew
+generation, every web page and API endpoint, a spoken command over HTTP,
+and your local STT / service install status. PASS/FAIL per check, clear
+root cause on failure, non-zero exit if anything required broke — run it
+after every model change or `git pull`.
 
 ### Always-on (recursive) mode
 
