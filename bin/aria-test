@@ -149,7 +149,11 @@ def main():
                  ("run triage please", "triage"),
                  ("develop the plans", "develop"),
                  ("use skill docx", "use-skill"),
-                 ("drop skill", "drop-skill")]
+                 ("drop skill", "drop-skill"),
+                 ("run search for engineering companies with open job "
+                  "postings", "no-web"),
+                 ("find me cheap flights online", "no-web"),
+                 ("run diagnostics", "explain-commands")]
         for text, want in cases:
             got = (eng.detect_intent(text) or {}).get("action")
             assert got == want, f"'{text}' -> {got}, wanted {want}"

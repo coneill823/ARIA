@@ -729,17 +729,26 @@ def board():
 # ---------------------------------------------------------------- voice chat
 
 CHAT_SYSTEM = """You are A.R.I.A. (Autonomous Reasoning & Intelligence \
-Assistant), the voice interface of a personal idea-to-project pipeline. Your \
-replies are spoken aloud, so answer in one to three short conversational \
-sentences — no markdown, no lists, no emoji. Be warm, capable, and lightly \
-witty.
+Assistant), the voice interface of a personal idea-to-project pipeline that \
+runs entirely on the user's own computer. Your replies are spoken aloud, so \
+answer in one to three short conversational sentences — no markdown, no \
+lists, no emoji. Be warm, capable, lightly witty — and strictly honest.
 
 Current pipeline state: {summary}
 
-The app itself executes pipeline commands when the user phrases them \
-directly, for example "capture <idea>", "run triage", or "develop the \
-plans". If the user seems to want one of those actions, tell them the exact \
-phrase to say — never claim you already did it."""
+Hard facts about yourself — never contradict them:
+- You have NO web access. You cannot search the internet, browse, or fetch \
+live data like job postings, companies, prices or news, and you can never \
+"display a list" you did not actually produce. When asked for such things, \
+say so plainly and suggest: "capture <the idea>" — the pipeline will draft \
+a plan with research leads clearly marked unverified.
+- The app executes ONLY these exact phrases when the user says them: \
+"capture <idea>", "run triage", "develop the plans", "ask the <agent> to \
+<task>", "use skill <name>", "drop skill", "trigger <webhook>". Never \
+invent other commands and never tell the user to say a phrase that is not \
+on this list.
+- Never claim an action happened or a thing exists unless the pipeline \
+state above shows it. If you are unsure, say you are unsure."""
 
 
 def board_summary_text():
@@ -777,6 +786,20 @@ INTENT_AGENT = re.compile(
 INTENT_TRIGGER = re.compile(
     r"^\s*(?:trigger|fire|run webhook|launch webhook)\s+([\w.-]+)"
     r"(?:\s*[:,]?\s*(.*))?$", re.I | re.S)
+INTENT_NO_WEB = re.compile(
+    r"\b(?:search|look\s+up|browse|google|scrape)\b"
+    r"|\bfind\b.*\b(?:online|web|internet|compan(?:y|ies)|jobs?|postings?|"
+    r"news|prices?)\b", re.I | re.S)
+INTENT_RUNISH = re.compile(r"^\s*(?:run|execute|start)\s+\S+", re.I)
+
+
+def known_commands_text():
+    agents = ", ".join(a["name"] for a in list_agents()) or "none defined"
+    hooks = ", ".join(sorted(config()["webhooks"])) or "none configured"
+    return ("The commands I actually execute: capture <idea>; run triage; "
+            "develop the plans; ask the <agent> to <task> (agents: "
+            f"{agents}); use skill <name>; drop skill; trigger <webhook> "
+            f"(webhooks: {hooks}). Everything else is just conversation.")
 
 
 def detect_intent(text):
@@ -801,6 +824,10 @@ def detect_intent(text):
         return {"action": "triage"}
     if INTENT_DEVELOP.search(text):
         return {"action": "develop"}
+    if INTENT_NO_WEB.search(text):
+        return {"action": "no-web"}
+    if INTENT_RUNISH.match(text):
+        return {"action": "explain-commands"}
     return None
 
 

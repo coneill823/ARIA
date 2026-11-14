@@ -218,6 +218,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     emit({"event": "action", "action": "webhook",
                           "say": f"Couldn't trigger {intent['name']}: {exc}"})
+            elif intent and intent["action"] == "no-web":
+                emit({"event": "action", "action": "no-web",
+                      "say": "Straight answer: I run fully local with no "
+                             "web access, so I can't search or fetch live "
+                             "data — and I won't pretend to. Say 'capture "
+                             "<the idea>' and the pipeline will draft a "
+                             "plan with research leads marked unverified; "
+                             "for sourced web research, run /develop in a "
+                             "Claude Code session."})
+            elif intent and intent["action"] == "explain-commands":
+                emit({"event": "action", "action": "explain-commands",
+                      "say": "That's not a command I have. "
+                             + eng.known_commands_text()})
             elif intent and intent["action"] == "agent":
                 emit({"event": "action", "action": "agent",
                       "name": intent["name"], "task": intent["task"],
