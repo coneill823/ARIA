@@ -56,11 +56,28 @@ server_bin() {
   return 1
 }
 
+link_server() {
+  # the release archives change their internal layout between versions —
+  # find the binary wherever it landed and link it to the known spot
+  found="$(find "$VENDOR" -maxdepth 5 -type f -name llama-server \
+             -not -path "$VENDOR/bin/*" 2>/dev/null | head -1 || true)"
+  [ -n "$found" ] || return 1
+  chmod +x "$found" 2>/dev/null || true
+  mkdir -p "$VENDOR/bin"
+  ln -sfn "$found" "$VENDOR/bin/llama-server"
+  return 0
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   install)
     if server_bin >/dev/null 2>&1; then
       echo "llama-server already available: $(server_bin)"; exit 0
+    fi
+    if link_server; then
+      echo "found an already-extracted binary — linked: $(server_bin)"
+      "$(server_bin)" --version 2>/dev/null || true
+      exit 0
     fi
     mkdir -p "$VENDOR"
     echo "searching recent llama.cpp builds for a Vulkan linux binary…"
@@ -87,6 +104,7 @@ case "$cmd" in
       *) echo "unknown archive type: $file" >&2; exit 1 ;;
     esac
     rm -f "$file"
+    link_server || true
     bin="$(server_bin)" || {
       echo "extracted, but llama-server not found — try: aria-llama build" >&2
       exit 1
@@ -98,8 +116,9 @@ case "$cmd" in
 
   build)
     command -v cmake >/dev/null 2>&1 || {
-      echo "needs cmake (and for Vulkan: vulkan-headers + shaderc)." >&2
-      echo "on Arch: sudo pacman -S --needed cmake vulkan-headers shaderc" >&2
+      echo "needs cmake (and for Vulkan: headers + shader tooling)." >&2
+      echo "on Arch: sudo pacman -S --needed cmake vulkan-headers shaderc \\" >&2
+      echo "         spirv-headers spirv-tools glslang" >&2
       exit 1
     }
     SRC="$ARIA_ROOT/vendor/llama.cpp-src"
