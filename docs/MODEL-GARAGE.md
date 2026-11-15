@@ -23,18 +23,22 @@ Ollama loads/unloads on demand (your drop-in allows 3 loaded at once).
 bin/aria llama install     # once (repaired binaries auto-detected)
 ```
 
-For each giant: open its HuggingFace repo in a browser → Files →
-the **UD-TQ1_0** (or UD-IQ1_S) folder → copy each part's download link →
+For each giant: open its HuggingFace repo in a browser → Files → the
+smallest **UD-** folder (usually `UD-IQ1_S`; the exact name varies per
+repo — the UD- prefix is what matters) → copy each part's download link →
 
 ```bash
 bin/aria llama get "<part url>"        # repeat per part, resumable
 ```
 
-| Giant | Repo | ~Size | Serve as |
+| Giant | Repo (search unsloth + "GGUF") | ~Size | Serve as |
 |---|---|---|---|
-| DeepSeek 671B | unsloth/DeepSeek-… (newest V3.x/R1 GGUF) | ~170GB | `deepseek`, port 8080 |
-| Kimi K2 1T | unsloth/Kimi-K2-Instruct-GGUF | ~250GB | `kimi`, port 8081 |
-| Kimi K3 2.8T | unsloth/Kimi-K3-GGUF | ~594GB | summit attempt — see BIG-MODELS.md |
+| DeepSeek-R1 671B — **reasoning** | unsloth/DeepSeek-R1-GGUF (NOT "Prover" — that one only does math proofs) | ~170GB | `deepseek`, port 8080 |
+| Kimi K2 1T — **research/knowledge** | unsloth/Kimi-K2-Instruct-GGUF | ~250GB | `kimi`, port 8081 |
+| Qwen3-Coder 480B — **coding** | unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF | ~180GB | `coder`, port 8082 |
+| Kimi K3 2.8T — summit attempt | unsloth/Kimi-K3-GGUF | ~594GB | needs ~600GB free; see BIG-MODELS.md |
+
+The three specialists together ≈ 600GB — fine on a 1.8TB drive.
 
 Each giant gets its **own named service on its own port**, so they're all
 reachable at once (they share your NVMe bandwidth — expect them to be
@@ -43,6 +47,7 @@ slower when used simultaneously):
 ```bash
 bin/aria llama service deepseek vendor/models/<deepseek-part-00001…>.gguf 8080
 bin/aria llama service kimi     vendor/models/<kimi-part-00001…>.gguf     8081
+bin/aria llama service coder    vendor/models/<qwen3coder-part-00001…>.gguf 8082
 ```
 
 Then name them as backends in `system/config.yml`:
@@ -53,6 +58,7 @@ Then name them as backends in `system/config.yml`:
     llamacpp: http://localhost:8080
     deepseek: http://localhost:8080
     kimi: http://localhost:8081
+    coder: http://localhost:8082
 ```
 
 ## 3. Assign brains to agents
@@ -60,13 +66,15 @@ Then name them as backends in `system/config.yml`:
 Edit the frontmatter in `system/agents/*.md` — effective on the next run:
 
 ```yaml
-# researcher.md — bulk reading, needs speed
-model: ollama/qwen3:30b
-# critic.md — judgment matters, still interactive
+# strategist.md — general reasoning giant
+model: deepseek/r1
+# researcher.md — biggest knowledge base for prior-art recall
+model: kimi/k2            # (interactive asks get slow — use missions)
+# coder.md — the coding giant
+model: coder/qwen3-480b   # model name is a label; the backend serves
+                          # whatever gguf its service loaded
+# critic.md — judgment, still interactive
 model: ollama/gpt-oss:120b
-# strategist.md — the overnight deep thinker
-model: kimi/k2          # or deepseek/v3 — model name is a label,
-                        # the backend serves whatever gguf it loaded
 # scribe.md — formatting, cheap and instant
 model: ollama/llama3.1:8b
 ```
