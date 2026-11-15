@@ -34,7 +34,8 @@ import aria_engine as eng  # noqa: E402
 
 UI_DIR = eng.ROOT / "ui"
 PAGES = {"/": UI_DIR / "index.html", "/board": UI_DIR / "board.html",
-         "/orb": UI_DIR / "orb.html", "/agents": UI_DIR / "agents.html"}
+         "/orb": UI_DIR / "orb.html", "/agents": UI_DIR / "agents.html",
+         "/projects": UI_DIR / "projects.html"}
 RUN_LOCK = threading.Lock()  # one engine run at a time
 AUDIO_SUFFIX = {"audio/webm": ".webm", "audio/ogg": ".ogg",
                 "audio/wav": ".wav", "audio/mp4": ".m4a"}
@@ -92,6 +93,30 @@ class Handler(BaseHTTPRequestHandler):
                             "stt_model": cfg["stt_model"]})
         elif url.path == "/api/missions":
             self.send_json({"missions": eng.mission_list()})
+        elif url.path == "/api/projects":
+            self.send_json({"projects": eng.list_projects()})
+        elif url.path == "/api/project":
+            slug = (query.get("slug") or [""])[0]
+            try:
+                auto = eng._auto_dir(slug)
+            except ValueError:
+                self.send_json({"error": "no such project"}, 404)
+                return
+            plan = {"tasks": []}
+            if (auto / "plan.json").is_file():
+                plan = json.loads((auto / "plan.json").read_text())
+            out = {"slug": slug, "state": eng._auto_state(slug),
+                   "plan": plan, "changelog": "", "report": "", "dir": ""}
+            try:
+                out["dir"] = str(eng._project_dir(slug)
+                                 .relative_to(eng.ROOT))
+            except ValueError:
+                pass  # promoted outside the repo — outputs not servable
+            if (auto / "CHANGELOG.md").is_file():
+                out["changelog"] = (auto / "CHANGELOG.md").read_text()[-12000:]
+            if (auto / "FINAL-REPORT.md").is_file():
+                out["report"] = (auto / "FINAL-REPORT.md").read_text()
+            self.send_json(out)
         elif url.path == "/api/agents":
             self.send_json({"agents": [
                 {k: a[k] for k in ("name", "role", "skills", "model", "path")}
@@ -159,6 +184,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True,
                                 "obsidian_vault": cfg["obsidian_vault"],
                                 "auto_pipeline": cfg["auto_pipeline"]})
+            elif url.path == "/api/autopilot":
+                slug = str(body.get("slug", "")).strip().lower()
+                action = str(body.get("action", "")).strip()
+                if action == "start":
+                    state = eng.autopilot_start(slug)
+                elif action == "stop":
+                    state = eng.autopilot_stop(slug)
+                else:
+                    self.send_json({"error": "action must be start|stop"}, 400)
+                    return
+                self.send_json({"ok": True, "state": state})
+            elif url.path == "/api/plan":
+                self.plan_project(body)
             elif url.path == "/api/chat":
                 self.chat(body)
             elif url.path == "/api/agent":
@@ -234,6 +272,23 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"event": "action", "action": "explain-commands",
                       "say": "That's not a command I have. "
                              + eng.known_commands_text()})
+            elif intent and intent["action"] == "autopilot-start":
+                eng.autopilot_start(intent["slug"])
+                emit({"event": "action", "action": "autopilot-start",
+                      "slug": intent["slug"],
+                      "say": f"Autopilot engaged on {intent['slug']}. I'll "
+                             "plan it, work the tasks one by one, verify "
+                             "each, and keep iterating until you say "
+                             f"'stop working on {intent['slug']}'. Watch "
+                             "the Projects page."})
+            elif intent and intent["action"] == "autopilot-stop":
+                eng.autopilot_stop(intent["slug"])
+                emit({"event": "action", "action": "autopilot-stop",
+                      "slug": intent["slug"],
+                      "say": f"Standing down on {intent['slug']} — I'll "
+                             "finish the task in flight, write the final "
+                             "report of everything changed and why, and "
+                             "leave the project as is."})
             elif intent and intent["action"] == "mission":
                 try:
                     path = eng.mission_create(intent["name"], intent["task"])
@@ -260,6 +315,30 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             emit({"event": "error", "log": str(exc)})
         emit({"event": "done"})
+
+    def plan_project(self, body):
+        slug = str(body.get("slug", "")).strip().lower()
+        if not RUN_LOCK.acquire(blocking=False):
+            self.send_json({"error": "a run is already in progress"}, 409)
+            return
+        try:
+            self.send_sse_headers()
+
+            def emit(ev):
+                try:
+                    self.wfile.write(b"data: " + json.dumps(ev).encode()
+                                     + b"\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            try:
+                eng.autopilot_plan(slug, emit)
+            except Exception as exc:
+                emit({"event": "error", "log": str(exc)})
+            emit({"event": "done"})
+        finally:
+            RUN_LOCK.release()
 
     def agent(self, body):
         name = str(body.get("name", "")).strip()
@@ -327,6 +406,27 @@ class Handler(BaseHTTPRequestHandler):
             RUN_LOCK.release()
 
 
+def autopilot_worker():
+    """Drives every project whose autopilot is 'running': one task at a
+    time, round-robin across projects, forever. Independent of RUN_LOCK —
+    a week of autonomous work must not block triage or chat."""
+    while True:
+        busy = False
+        for p in eng.list_projects():
+            if p["autopilot"] != "running":
+                continue
+            try:
+                result = eng.autopilot_tick(
+                    p["slug"],
+                    lambda ev: print("autopilot:", ev["log"])
+                    if ev.get("log") else None)
+                busy = busy or result not in ("idle",)
+            except Exception as exc:
+                print("autopilot worker error:", p["slug"], exc)
+        if not busy:
+            time.sleep(15)
+
+
 def mission_worker():
     """Background executor: drains the mission queue one job at a time,
     forever. Lives inside the always-on server, so missions keep running
@@ -349,6 +449,7 @@ def mission_worker():
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8700
     threading.Thread(target=mission_worker, daemon=True).start()
+    threading.Thread(target=autopilot_worker, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"A.R.I.A. UI -> http://127.0.0.1:{port}  (Ctrl+C to stop)")
     try:

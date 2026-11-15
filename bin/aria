@@ -8,6 +8,8 @@
 #   aria agent <name> "task"   run one agent (role + skills + model tier)
 #   aria mission <name> "task" queue a BACKGROUND agent job (survives logout*)
 #   aria missions [run]        list missions / drain the queue headless
+#   aria autopilot <slug> start|stop|status   autonomous project execution
+#   aria plan <slug>           (re)generate a project's autopilot task plan
 #   aria skills <cmd>          list|convert|prompt — universal skills pack
 #   aria crew <slug>           generate a CrewAI project for a project
 #   aria handoff <slug>        generate an OpenHands launch script for a project
@@ -31,7 +33,7 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -237,6 +239,40 @@ import aria_engine as eng
 status = eng.trigger_webhook(sys.argv[1], ' '.join(sys.argv[2:]))
 print(f'triggered {sys.argv[1]} -> HTTP {status}')
 " "$name" "$@"
+    ;;
+
+  autopilot)
+    slug="${1:-}"; action="${2:-status}"
+    [ -n "$slug" ] || { echo "usage: aria autopilot <slug> start|stop|status" >&2; exit 1; }
+    exec python3 -c "
+import sys, json
+sys.path.insert(0, '$ARIA_ROOT/bin')
+import aria_engine as eng
+slug, action = sys.argv[1], sys.argv[2]
+if action == 'start':
+    print(json.dumps(eng.autopilot_start(slug)))
+    print('running — the always-on server works it continuously;')
+    print('watch /projects, or tail the changelog in <project>/autopilot/')
+elif action == 'stop':
+    eng.autopilot_stop(slug)
+    print('stop requested — current task finishes, then the final report is written')
+else:
+    print(json.dumps(eng._auto_state(slug), indent=2))
+" "$slug" "$action"
+    ;;
+
+  plan)
+    slug="${1:-}"
+    [ -n "$slug" ] || { echo "usage: aria plan <slug>" >&2; exit 1; }
+    exec python3 -c "
+import sys
+sys.path.insert(0, '$ARIA_ROOT/bin')
+import aria_engine as eng
+plan = eng.autopilot_plan(sys.argv[1],
+    lambda ev: print(ev['log']) if ev.get('log') else None)
+for t in plan['tasks']:
+    print(f\"{t['status']:10} {t['id']:4} {t['agent']:12} {t['title']}\")
+" "$slug"
     ;;
 
   llama)

@@ -796,6 +796,12 @@ def board_summary_text():
             mp.append("latest finished: " + done[-1]["id"]
                       + f" ({done[-1]['status']})")
         parts.append("background missions — " + "; ".join(mp))
+    running_projects = [p for p in list_projects()
+                        if p["autopilot"] == "running"]
+    if running_projects:
+        parts.append("autopilot working on: " + ", ".join(
+            f"{p['slug']} (iteration {p['iteration']})"
+            for p in running_projects))
     return "; ".join(parts)
 
 
@@ -815,6 +821,12 @@ INTENT_AGENT = re.compile(
 INTENT_MISSION = re.compile(
     r"^\s*(?:mission|overnight|background|queue)\b[:,]?\s*(?:ask\s+)?"
     r"(?:the\s+)?(\w[\w-]*)\s+(?:agent\s+)?to\s+(.+)$", re.I | re.S)
+INTENT_AUTOPILOT = re.compile(
+    r"^\s*(?:work on|start autopilot(?: on| for)?|autopilot)\s+([\w-]+)\s*$",
+    re.I)
+INTENT_AUTOPILOT_STOP = re.compile(
+    r"^\s*(?:stop(?: the)?(?: autopilot| working| work)(?: on| for)?|"
+    r"stand down(?: on)?)\s+([\w-]+)\s*$", re.I)
 INTENT_TRIGGER = re.compile(
     r"^\s*(?:trigger|fire|run webhook|launch webhook)\s+([\w.-]+)"
     r"(?:\s*[:,]?\s*(.*))?$", re.I | re.S)
@@ -845,6 +857,20 @@ def detect_intent(text):
     if m and m.group(1).lower() in config()["webhooks"]:
         return {"action": "webhook", "name": m.group(1).lower(),
                 "message": (m.group(2) or "").strip()}
+    m = INTENT_AUTOPILOT.match(text)
+    if m:
+        try:
+            _project_dir(m.group(1).lower())
+            return {"action": "autopilot-start", "slug": m.group(1).lower()}
+        except ValueError:
+            pass
+    m = INTENT_AUTOPILOT_STOP.match(text)
+    if m:
+        try:
+            _project_dir(m.group(1).lower())
+            return {"action": "autopilot-stop", "slug": m.group(1).lower()}
+        except ValueError:
+            pass
     m = INTENT_MISSION.match(text)
     if m and m.group(1).lower() in {a["name"] for a in list_agents()}:
         return {"action": "mission", "name": m.group(1).lower(),
@@ -1109,6 +1135,434 @@ def mission_requeue_stale():
             update_frontmatter(ROOT / m["path"], status="queued", started="")
             fixed.append(m["id"])
     return fixed
+
+
+# ---------------------------------------------------------------- autopilot
+#
+# Autonomous project execution: plan -> execute -> verify -> next ->
+# replan -> ... until the user stops it. The loop encodes the
+# plan/build/verify/review discipline (c.f. ECC) natively:
+#   1. The planner turns requirements + the live agent roster + the skills
+#      index into a JSON task list (agent, skills, model, deps per task).
+#   2. Each task runs on its assigned agent/model; fenced blocks whose
+#      info line is `file:relative/path` are written into the project.
+#   3. The critic verifies output against the task's done_when before the
+#      task counts as done; one retry with the critique attached.
+#   4. When every task is done, the planner reviews the changelog and
+#      either emits the next iteration of tasks or declares completion.
+# State lives in <project>/autopilot/ — plan.json, state.json, task
+# outputs, CHANGELOG.md, FINAL-REPORT.md. Stop = finish current task,
+# write the final report, leave everything in place.
+
+AUTOPILOT_PLANNER = """You are the project planner inside A.R.I.A. Produce
+the next working plan for the project described below, as tasks an AI
+agent can complete by producing text, documents, designs, or code files.
+Respond with ONLY JSON:
+{"tasks": [{"id": "t1", "title": "...", "detail": "what exactly to produce",
+  "agent": "<one of: %s>", "skills": [], "model": "",
+  "phase": "<short phase name>", "est_hours": 2,
+  "depends_on": [], "done_when": "<observable criterion>"}],
+ "project_complete": false}
+Rules: 3-10 tasks, concrete and self-contained; depends_on refers to ids
+in THIS list; "skills" only from: %s (or empty); "model" empty for the
+agent's default, or fast/smart/deep, or a backend/model spec; order tasks
+so each builds on its dependencies. If the changelog shows the project
+goal is genuinely met and nothing worthwhile remains, return
+{"tasks": [], "project_complete": true} instead."""
+
+AUTOPILOT_TASK = """You are working autonomously inside project
+"{slug}". Overall goal:
+{goal}
+
+Your task: {title}
+Detail: {detail}
+It is done when: {done_when}
+{deps}
+To create or modify a project file, put its FULL contents in a fenced code
+block whose info line is exactly `file:relative/path.ext` — those blocks
+are saved into the project automatically. Produce the complete work
+product now; no questions, no placeholders."""
+
+AUTOPILOT_VERIFIER = """You are the verification judge. Decide whether the
+work output satisfies the task's done_when criterion. Respond with ONLY
+JSON: {"pass": true/false, "feedback": "<one or two sentences — what is
+missing if it fails>"}. Judge substance, not style; a genuine, complete
+attempt that meets the criterion passes."""
+
+
+def _project_dir(slug):
+    cfg = config()
+    target = Path(cfg["promotion_target"])
+    if not target.is_absolute():
+        target = (ROOT / target).resolve()
+    for base in (target / slug, POTENTIAL / slug):
+        if base.is_dir():
+            return base
+    raise ValueError(f"no project found for slug: {slug}")
+
+
+def _auto_dir(slug):
+    d = _project_dir(slug) / "autopilot"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _auto_state(slug):
+    f = _auto_dir(slug) / "state.json"
+    if f.is_file():
+        return json.loads(f.read_text(encoding="utf-8"))
+    return {"status": "idle", "iteration": 0}
+
+
+def _auto_save_state(slug, state):
+    (_auto_dir(slug) / "state.json").write_text(
+        json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _auto_plan_path(slug):
+    return _auto_dir(slug) / "plan.json"
+
+
+def _project_goal(slug, limit=2500):
+    proj = _project_dir(slug)
+    for name in ("docs/requirements.md", "requirements.md",
+                 "docs/proposed-plan.md", "proposed-plan.md", "idea.md",
+                 "docs/idea.md"):
+        f = proj / name
+        if f.is_file():
+            return f.read_text(encoding="utf-8")[:limit]
+    return f"(no requirements found — infer the goal from the slug: {slug})"
+
+
+def list_projects():
+    cfg = config()
+    target = Path(cfg["promotion_target"])
+    if not target.is_absolute():
+        target = (ROOT / target).resolve()
+    seen, out = set(), []
+    for base, kind in ((target, "active"), (POTENTIAL, "potential")):
+        if not base.is_dir():
+            continue
+        for d in sorted(base.iterdir()):
+            if not d.is_dir() or d.name in seen or d.name == "crew":
+                continue
+            if not any((d / n).exists() for n in
+                       ("requirements.md", "docs", "proposed-plan.md",
+                        "idea.md", "STATUS.md")):
+                continue
+            seen.add(d.name)
+            state = {"status": "idle", "iteration": 0}
+            sf = d / "autopilot" / "state.json"
+            if sf.is_file():
+                try:
+                    state = json.loads(sf.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            out.append({"slug": d.name, "kind": kind,
+                        "autopilot": state.get("status", "idle"),
+                        "iteration": state.get("iteration", 0)})
+    return out
+
+
+def autopilot_plan(slug, emit):
+    """(Re)plan the project: merge-safe — done tasks are kept, new tasks
+    appended with fresh ids."""
+    cfg = config()
+    agents = list_agents()
+    names = ", ".join(a["name"] for a in agents)
+    skills = ", ".join(list_skill_names()[:40]) or "none installed"
+    system = AUTOPILOT_PLANNER % (names, skills)
+    plan_path = _auto_plan_path(slug)
+    old = {"tasks": []}
+    if plan_path.is_file():
+        old = json.loads(plan_path.read_text(encoding="utf-8"))
+    done = [t for t in old["tasks"] if t.get("status") == "done"]
+    changelog = ""
+    cl = _auto_dir(slug) / "CHANGELOG.md"
+    if cl.is_file():
+        changelog = cl.read_text(encoding="utf-8")[-3000:]
+    prompt = (f"PROJECT {slug}\n\nGOAL / REQUIREMENTS:\n"
+              + _project_goal(slug)
+              + (f"\n\nCHANGELOG SO FAR:\n{changelog}" if changelog else "")
+              + (f"\n\nALREADY DONE: "
+                 + "; ".join(t["title"] for t in done) if done else ""))
+    emit({"event": "thinking", "label": "planning project " + slug})
+    target = resolve_tier("smart", cfg)
+    reply = chat_stream(target, prompt, system, force_json=True,
+                        on_token=lambda t: emit({"event": "token", "text": t}))
+    data = json.loads(reply)
+    valid_agents = {a["name"] for a in agents}
+    fresh = []
+    base = len(done)
+    for i, t in enumerate(data.get("tasks", [])):
+        tid = f"t{base + i + 1}"
+        fresh.append({
+            "id": tid, "orig_id": str(t.get("id", tid)),
+            "title": str(t.get("title", "untitled"))[:120],
+            "detail": str(t.get("detail", ""))[:1500],
+            "agent": (t.get("agent") if t.get("agent") in valid_agents
+                      else "planner"),
+            "skills": [s for s in (t.get("skills") or [])
+                       if isinstance(s, str)][:4],
+            "model": str(t.get("model") or ""),
+            "phase": str(t.get("phase", "work"))[:40],
+            "est_hours": float(t.get("est_hours") or 1),
+            "depends_on": [str(d) for d in (t.get("depends_on") or [])],
+            "done_when": str(t.get("done_when")
+                             or "the work product exists and is complete")[:300],
+            "status": "todo",
+        })
+    # remap depends_on from the model's ids to our assigned ids
+    idmap = {t["orig_id"]: t["id"] for t in fresh}
+    for t in fresh:
+        t["depends_on"] = [idmap.get(d, d) for d in t["depends_on"]
+                           if idmap.get(d, d) in idmap.values()
+                           or any(x["id"] == d for x in done)]
+        t.pop("orig_id", None)
+    plan = {"tasks": done + fresh,
+            "project_complete": bool(data.get("project_complete"))
+            and not fresh}
+    plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    emit({"event": "stage_done", "stage": "plan",
+          "log": f"plan for {slug}: {len(fresh)} new task(s), "
+                 f"{len(done)} already done"})
+    return plan
+
+
+def _changelog(slug, text):
+    with (_auto_dir(slug) / "CHANGELOG.md").open("a", encoding="utf-8") as f:
+        f.write(f"\n### {datetime.datetime.now():%Y-%m-%d %H:%M}\n{text}\n")
+
+
+def _write_file_blocks(slug, output, emit):
+    """Write fenced blocks tagged `file:relative/path` into the project —
+    confined to the project directory, path traversal rejected."""
+    proj = _project_dir(slug).resolve()
+    written = []
+    for m in re.finditer(r"```file:([^\n`]+)\n(.*?)```", output, re.S):
+        rel = m.group(1).strip()
+        dest = (proj / rel).resolve()
+        if not str(dest).startswith(str(proj) + os.sep) or rel.startswith("/"):
+            emit({"event": "error",
+                  "log": f"refused unsafe file path from agent: {rel}"})
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(m.group(2), encoding="utf-8")
+        written.append(rel)
+        emit({"event": "file_written", "file": rel,
+              "log": f"wrote {rel}"})
+    return written
+
+
+def autopilot_tick(slug, emit):
+    """Run ONE step of the autopilot. Returns what happened:
+    'task' (executed one), 'replanned', 'finalized', 'complete', 'idle'."""
+    state = _auto_state(slug)
+    if state.get("status") != "running":
+        return "idle"
+    auto = _auto_dir(slug)
+    if (auto / "STOP").exists():
+        _finalize(slug, emit, stopped=True)
+        return "finalized"
+
+    plan_path = _auto_plan_path(slug)
+    if not plan_path.is_file():
+        autopilot_plan(slug, emit)
+        return "replanned"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    done_ids = {t["id"] for t in plan["tasks"] if t["status"] == "done"}
+    todo = [t for t in plan["tasks"] if t["status"] in ("todo", "blocked")
+            and all(d in done_ids for d in t["depends_on"])]
+    if not todo:
+        if all(t["status"] == "done" for t in plan["tasks"]):
+            if plan.get("project_complete"):
+                _finalize(slug, emit, stopped=False)
+                return "complete"
+            state["iteration"] = state.get("iteration", 0) + 1
+            _auto_save_state(slug, state)
+            emit({"event": "start", "stage": "autopilot",
+                  "log": f"{slug}: iteration {state['iteration']} — replanning"})
+            plan = autopilot_plan(slug, emit)
+            if plan.get("project_complete"):
+                _finalize(slug, emit, stopped=False)
+                return "complete"
+            return "replanned"
+        # recover: a crash/restart can strand tasks inprogress/reviewing
+        # (restart them), and blocked tasks are parked so replanning can
+        # decide what to do instead. If nothing changed, genuinely idle.
+        changed = False
+        for t in plan["tasks"]:
+            if t["status"] in ("inprogress", "reviewing"):
+                t["status"] = "todo"
+                changed = True
+            elif t["status"] == "blocked":
+                t["status"] = "done"
+                changed = True
+        if changed:
+            emit({"event": "error",
+                  "log": f"{slug}: recovered stranded/blocked tasks"})
+            plan_path.write_text(json.dumps(plan, indent=2) + "\n",
+                                 encoding="utf-8")
+            return "replanned"
+        return "idle"
+
+    task = todo[0]
+    task["status"] = "inprogress"
+    plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    emit({"event": "start", "stage": "autopilot",
+          "log": f"{slug}: task {task['id']} — {task['title']} "
+                 f"({task['agent']})"})
+
+    deps = ""
+    for d in task["depends_on"][:3]:
+        f = auto / f"task-{d}.md"
+        if f.is_file():
+            deps += (f"\nOutput of dependency {d} (excerpt):\n"
+                     + f.read_text(encoding="utf-8")[:2000] + "\n")
+    prompt = AUTOPILOT_TASK.format(slug=slug, goal=_project_goal(slug, 1500),
+                                   title=task["title"], detail=task["detail"],
+                                   done_when=task["done_when"], deps=deps)
+    cfg = config()
+    agent_name = task["agent"]
+    try:
+        # honor a per-task model override by running through the agent but
+        # with the override resolved here
+        output = run_agent(agent_name, prompt, emit, timeout=7 * 24 * 3600) \
+            if not task.get("model") else _run_agent_with_model(
+                agent_name, prompt, task["model"], emit)
+        written = _write_file_blocks(slug, output, emit)
+        (auto / f"task-{task['id']}.md").write_text(
+            f"# {task['title']}\n\nagent: {agent_name}  "
+            f"model: {task.get('model') or 'agent default'}\n\n"
+            + output, encoding="utf-8")
+        task["status"] = "reviewing"
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n",
+                             encoding="utf-8")
+        verdict = _verify(task, output, cfg, emit)
+        if not verdict["pass"]:
+            emit({"event": "error",
+                  "log": f"{task['id']} failed review: "
+                         f"{verdict['feedback']} — retrying once"})
+            output = run_agent(agent_name,
+                               prompt + "\n\nA reviewer rejected the "
+                               "previous attempt: " + verdict["feedback"]
+                               + "\nFix it and produce the full corrected "
+                               "work product.", emit,
+                               timeout=7 * 24 * 3600)
+            written += _write_file_blocks(slug, output, emit)
+            (auto / f"task-{task['id']}.md").write_text(
+                f"# {task['title']} (retry)\n\n" + output, encoding="utf-8")
+            verdict = _verify(task, output, cfg, emit)
+        task["status"] = "done" if verdict["pass"] else "blocked"
+    except Exception as exc:
+        task["status"] = "blocked"
+        emit({"event": "error", "log": f"{task['id']} errored: {exc}"})
+        _changelog(slug, f"- **{task['title']}** errored: {exc}")
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n",
+                             encoding="utf-8")
+        return "task"
+
+    plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    summary = " ".join(output.split())[:300]
+    _changelog(slug,
+               f"- **{task['title']}** [{task['id']}] by {agent_name} — "
+               f"{task['status']}."
+               + (f" Files: {', '.join(written)}." if written else "")
+               + f" Reasoning/result: {summary}… "
+               f"(full output: autopilot/task-{task['id']}.md)")
+    emit({"event": "stage_done", "stage": "autopilot",
+          "log": f"{slug}: {task['id']} {task['status']}"})
+    return "task"
+
+
+def _run_agent_with_model(agent_name, prompt, model_spec, emit):
+    """Execute an agent but on a plan-assigned model."""
+    cfg = config()
+    if model_spec in ("fast", "smart", "deep"):
+        target = resolve_tier(model_spec, cfg)
+    else:
+        target = _parse_spec(model_spec, cfg) or resolve_tier("smart", cfg)
+    agent = next((a for a in list_agents()
+                  if a["name"] == agent_name.lower()), None)
+    system = AGENT_HEADER.format(name=agent_name)
+    if agent:
+        if agent["role"]:
+            system += f"\n\nYour role: {agent['role']}"
+        if agent["body"]:
+            system += "\n\n" + agent["body"]
+    emit({"event": "thinking", "label": f"{agent_name} on {target['model']}"})
+    return chat_stream(target, prompt, system, timeout=7 * 24 * 3600,
+                       on_token=lambda t: emit({"event": "token", "text": t}))
+
+
+def _verify(task, output, cfg, emit):
+    emit({"event": "thinking", "label": f"verifying {task['id']}"})
+    try:
+        reply = chat_stream(
+            resolve_tier("smart", cfg),
+            f"TASK: {task['title']}\nDONE WHEN: {task['done_when']}\n\n"
+            f"WORK OUTPUT:\n{output[:6000]}",
+            AUTOPILOT_VERIFIER, force_json=True)
+        data = json.loads(reply)
+        return {"pass": bool(data.get("pass")),
+                "feedback": str(data.get("feedback", ""))[:400]}
+    except Exception as exc:
+        return {"pass": True, "feedback": f"verifier unavailable ({exc}) — "
+                "accepted unreviewed"}
+
+
+def _finalize(slug, emit, stopped):
+    auto = _auto_dir(slug)
+    (auto / "STOP").unlink(missing_ok=True)
+    changelog = ""
+    if (auto / "CHANGELOG.md").is_file():
+        changelog = (auto / "CHANGELOG.md").read_text(encoding="utf-8")
+    try:
+        report = run_agent(
+            "scribe",
+            "Write the final report for this project run: a clear list of "
+            "every change made, with the file or task reference and the "
+            "reasoning, then a short 'state of the project' paragraph and "
+            "what a human should look at first. Source changelog:\n\n"
+            + changelog[-8000:], emit)
+    except Exception as exc:
+        report = f"(report generation failed: {exc})\n\n{changelog}"
+    (auto / "FINAL-REPORT.md").write_text(
+        f"# Final report — {slug}\n\n"
+        f"run {'stopped by user' if stopped else 'completed'} at "
+        f"{datetime.datetime.now():%Y-%m-%d %H:%M}\n\n" + report + "\n",
+        encoding="utf-8")
+    state = _auto_state(slug)
+    state["status"] = "stopped" if stopped else "complete"
+    _auto_save_state(slug, state)
+    emit({"event": "stage_done", "stage": "autopilot",
+          "log": f"{slug}: final report written "
+                 "(autopilot/FINAL-REPORT.md)"})
+    try:
+        if "mission-done" in config()["webhooks"]:
+            trigger_webhook("mission-done",
+                            f"autopilot {slug} "
+                            + ("stopped" if stopped else "complete"))
+    except Exception:
+        pass
+
+
+def autopilot_start(slug):
+    _project_dir(slug)  # validates
+    state = _auto_state(slug)
+    state["status"] = "running"
+    state.setdefault("iteration", 0)
+    state["started"] = f"{datetime.datetime.now():%Y-%m-%dT%H:%M}"
+    (_auto_dir(slug) / "STOP").unlink(missing_ok=True)
+    _auto_save_state(slug, state)
+    return state
+
+
+def autopilot_stop(slug):
+    """Graceful: the worker finishes the current task, then writes the
+    final report and stands down."""
+    (_auto_dir(slug) / "STOP").touch()
+    return _auto_state(slug)
 
 
 # ---------------------------------------------------------------- config edit

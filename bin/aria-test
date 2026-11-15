@@ -347,6 +347,32 @@ def main():
         return "queued -> ran -> done, output persisted"
     check("background mission — live model", c_missions)
 
+    def c_autopilot():
+        need_backend()
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        slug = state["slug"]
+        quiet = lambda e: None
+        plan = eng.autopilot_plan(slug, quiet)
+        assert plan["tasks"], "planner produced no tasks"
+        eng.autopilot_start(slug)
+        r = eng.autopilot_tick(slug, quiet)
+        if r == "replanned":
+            r = eng.autopilot_tick(slug, quiet)
+        assert r == "task", f"expected a task execution, got {r}"
+        eng.autopilot_stop(slug)
+        r = eng.autopilot_tick(slug, quiet)
+        assert r == "finalized", f"expected finalize after stop, got {r}"
+        auto = os.path.join(sandbox, "pipeline/02-potential-projects",
+                            slug, "autopilot")
+        assert os.path.isfile(os.path.join(auto, "CHANGELOG.md"))
+        assert os.path.isfile(os.path.join(auto, "FINAL-REPORT.md"))
+        n = sum(1 for t in json.load(open(os.path.join(auto, "plan.json")))
+                ["tasks"] if t["status"] == "done")
+        return (f"planned {len(plan['tasks'])} task(s), executed+verified "
+                f"{n}, stopped gracefully, final report written")
+    check("autopilot — live model", c_autopilot)
+
     def c_skills():
         names = eng.list_skill_names()
         if not names:

@@ -358,6 +358,17 @@ aria/
 └── bin/aria                   # capture + headless automation CLI
 ```
 
+## Autopilot — she works the project, you sleep
+
+`work on <slug>` starts the autonomous loop: plan (agents, skills and
+models assigned per task) -> execute -> verify -> auto-advance -> replan,
+recursively, until you say `stop working on <slug>` — then she finishes
+the task in flight and writes a final report of every change with
+references and reasoning. Watch it on the **Projects** page: Kanban board
+(To Do / Planning / In Progress / Reviewing / Done), a dependency-driven
+Gantt chart, the changelog, and the report. Details:
+**[docs/AUTOPILOT.md](docs/AUTOPILOT.md)**.
+
 ## Integrations & reach
 
 A.R.I.A.'s control model is **capability through named allowlists**: she
