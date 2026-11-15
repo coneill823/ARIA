@@ -204,7 +204,10 @@ MoE models keep attention on the GPU and park expert weights in system
 RAM (`--n-cpu-moe` — presets in `bin/aria-llama serve smart|deep`), which
 is what makes 30B fast and ~120B possible on this hardware. For going
 further — 671B and 1T-class models streamed from NVMe at ~1 tok/s — see
-**[docs/BIG-MODELS.md](docs/BIG-MODELS.md)**.
+**[docs/BIG-MODELS.md](docs/BIG-MODELS.md)**. To install the whole
+model roster and assign a brain per agent — plus background **missions**
+that keep agents working with every tab closed — see
+**[docs/MODEL-GARAGE.md](docs/MODEL-GARAGE.md)**.
 
 ### The pipeline board — watch A.R.I.A. work
 

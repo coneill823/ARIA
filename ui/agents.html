@@ -53,7 +53,7 @@
          overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere;
          font-size: 13.5px; }
   #out .lbl { color: var(--dim); font-family: var(--mono); font-size: 12px; }
-  #skills-note { color: var(--dim); font-size: 12px; margin: 4px 0 12px; }
+  #skills-note, #missions-note { color: var(--dim); font-size: 12px; margin: 4px 0 12px; }
 </style>
 </head>
 <body>
@@ -68,6 +68,13 @@
     pack, see <code>aria skills list</code>) or pin a model tier
     (fast / smart / deep). Changes apply on the next run.</div>
     <div id="agents"></div>
+    <div id="missions-note" style="margin-top:14px">
+      <b style="color:var(--accent);font-size:12px;letter-spacing:1px">MISSIONS</b>
+      — background jobs ("mission strategist to …" in chat, or
+      <code>aria mission</code>). They run on the server even with every tab
+      closed; click one to read its output.
+    </div>
+    <div id="missions"></div>
   </div>
   <div id="work">
     <textarea id="task" placeholder="Pick an agent, describe the task, run. (In chat you can also say: “ask the critic to review the meal planner plan”.)"></textarea>
@@ -140,7 +147,35 @@ $('#run').onclick = async () => {
   busy = false; $('#run').disabled = false;
 };
 
+async function loadMissions() {
+  try {
+    const r = await (await fetch('/api/missions')).json();
+    const el = $('#missions'); el.replaceChildren();
+    for (const m of r.missions.slice().reverse()) {
+      const d = document.createElement('div');
+      d.className = 'agent';
+      const h = document.createElement('h2');
+      h.textContent = (m.status === 'running' ? '⟳ ' :
+                       m.status === 'queued' ? '… ' :
+                       m.status === 'done' ? '✓ ' : '✗ ') + m.id;
+      const rr = document.createElement('div'); rr.className = 'role';
+      rr.textContent = m.task;
+      const b = document.createElement('span');
+      b.className = 'badge' + (m.status === 'done' ? '' : ' model');
+      b.textContent = m.status;
+      d.append(h, rr, b);
+      d.onclick = async () => {
+        const n = await (await fetch('/api/note?path=' +
+          encodeURIComponent(m.path))).json();
+        $('#out').textContent = n.content || n.error || '';
+      };
+      el.appendChild(d);
+    }
+  } catch {}
+}
+
 load();
+loadMissions(); setInterval(loadMissions, 15000);
 </script>
 </body>
 </html>

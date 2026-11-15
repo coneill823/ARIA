@@ -87,6 +87,24 @@ def config():
     }
 
 
+def _parse_spec(spec, cfg):
+    """Parse a 'backend/model' spec against configured backends; None if
+    the backend name is unknown."""
+    backend, _, model = spec.partition("/")
+    backend = backend.strip().lower()
+    model = model.strip()
+    if not model:  # bare model name means ollama
+        backend, model = "ollama", backend
+    url = cfg["backend_urls"].get(backend)
+    if url is None:
+        return None
+    kind = "ollama" if backend == "ollama" else "openai"
+    key = (os.environ.get(f"ARIA_KEY_{backend.upper()}")
+           or cfg["backend_keys"].get(backend) or "local")
+    return {"kind": kind, "url": url, "model": model,
+            "backend": backend, "key": key}
+
+
 def resolve_tier(tier, cfg=None):
     """Turn a tier name (fast/smart/deep) into a callable backend target:
     {"kind": "ollama"|"openai", "url", "model", "tier"}. Unset tiers fall
@@ -99,39 +117,33 @@ def resolve_tier(tier, cfg=None):
     if not spec:  # legacy single-model config
         return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
                 "tier": tier}
-    backend, _, model = spec.partition("/")
-    backend = backend.strip().lower()
-    model = model.strip()
-    if not model:  # bare model name means ollama
-        backend, model = "ollama", backend
-    url = cfg["backend_urls"].get(backend)
-    if url is None:  # unknown backend name — fail soft to legacy ollama
+    target = _parse_spec(spec, cfg)
+    if target is None:  # unknown backend name — fail soft to legacy ollama
         return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
                 "tier": tier}
-    kind = "ollama" if backend == "ollama" else "openai"
-    key = (os.environ.get(f"ARIA_KEY_{backend.upper()}")
-           or cfg["backend_keys"].get(backend) or "local")
-    return {"kind": kind, "url": url, "model": model, "tier": tier,
-            "backend": backend, "key": key}
+    target["tier"] = tier
+    return target
 
 
-def chat_stream(target, prompt, system=None, force_json=False, on_token=None):
+def chat_stream(target, prompt, system=None, force_json=False, on_token=None,
+                timeout=3600):
     """Single-prompt convenience wrapper around chat_messages."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
     return chat_messages(target, messages, force_json=force_json,
-                         on_token=on_token)
+                         on_token=on_token, timeout=timeout)
 
 
-def chat_messages(target, messages, force_json=False, on_token=None):
+def chat_messages(target, messages, force_json=False, on_token=None,
+                  timeout=3600):
     """Stream a chat completion from the target backend; returns the full
     reply text. `target` comes from resolve_tier() — a legacy config dict
     (url+model, no kind) is treated as Ollama."""
     kind = target.get("kind", "ollama")
     if kind == "openai":
-        return _openai_stream(target, messages, force_json, on_token)
+        return _openai_stream(target, messages, force_json, on_token, timeout)
     body = {"model": target["model"], "stream": True, "messages": messages}
     if force_json:
         body["format"] = "json"
@@ -142,8 +154,8 @@ def chat_messages(target, messages, force_json=False, on_token=None):
     )
     parts = []
     # generous timeout: a larger-than-RAM "giant" model can sit silent for
-    # many minutes processing the prompt before the first token streams
-    with urllib.request.urlopen(req, timeout=3600) as resp:
+    # a long time processing the prompt before the first token streams
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             raw = raw.strip()
             if not raw:
@@ -159,7 +171,8 @@ def chat_messages(target, messages, force_json=False, on_token=None):
     return "".join(parts)
 
 
-def _openai_stream(target, messages, force_json=False, on_token=None):
+def _openai_stream(target, messages, force_json=False, on_token=None,
+                   timeout=3600):
     """Streaming client for any OpenAI-compatible server (llama.cpp
     llama-server, LM Studio, vLLM...)."""
     body = {"model": target["model"], "stream": True, "messages": messages}
@@ -172,7 +185,7 @@ def _openai_stream(target, messages, force_json=False, on_token=None):
                  "Authorization": "Bearer " + target.get("key", "local")},
     )
     parts = []
-    with urllib.request.urlopen(req, timeout=3600) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             raw = raw.strip()
             if not raw.startswith(b"data:"):
@@ -769,6 +782,20 @@ def board_summary_text():
     if b["active"]:
         parts.append("active projects: " + ", ".join(
             f"{p['slug']} ({p['phase']})" for p in b["active"]))
+    missions = mission_list()
+    if missions:
+        running = [m for m in missions if m["status"] == "running"]
+        queued = [m for m in missions if m["status"] == "queued"]
+        done = [m for m in missions if m["status"] in ("done", "failed")]
+        mp = []
+        if running:
+            mp.append("running: " + ", ".join(m["id"] for m in running))
+        if queued:
+            mp.append(f"{len(queued)} queued")
+        if done:
+            mp.append("latest finished: " + done[-1]["id"]
+                      + f" ({done[-1]['status']})")
+        parts.append("background missions — " + "; ".join(mp))
     return "; ".join(parts)
 
 
@@ -785,6 +812,9 @@ INTENT_SKILL_OFF = re.compile(
 INTENT_AGENT = re.compile(
     r"^\s*(?:ask|tell|have|get)\s+(?:the\s+)?(\w[\w-]*)\s+(?:agent\s+)?to\s+(.+)$",
     re.I | re.S)
+INTENT_MISSION = re.compile(
+    r"^\s*(?:mission|overnight|background|queue)\b[:,]?\s*(?:ask\s+)?"
+    r"(?:the\s+)?(\w[\w-]*)\s+(?:agent\s+)?to\s+(.+)$", re.I | re.S)
 INTENT_TRIGGER = re.compile(
     r"^\s*(?:trigger|fire|run webhook|launch webhook)\s+([\w.-]+)"
     r"(?:\s*[:,]?\s*(.*))?$", re.I | re.S)
@@ -815,6 +845,10 @@ def detect_intent(text):
     if m and m.group(1).lower() in config()["webhooks"]:
         return {"action": "webhook", "name": m.group(1).lower(),
                 "message": (m.group(2) or "").strip()}
+    m = INTENT_MISSION.match(text)
+    if m and m.group(1).lower() in {a["name"] for a in list_agents()}:
+        return {"action": "mission", "name": m.group(1).lower(),
+                "task": m.group(2).strip()}
     m = INTENT_AGENT.match(text)
     if m and m.group(1).lower() in {a["name"] for a in list_agents()}:
         return {"action": "agent", "name": m.group(1).lower(),
@@ -940,15 +974,26 @@ def list_agents():
     return agents
 
 
-def run_agent(name, task, emit):
-    """Run one agent on one task: role + assigned skills + assigned model
-    tier. Streams thinking via emit; returns the agent's reply."""
+def run_agent(name, task, emit, timeout=3600):
+    """Run one agent on one task: role + assigned skills + assigned model.
+    `model:` in the agent's frontmatter may be a tier (fast/smart/deep) OR
+    a direct backend/model spec like `ollama/gpt-oss:120b` or
+    `llamacpp/giant` — so agents can choose ANY installed model.
+    Streams thinking via emit; returns the agent's reply."""
     agent = next((a for a in list_agents() if a["name"] == name.lower()), None)
     if agent is None:
         raise ValueError(f"no such agent: {name} (defined in system/agents/)")
     cfg = config()
-    target = resolve_tier(agent["model"] if agent["model"] in
-                          ("fast", "smart", "deep") else "smart", cfg)
+    mspec = (agent["model"] or "smart").strip()
+    if mspec in ("fast", "smart", "deep"):
+        target = resolve_tier(mspec, cfg)
+    else:
+        target = _parse_spec(mspec, cfg)
+        if target is None:
+            emit({"event": "error",
+                  "log": f"agent model '{mspec}' has no configured backend "
+                         "— falling back to smart"})
+            target = resolve_tier("smart", cfg)
     system = AGENT_HEADER.format(name=agent["name"])
     if agent["role"]:
         system += f"\n\nYour role: {agent['role']}"
@@ -967,11 +1012,103 @@ def run_agent(name, task, emit):
                  + (f", skills: {', '.join(loaded)}" if loaded else "")
                  + f") working on: {task[:120]}"})
     emit({"event": "thinking", "label": f"{agent['name']} thinking"})
-    reply = chat_stream(target, task, system,
+    reply = chat_stream(target, task, system, timeout=timeout,
                         on_token=lambda t: emit({"event": "token", "text": t}))
     emit({"event": "stage_done", "stage": "agent", "agent": agent["name"],
           "log": f"agent {agent['name']} finished"})
     return reply
+
+
+# ---------------------------------------------------------------- missions
+
+MISSIONS = ROOT / "pipeline" / "missions"
+
+
+def mission_create(agent_name, task):
+    """Queue a background job for an agent. Missions are plain markdown
+    files; a worker (in the UI server, or `aria missions run`) executes
+    them one at a time and appends the output — so a giant model can think
+    for hours with no browser tab open."""
+    agent_name = agent_name.lower().strip()
+    if not any(a["name"] == agent_name for a in list_agents()):
+        raise ValueError(f"no such agent: {agent_name}")
+    task = task.strip()
+    if not task:
+        raise ValueError("empty task")
+    MISSIONS.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now()
+    path = unique_path(MISSIONS / f"{now:%Y%m%d-%H%M}-{agent_name}.md")
+    path.write_text(
+        f"---\nid: {path.stem}\nagent: {agent_name}\nstatus: queued\n"
+        f"created: {now:%Y-%m-%dT%H:%M}\nstarted:\nfinished:\n---\n\n"
+        f"## Task\n\n{task}\n", encoding="utf-8")
+    return path
+
+
+def mission_list():
+    out = []
+    if MISSIONS.is_dir():
+        for p in sorted(MISSIONS.glob("*.md")):
+            fm, _, body = parse_note(p)
+            m = re.search(r"## Task\s*\n+(.*?)(?=\n## |\Z)", body, re.S)
+            out.append({"id": p.stem, "path": str(p.relative_to(ROOT)),
+                        "agent": fm.get("agent", "?"),
+                        "status": fm.get("status", "?"),
+                        "created": fm.get("created", ""),
+                        "finished": fm.get("finished", ""),
+                        "task": " ".join((m.group(1) if m else "").split())[:160]})
+    return out
+
+
+def mission_run_next(emit):
+    """Execute the oldest queued mission (blocking). Returns its id, or
+    None when the queue is empty. Output is appended to the mission file;
+    failures are recorded, never lost. If a webhook named 'mission-done'
+    is configured, it is triggered on completion."""
+    queued = [m for m in mission_list() if m["status"] == "queued"]
+    if not queued:
+        return None
+    m = queued[0]
+    path = ROOT / m["path"]
+    fm, _, body = parse_note(path)
+    task_m = re.search(r"## Task\s*\n+(.*?)(?=\n## |\Z)", body, re.S)
+    task = (task_m.group(1) if task_m else "").strip()
+    update_frontmatter(path, status="running",
+                       started=f"{datetime.datetime.now():%Y-%m-%dT%H:%M}")
+    emit({"event": "start", "stage": "mission", "mission": m["id"],
+          "log": f"mission {m['id']} started ({m['agent']})"})
+    try:
+        reply = run_agent(m["agent"], task, emit, timeout=7 * 24 * 3600)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## Output\n\n{reply.strip()}\n")
+        update_frontmatter(path, status="done",
+                           finished=f"{datetime.datetime.now():%Y-%m-%dT%H:%M}")
+        emit({"event": "stage_done", "stage": "mission", "mission": m["id"],
+              "log": f"mission {m['id']} done"})
+    except Exception as exc:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## Output\n\nFAILED: {exc}\n")
+        update_frontmatter(path, status="failed",
+                           finished=f"{datetime.datetime.now():%Y-%m-%dT%H:%M}")
+        emit({"event": "error", "log": f"mission {m['id']} failed: {exc}"})
+    try:
+        if "mission-done" in config()["webhooks"]:
+            trigger_webhook("mission-done",
+                            f"mission {m['id']} ({m['agent']}) finished")
+    except Exception:
+        pass  # notification is best-effort, never fails a mission
+    return m["id"]
+
+
+def mission_requeue_stale():
+    """A mission left 'running' by a crashed/restarted server restarts
+    from scratch (generations can't be checkpointed)."""
+    fixed = []
+    for m in mission_list():
+        if m["status"] == "running":
+            update_frontmatter(ROOT / m["path"], status="queued", started="")
+            fixed.append(m["id"])
+    return fixed
 
 
 # ---------------------------------------------------------------- config edit

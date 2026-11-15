@@ -153,7 +153,9 @@ def main():
                  ("run search for engineering companies with open job "
                   "postings", "no-web"),
                  ("find me cheap flights online", "no-web"),
-                 ("run diagnostics", "explain-commands")]
+                 ("run diagnostics", "explain-commands"),
+                 ("mission critic to check everything", "mission"),
+                 ("overnight ask the critic to review the plan", "mission")]
         for text, want in cases:
             got = (eng.detect_intent(text) or {}).get("action")
             assert got == want, f"'{text}' -> {got}, wanted {want}"
@@ -332,6 +334,18 @@ def main():
         return f"{len(agents)} agents; critic replied " \
                f"({len(''.join(toks))} chars)"
     check("agent run — live model", c_agent)
+
+    def c_missions():
+        need_backend()
+        p = eng.mission_create("critic", "reply with one short sentence")
+        assert any(m["status"] == "queued" for m in eng.mission_list())
+        mid = eng.mission_run_next(lambda e: None)
+        assert mid == p.stem, f"ran {mid}, expected {p.stem}"
+        m = next(x for x in eng.mission_list() if x["id"] == mid)
+        assert m["status"] == "done", f"mission ended as {m['status']}"
+        assert "## Output" in p.read_text(encoding="utf-8")
+        return "queued -> ran -> done, output persisted"
+    check("background mission — live model", c_missions)
 
     def c_skills():
         names = eng.list_skill_names()

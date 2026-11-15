@@ -180,10 +180,33 @@ case "$cmd" in
 
   service)
     what="${1:-smart}"
+    gguf="${2:-}"
+    svcport="${3:-$PORT}"
     server_bin >/dev/null || { echo "run 'aria-llama install' first" >&2; exit 1; }
     SYSD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$SYSD"
-    cat > "$SYSD/aria-llama.service" <<UNIT
+    if [ -n "$gguf" ]; then
+      # named instance: its own unit + port, so several models can serve
+      # at once (add `<name>: http://localhost:<port>` under aria.backends,
+      # then agents use  model: <name>/anything)
+      [ -f "$gguf" ] || { echo "model not found: $gguf" >&2; exit 1; }
+      unit="aria-llama-$what.service"
+      cat > "$SYSD/$unit" <<UNIT
+[Unit]
+Description=A.R.I.A. llama.cpp server ($what on :$svcport)
+
+[Service]
+Environment=ARIA_LLAMACPP_PORT=$svcport
+ExecStart=$ARIA_ROOT/bin/aria-llama serve giant $gguf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+    else
+      unit="aria-llama.service"
+      cat > "$SYSD/$unit" <<UNIT
 [Unit]
 Description=A.R.I.A. llama.cpp server ($what)
 
@@ -195,10 +218,11 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 UNIT
+    fi
     systemctl --user daemon-reload
-    systemctl --user enable --now aria-llama.service
-    echo "aria-llama.service enabled (serving '$what' at login)"
-    echo "logs: journalctl --user -u aria-llama -f"
+    systemctl --user enable --now "$unit"
+    echo "$unit enabled (port $svcport)"
+    echo "logs: journalctl --user -u ${unit%.service} -f"
     ;;
 
   ""|-h|--help|help) usage ;;

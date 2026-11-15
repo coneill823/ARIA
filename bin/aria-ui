@@ -24,6 +24,7 @@ Stdlib only. Endpoints:
 import json
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -89,6 +90,8 @@ class Handler(BaseHTTPRequestHandler):
                                           eng.resolve_tier(t, cfg)["model"])
                                       for t in ("fast", "smart", "deep")},
                             "stt_model": cfg["stt_model"]})
+        elif url.path == "/api/missions":
+            self.send_json({"missions": eng.mission_list()})
         elif url.path == "/api/agents":
             self.send_json({"agents": [
                 {k: a[k] for k in ("name", "role", "skills", "model", "path")}
@@ -231,6 +234,18 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"event": "action", "action": "explain-commands",
                       "say": "That's not a command I have. "
                              + eng.known_commands_text()})
+            elif intent and intent["action"] == "mission":
+                try:
+                    path = eng.mission_create(intent["name"], intent["task"])
+                    emit({"event": "action", "action": "mission",
+                          "name": intent["name"], "id": path.stem,
+                          "say": f"Mission queued for the {intent['name']} — "
+                                 "it runs in the background even if you "
+                                 "close this tab. Ask me about missions "
+                                 "anytime, or watch the Agents page."})
+                except ValueError as exc:
+                    emit({"event": "action", "action": "mission",
+                          "say": str(exc)})
             elif intent and intent["action"] == "agent":
                 emit({"event": "action", "action": "agent",
                       "name": intent["name"], "task": intent["task"],
@@ -312,8 +327,28 @@ class Handler(BaseHTTPRequestHandler):
             RUN_LOCK.release()
 
 
+def mission_worker():
+    """Background executor: drains the mission queue one job at a time,
+    forever. Lives inside the always-on server, so missions keep running
+    with every browser tab closed. Pipeline runs (RUN_LOCK) are not
+    blocked — a days-long giant-model mission must not freeze triage."""
+    for mid in eng.mission_requeue_stale():
+        print(f"mission {mid} was interrupted by a restart — requeued")
+    while True:
+        try:
+            ran = eng.mission_run_next(
+                lambda ev: print("mission:", ev["log"])
+                if ev.get("log") else None)
+        except Exception as exc:
+            print("mission worker error:", exc)
+            ran = None
+        if not ran:
+            time.sleep(20)
+
+
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8700
+    threading.Thread(target=mission_worker, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"A.R.I.A. UI -> http://127.0.0.1:{port}  (Ctrl+C to stop)")
     try:
