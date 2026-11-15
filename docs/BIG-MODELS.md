@@ -12,7 +12,8 @@ memory holds the always-used layers; the rest streams from NVMe.
 |---|---|---|
 | VRAM (16GB) | instant | Qwen3-30B-A3B Q4 (~19GB, partly in RAM) — the `smart` default |
 | RAM+VRAM (~78GB) | fast (5–20 t/s) | gpt-oss-120b (~63GB), GLM-4.5-Air, Qwen3-235B-A22B at ~2-bit (~85GB, borderline) |
-| NVMe-streamed | **0.5–2 t/s** | DeepSeek-V3.1/R1 **671B** (~170–230GB), **Kimi K2 1T** (~250–380GB) |
+| NVMe-streamed | **0.5–2 t/s** | DeepSeek-V3.x **671B** (37B active, ~170–230GB), **Kimi K2 1T** (32B active, ~250–380GB) |
+| NVMe-streamed, summit | **~0.05–0.25 t/s** | **Kimi K3 2.8T** (104B active — UD-IQ1_S ~594GB). Runs, but ~22GB of experts stream per token: answers take overnight-to-days. Needs ~600GB+ free disk; skip the 861GB 2-bit on a 1.8TB drive. |
 
 Rules of thumb: weights-on-disk works because of mmap — the OS pages in
 only the experts each token touches. Generation speed is then your SSD's
