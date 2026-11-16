@@ -249,15 +249,20 @@ import sys, json
 sys.path.insert(0, '$ARIA_ROOT/bin')
 import aria_engine as eng
 slug, action = sys.argv[1], sys.argv[2]
-if action == 'start':
-    print(json.dumps(eng.autopilot_start(slug)))
-    print('running — the always-on server works it continuously;')
-    print('watch /projects, or tail the changelog in <project>/autopilot/')
-elif action == 'stop':
-    eng.autopilot_stop(slug)
-    print('stop requested — current task finishes, then the final report is written')
-else:
-    print(json.dumps(eng._auto_state(slug), indent=2))
+try:
+    if action == 'start':
+        print(json.dumps(eng.autopilot_start(slug)))
+        print('running — the always-on server works it continuously;')
+        print('watch /projects, or tail the changelog in <project>/autopilot/')
+    elif action == 'stop':
+        eng.autopilot_stop(slug)
+        print('stop requested — current task finishes, then the final report is written')
+    else:
+        print(json.dumps(eng._auto_state(slug), indent=2))
+except ValueError as exc:
+    known = ', '.join(p['slug'] for p in eng.list_projects()) or 'none yet'
+    print(f'{exc}  (projects: {known})', file=sys.stderr)
+    sys.exit(1)
 " "$slug" "$action"
     ;;
 
@@ -268,8 +273,11 @@ else:
 import sys
 sys.path.insert(0, '$ARIA_ROOT/bin')
 import aria_engine as eng
-plan = eng.autopilot_plan(sys.argv[1],
-    lambda ev: print(ev['log']) if ev.get('log') else None)
+try:
+    plan = eng.autopilot_plan(sys.argv[1],
+        lambda ev: print(ev['log']) if ev.get('log') else None)
+except ValueError as exc:
+    print(exc, file=sys.stderr); sys.exit(1)
 for t in plan['tasks']:
     print(f\"{t['status']:10} {t['id']:4} {t['agent']:12} {t['title']}\")
 " "$slug"

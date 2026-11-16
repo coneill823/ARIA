@@ -199,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.plan_project(body)
             elif url.path == "/api/chat":
                 self.chat(body)
+            elif url.path == "/api/say":
+                self.say(body)
             elif url.path == "/api/agent":
                 self.agent(body)
             else:
@@ -339,6 +341,79 @@ class Handler(BaseHTTPRequestHandler):
             emit({"event": "done"})
         finally:
             RUN_LOCK.release()
+
+    def say(self, body):
+        """Plain JSON in/out for integrations (Alexa via n8n, scripts…):
+        {"text": "..."} -> {"reply": "..."}. Commands execute (long runs
+        start in the background); everything else is fast-tier chat."""
+        text = str(body.get("text", "")).strip()
+        if not text:
+            self.send_json({"error": "text required"}, 400)
+            return
+        try:
+            intent = eng.detect_intent(text)
+            if intent and intent["action"] == "capture":
+                path = eng.capture_note(intent["text"], source="integration")
+                auto = eng.config()["auto_pipeline"]
+                reply = f"Captured as {path.stem}."
+                if auto and self._start_stage("auto", path.name):
+                    reply += " The pipeline is processing it now."
+            elif intent and intent["action"] in ("triage", "develop"):
+                started = self._start_stage(intent["action"], "")
+                reply = (f"Running {intent['action']} in the background."
+                         if started else "I'm mid-run on something else — "
+                         "try again in a minute.")
+            elif intent and intent["action"] == "webhook":
+                status = eng.trigger_webhook(intent["name"],
+                                             intent.get("message", ""))
+                reply = f"Triggered {intent['name']}, it answered {status}."
+            elif intent and intent["action"] == "mission":
+                eng.mission_create(intent["name"], intent["task"])
+                reply = f"Mission queued for the {intent['name']}."
+            elif intent and intent["action"] == "autopilot-start":
+                eng.autopilot_start(intent["slug"])
+                reply = f"Autopilot engaged on {intent['slug']}."
+            elif intent and intent["action"] == "autopilot-stop":
+                eng.autopilot_stop(intent["slug"])
+                reply = (f"Standing down on {intent['slug']} after the "
+                         "current task.")
+            elif intent and intent["action"] == "no-web":
+                reply = ("I'm fully local with no web access. Say capture, "
+                         "followed by the idea, and I'll plan it instead.")
+            elif intent and intent["action"] == "explain-commands":
+                reply = eng.known_commands_text()
+            elif intent and intent["action"] in ("use-skill", "drop-skill"):
+                reply = ("Skills are a chat-session feature — use the app "
+                         "for that one.")
+            else:
+                reply = eng.converse(
+                    [{"role": "user", "content": text}]) or "…"
+            self.send_json({"reply": reply})
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 500)
+
+    def _start_stage(self, stage, file):
+        """Fire a pipeline stage in the background (for /api/say callers
+        that can't hold an SSE stream open)."""
+        if not RUN_LOCK.acquire(blocking=False):
+            return False
+
+        def run():
+            try:
+                files = [f"pipeline/00-inbox/{Path(file).name}"] if file \
+                    else None
+                quiet = lambda ev: None
+                if stage == "triage":
+                    eng.triage_run(quiet, files=files)
+                elif stage == "develop":
+                    eng.develop_run(quiet)
+                else:
+                    eng.auto_run(quiet, files=files)
+            finally:
+                RUN_LOCK.release()
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
 
     def agent(self, body):
         name = str(body.get("name", "")).strip()
