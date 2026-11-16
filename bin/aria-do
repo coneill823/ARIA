@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""aria-do — the engine-backed verbs of the `aria` command line.
+
+`bin/aria` handles capture, installs and the headless pipeline stages
+itself and hands everything below to this script:
+
+  agent <name> "task"            run one agent, streaming to the terminal
+  mission <agent> "task"         queue a background job
+  missions [run]                 list missions / drain the queue here
+  projects                       every project and what autopilot is doing
+  approve <slug>                 THE HUMAN GATE: approve a proposed plan
+  autopilot <slug> start|stop|status|run|steer "guidance"
+  plan <slug>                    assess + (re)plan a project now
+  search "query"                 web search
+  fetch <url>                    read a web page as text
+  brain "text"                   write a note into the Obsidian vault
+  github status|init|publish|push <slug> [--public] [--force]
+  trigger <webhook> [message]    fire an allowlisted webhook
+  reach                          what is switched on (used by doctor)
+"""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aria_engine as eng  # noqa: E402
+
+
+def log(ev):
+    if ev.get("log"):
+        print(ev["log"], flush=True)
+
+
+def stream(ev):
+    if ev.get("event") == "token":
+        print(ev["text"], end="", flush=True)
+    elif ev.get("log"):
+        print("[" + ev["log"] + "]", file=sys.stderr, flush=True)
+
+
+def need(args, n, usage):
+    if len(args) < n:
+        raise SystemExit("usage: aria " + usage)
+
+
+def projects_hint():
+    return ", ".join(p["slug"] for p in eng.list_projects()) or "none yet"
+
+
+def cmd_agent(args):
+    need(args, 2, 'agent <name> "task"')
+    eng.run_agent(args[0], " ".join(args[1:]), stream)
+    print()
+
+
+def cmd_mission(args):
+    need(args, 2, 'mission <agent> "task"')
+    p = eng.mission_create(args[0], " ".join(args[1:]))
+    print(f"queued -> {p.relative_to(eng.ROOT)}")
+    print("it runs inside the always-on server (aria ui / aria.service), or "
+          "drain the queue here with: aria missions run")
+
+
+def cmd_missions(args):
+    if args[:1] == ["run"]:
+        eng.mission_requeue_stale()
+        while True:
+            if not eng.mission_run_next(log):
+                print("queue empty")
+                return
+    ms = eng.mission_list()
+    if not ms:
+        print('no missions yet — queue one: aria mission <agent> "task"')
+    for m in ms:
+        print(f"{m['status']:8} {m['id']:34} {m['task'][:70]}")
+
+
+def cmd_projects(_args):
+    rows = eng.list_projects()
+    if not rows:
+        print("no projects yet — capture an idea and run: aria auto")
+    for p in rows:
+        gate = "approved" if p["approved"] else "awaiting approval"
+        line = f"{p['slug']:34} {p['kind']:9} {gate:18} {p['autopilot']}"
+        if p["autopilot"] == "running":
+            line += (f" · iteration {p['iteration']} · {p['done']}/"
+                     f"{p['total']} tasks"
+                     + (f" · {p['waiting']}" if p["waiting"] else
+                        (f" · now: {p['current']}" if p["current"] else "")))
+        print(line)
+
+
+def cmd_approve(args):
+    need(args, 1, "approve <slug>")
+    path = eng.approve_project(args[0], via="cli")
+    print(f"approved -> {path}")
+    print(f"start work with: aria autopilot {args[0]} start")
+
+
+def cmd_autopilot(args):
+    need(args, 1, 'autopilot <slug> start|stop|status|run|steer "guidance"')
+    slug, action = args[0], (args[1] if len(args) > 1 else "status")
+    if action in ("start", "run"):
+        state = eng.autopilot_start(slug, via="cli")
+        print(f"autopilot engaged on {slug} (run {state['run']})")
+        if action == "run":
+            print("working here until it finishes — Ctrl+C or "
+                  f"`aria autopilot {slug} stop` to end it gracefully")
+            try:
+                result = eng._autopilot().run_forever(slug, log)
+            except KeyboardInterrupt:
+                print("\nstopping after the current step…")
+                eng.autopilot_stop(slug)
+                result = eng._autopilot().run_forever(slug, log)
+            print(f"ended: {result} — report: "
+                  f"{eng._auto_dir(slug) / 'FINAL-REPORT.md'}")
+        else:
+            print("the always-on server works it continuously (aria ui / "
+                  "aria.service); without the server, use: "
+                  f"aria autopilot {slug} run")
+    elif action == "stop":
+        eng.autopilot_stop(slug)
+        print("stop requested — the current step finishes, then the final "
+              "report is written")
+    elif action == "steer":
+        need(args, 3, 'autopilot <slug> steer "guidance"')
+        eng.autopilot_steer(slug, " ".join(args[2:]), via="cli")
+        print("noted — unstarted work is replanned around it")
+    else:
+        print(eng.project_status_text(slug))
+        state = eng._auto_state(slug)
+        state.pop("run_started", None)
+        print(json.dumps(state, indent=2))
+
+
+def cmd_plan(args):
+    need(args, 1, "plan <slug>")
+    plan = eng.autopilot_plan(args[0], log)
+    for t in plan["tasks"]:
+        print(f"{t['status']:10} {t['id']:5} {t['agent']:14} "
+              f"{(t['model'] or '-'):8} {t['title']}")
+
+
+def cmd_search(args):
+    need(args, 1, 'search "query"')
+    print(eng.aria_web.format_results(eng.web_search(" ".join(args))))
+
+
+def cmd_fetch(args):
+    need(args, 1, "fetch <url>")
+    page = eng.web_fetch(args[0], limit=20000)
+    if page["title"]:
+        print(f"# {page['title']}\n{page['url']}\n")
+    print(page["text"])
+
+
+def cmd_brain(args):
+    need(args, 1, 'brain "text to remember"')
+    print(f"written -> {eng.brain_note(' '.join(args), source='cli')}")
+
+
+def cmd_github(args):
+    need(args, 2, "github status|init|publish|push <slug> [--public] [--force]")
+    action, slug = args[0], args[1]
+    flags = set(args[2:])
+    if action == "init":
+        info = eng.project_git_init(slug, force="--force" in flags)
+        print(f"{slug} is its own repository now (branch {info['branch']})")
+    elif action == "publish":
+        url = eng.project_publish(slug, private="--public" not in flags)
+        print(f"published -> {url}")
+    elif action == "push":
+        print(eng.project_push(slug)["say"])
+    elif action == "status":
+        print(json.dumps(eng.project_git(slug), indent=2))
+    else:
+        raise SystemExit("usage: aria github status|init|publish|push <slug>")
+
+
+def cmd_trigger(args):
+    need(args, 1, "trigger <webhook-name> [message]")
+    status = eng.trigger_webhook(args[0], " ".join(args[1:]))
+    print(f"triggered {args[0]} -> HTTP {status}")
+
+
+def cmd_reach(_args):
+    cfg = eng.config()
+    if cfg["web_access"]:
+        chain = eng.aria_web.provider_chain(cfg)
+        print("ok   web access on — search via "
+              + (" → ".join(chain) if chain else "(search disabled)")
+              + ("; fetch limited to " + ", ".join(cfg["web_allowlist"])
+                 if cfg["web_allowlist"] else ""))
+    else:
+        print("note web access off (aria.web_access) — she will say she "
+              "cannot browse")
+    if cfg["obsidian_vault"]:
+        print(("ok   " if eng.brain_ready(cfg) else "MISS ")
+              + f"Obsidian vault {cfg['obsidian_vault']}"
+              + ("" if eng.brain_ready(cfg) else " — folder not found"))
+    else:
+        print("note no Obsidian vault set (aria.obsidian_vault)")
+    if cfg["github_access"]:
+        print("ok   gh CLI found" if eng.aria_git.gh() else
+              "MISS gh CLI not found — https://cli.github.com then: "
+              "gh auth login")
+    else:
+        print("note GitHub off (aria.github_access) — autopilot commits "
+              "locally only")
+    lib = len(eng.list_library_agents())
+    print(f"ok   {len(eng.list_agents())} core agents, {lib} library "
+          f"agents, {len(eng.list_skill_names())} skills")
+
+
+COMMANDS = {name[4:]: fn for name, fn in globals().items()
+            if name.startswith("cmd_")}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__.strip())
+        return 0 if len(sys.argv) < 2 else 1
+    try:
+        COMMANDS[sys.argv[1]](sys.argv[2:])
+    except eng.NeedsApproval as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    except (ValueError, RuntimeError) as exc:
+        print(f"{exc}", file=sys.stderr)
+        if "no project found" in str(exc):
+            print(f"projects: {projects_hint()}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,3 +7,4 @@ __pycache__/
 vendor/
 .claude/skills/
 skills/
+system/voice-token

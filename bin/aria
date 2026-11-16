@@ -3,26 +3,35 @@
 #
 #   aria capture "idea text"   instant capture to the inbox (no LLM call)
 #   aria triage                classify the inbox
-#   aria develop [slug]        ideas -> proposed plans
+#   aria develop [slug]        ideas -> researched, proposed plans
 #   aria auto                  triage, then develop new projects (idea -> plan)
+#   aria projects              every project and what autopilot is doing
+#   aria approve <slug>        THE HUMAN GATE: approve a proposed plan
+#   aria autopilot <slug> start|stop|status|run|steer "guidance"
+#                              autonomous project execution (run = work in
+#                              this terminal, without the always-on server)
+#   aria plan <slug>           assess + (re)plan a project now
 #   aria agent <name> "task"   run one agent (role + skills + model tier)
-#   aria mission <name> "task" queue a BACKGROUND agent job (survives logout*)
+#   aria mission <name> "task" queue a BACKGROUND agent job
 #   aria missions [run]        list missions / drain the queue headless
-#   aria autopilot <slug> start|stop|status   autonomous project execution
-#   aria plan <slug>           (re)generate a project's autopilot task plan
+#   aria search "query"        web search            (aria.web_access)
+#   aria fetch <url>           read a web page as text
+#   aria brain "text"          write a note into your Obsidian vault
+#   aria github status|init|publish|push <slug>     git + GitHub per project
 #   aria skills <cmd>          list|convert|prompt — universal skills pack
 #   aria crew <slug>           generate a CrewAI project for a project
 #   aria handoff <slug>        generate an OpenHands launch script for a project
 #   aria trigger <name> [msg]  fire an allowlisted webhook (n8n, HA, ...)
+#   aria voice-gateway [port]  authenticated single-route door for Alexa
 #   aria llama <cmd>           llama.cpp Vulkan helper (install|get|serve|service)
 #   aria status                pipeline dashboard        (headless Claude Code)
-#   aria ui [port]             web UI (Claude-style app shell, default :8700)
+#   aria ui [port]             the app (one shell, default :8700)
 #   aria app [port]            open A.R.I.A. as a desktop app window
 #   aria install-desktop       add A.R.I.A. to your application menu
 #   aria install-service       always-on: server at login + hourly auto-pipeline
 #   aria uninstall-service     remove the systemd user services
-#   aria install-skills        install Anthropic's Agent Skills for Claude Code
-#   aria test [--keep]         self-test: run EVERYTHING in a sandbox copy
+#   aria install-skills        install skills + agent libraries (ECC, Anthropic…)
+#   aria test [--mock] [--keep]   self-test: run EVERYTHING in a sandbox copy
 #   aria doctor                sanity-check the setup
 #
 # triage/develop/auto run on the engine set in system/config.yml (aria.engine):
@@ -33,7 +42,7 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -157,68 +166,16 @@ DESKTOP
     exec python3 "$ARIA_ROOT/bin/aria-test" "$@"
     ;;
 
-  agent)
-    name="${1:-}"; shift || true
-    task="${*:-}"
-    [ -n "$name" ] && [ -n "$task" ] || {
-      echo "usage: aria agent <researcher|planner|critic|scribe|...> \"task\"" >&2
-      exit 1
-    }
-    exec python3 -c "
-import sys
-sys.path.insert(0, '$ARIA_ROOT/bin')
-import aria_engine as eng
+  agent|mission|missions|projects|approve|autopilot|plan|search|fetch|brain|github|trigger)
+    exec python3 "$ARIA_ROOT/bin/aria-do" "$cmd" "$@"
+    ;;
 
-def emit(ev):
-    if ev.get('event') == 'token':
-        print(ev['text'], end='', flush=True)
-    elif ev.get('log'):
-        print('[' + ev['log'] + ']', file=sys.stderr)
-
-eng.run_agent(sys.argv[1], sys.argv[2], emit)
-print()
-" "$name" "$task"
+  voice-gateway)
+    exec python3 "$ARIA_ROOT/bin/aria-voice-gateway" "$@"
     ;;
 
   skills)
     exec python3 "$ARIA_ROOT/bin/aria-skills" "$@"
-    ;;
-
-  mission)
-    name="${1:-}"; shift || true
-    task="${*:-}"
-    [ -n "$name" ] && [ -n "$task" ] || {
-      echo "usage: aria mission <agent> \"task\"" >&2; exit 1; }
-    exec python3 -c "
-import sys
-sys.path.insert(0, '$ARIA_ROOT/bin')
-import aria_engine as eng
-p = eng.mission_create(sys.argv[1], sys.argv[2])
-print(f'queued -> {p.name}')
-print('runs in the background while the A.R.I.A. server is up')
-print('(no server? drain headless with: aria missions run)')
-" "$name" "$task"
-    ;;
-
-  missions)
-    sub="${1:-list}"
-    exec python3 -c "
-import sys
-sys.path.insert(0, '$ARIA_ROOT/bin')
-import aria_engine as eng
-if sys.argv[1] == 'run':
-    eng.mission_requeue_stale()
-    while True:
-        mid = eng.mission_run_next(
-            lambda ev: print(ev['log']) if ev.get('log') else None)
-        if not mid:
-            print('queue empty'); break
-else:
-    ms = eng.mission_list()
-    if not ms: print('no missions yet — queue one: aria mission <agent> \"task\"')
-    for m in ms:
-        print(f\"{m['status']:8} {m['id']:34} {m['task'][:70]}\")
-" "$sub"
     ;;
 
   crew)
@@ -227,60 +184,6 @@ else:
 
   handoff)
     exec python3 "$ARIA_ROOT/bin/aria-handoff" "$@"
-    ;;
-
-  trigger)
-    name="${1:-}"; shift || true
-    [ -n "$name" ] || { echo "usage: aria trigger <webhook-name> [message]" >&2; exit 1; }
-    exec python3 -c "
-import sys
-sys.path.insert(0, '$ARIA_ROOT/bin')
-import aria_engine as eng
-status = eng.trigger_webhook(sys.argv[1], ' '.join(sys.argv[2:]))
-print(f'triggered {sys.argv[1]} -> HTTP {status}')
-" "$name" "$@"
-    ;;
-
-  autopilot)
-    slug="${1:-}"; action="${2:-status}"
-    [ -n "$slug" ] || { echo "usage: aria autopilot <slug> start|stop|status" >&2; exit 1; }
-    exec python3 -c "
-import sys, json
-sys.path.insert(0, '$ARIA_ROOT/bin')
-import aria_engine as eng
-slug, action = sys.argv[1], sys.argv[2]
-try:
-    if action == 'start':
-        print(json.dumps(eng.autopilot_start(slug)))
-        print('running — the always-on server works it continuously;')
-        print('watch /projects, or tail the changelog in <project>/autopilot/')
-    elif action == 'stop':
-        eng.autopilot_stop(slug)
-        print('stop requested — current task finishes, then the final report is written')
-    else:
-        print(json.dumps(eng._auto_state(slug), indent=2))
-except ValueError as exc:
-    known = ', '.join(p['slug'] for p in eng.list_projects()) or 'none yet'
-    print(f'{exc}  (projects: {known})', file=sys.stderr)
-    sys.exit(1)
-" "$slug" "$action"
-    ;;
-
-  plan)
-    slug="${1:-}"
-    [ -n "$slug" ] || { echo "usage: aria plan <slug>" >&2; exit 1; }
-    exec python3 -c "
-import sys
-sys.path.insert(0, '$ARIA_ROOT/bin')
-import aria_engine as eng
-try:
-    plan = eng.autopilot_plan(sys.argv[1],
-        lambda ev: print(ev['log']) if ev.get('log') else None)
-except ValueError as exc:
-    print(exc, file=sys.stderr); sys.exit(1)
-for t in plan['tasks']:
-    print(f\"{t['status']:10} {t['id']:4} {t['agent']:12} {t['title']}\")
-" "$slug"
     ;;
 
   llama)
@@ -356,6 +259,7 @@ UNIT
     command -v claude >/dev/null 2>&1 \
       && echo "ok   claude CLI ($(command -v claude))" \
       || { echo "note claude CLI missing (capture + ollama engine still work)"; }
+    python3 "$ARIA_ROOT/bin/aria-do" reach || true
     exit $ok
     ;;
 

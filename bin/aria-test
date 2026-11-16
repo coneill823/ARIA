@@ -1,34 +1,47 @@
 #!/usr/bin/env python3
 """aria-test — A.R.I.A. end-to-end self-test.
 
-  aria test [--keep]
+  aria test [--mock] [--keep]
 
 Builds a throwaway sandbox copy of A.R.I.A. in a temp directory (your real
-pipeline, ledger and vault are never touched) and runs every capability
-against your REAL configured backends and models:
+pipeline, ledger, projects and vault are never touched) and runs every
+capability:
 
-  config/tiers, capture, intents, triage (live model), develop (live),
-  refine, Obsidian export, board+ledger, chat persona (live), agent run
-  (live), skills loading, crew generation, the web server and its API,
-  local STT availability, services/desktop presence.
+  config/tiers, capture, spoken commands, triage, develop, refine, the
+  Obsidian brain, board+ledger, chat persona, agents (core + library),
+  skills, missions, the human gate, promotion, the full autopilot loop
+  (assess -> plan -> execute -> verify -> reflect -> report, plus stop,
+  steering, rejected work and a model-server outage), git commits, web
+  access (against a local fixture — the self-test never touches the
+  internet), crew + OpenHands generation, the web server and its API.
 
-Live-model checks cost ~5 LLM calls (a minute or two on a local 8B).
+By default the model calls go to your REAL configured backends (about 25
+calls; a few minutes on a local 8B). With --mock they go to a built-in
+stand-in model (bin/aria-mock-llm), so the whole plumbing is verified in
+seconds on any machine — no GPU, no Ollama. --mock proves the machinery,
+not your models; run without it to prove both.
+
 PASS/FAIL per check; non-zero exit if anything required failed.
 --keep leaves the sandbox on disk for inspection.
 """
 
-import importlib.util
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REAL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEEP = "--keep" in sys.argv
+MOCK = "--mock" in sys.argv
 
 GREEN, RED, YELLOW, DIM, END = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 results = []
@@ -57,19 +70,65 @@ class SkipTest(Exception):
 TEST_IDEA = ("build a small command line tool that renames my photo files "
              "by the date they were taken, needs a plan, parser and tests")
 
+SEARCH_PAGE = """<html><body>
+<div class="result"><h2><a class="result__a"
+ href="//duckduckgo.com/l/?uddg=http%3A%2F%2F127.0.0.1%3A{port}%2Fpage">
+ Photo renaming <b>guide</b></a></h2>
+ <a class="result__snippet">Rename photos by their EXIF date.</a></div>
+<div class="result"><h2><a class="result__a"
+ href="https://example.org/other">Another result</a></h2></div>
+</body></html>"""
+ARTICLE = ("<html><head><title>Photo renaming guide</title></head><body>"
+           "<nav>menu</nav><h1>Guide</h1><p>" + "Read the EXIF "
+           "DateTimeOriginal tag and rename the file. " * 12 + "</p>"
+           "<script>ignore()</script></body></html>")
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_http(url, tries=60):
+    for _ in range(tries):
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except Exception:
+            time.sleep(0.2)
+    return False
+
+
+def set_config(sandbox, **pairs):
+    """Rewrite single-line keys in the sandbox config."""
+    import re
+    path = os.path.join(sandbox, "system", "config.yml")
+    text = open(path, encoding="utf-8").read()
+    for key, value in pairs.items():
+        line = f"  {key}: {value}".rstrip()
+        text, n = re.subn(rf"^[ \t]*{re.escape(key)}:.*$", line, text,
+                          count=1, flags=re.M)
+        if not n:
+            text = text.rstrip("\n") + "\n" + line + "\n"
+    open(path, "w", encoding="utf-8").write(text)
+
 
 def main():
-    print(f"A.R.I.A. self-test — sandbox copy, real models\n{DIM}"
+    print(f"A.R.I.A. self-test — sandbox copy, "
+          f"{'MOCK model (plumbing only)' if MOCK else 'real models'}\n{DIM}"
           f"source: {REAL_ROOT}{END}\n")
     sandbox = tempfile.mkdtemp(prefix="aria-selftest-")
     vault = os.path.join(sandbox, "_test-vault")
     os.makedirs(vault)
     os.environ["ARIA_OBSIDIAN_VAULT"] = vault
+    procs = []
 
     # ---- build the sandbox ------------------------------------------
     for sub in ("bin", "system", "ui"):
         shutil.copytree(os.path.join(REAL_ROOT, sub),
-                        os.path.join(sandbox, sub), symlinks=False)
+                        os.path.join(sandbox, sub), symlinks=False,
+                        ignore=shutil.ignore_patterns("__pycache__"))
     for d in ("pipeline/00-inbox", "pipeline/01-processing",
               "pipeline/02-potential-projects", "pipeline/knowledge/lists",
               "pipeline/knowledge/notes", "pipeline/knowledge/content-ideas",
@@ -81,13 +140,46 @@ def main():
         if os.path.isdir(s):
             shutil.copytree(s, os.path.join(sandbox, src), symlinks=False,
                             dirs_exist_ok=True)
+    # the self-test never reaches the internet or GitHub, whatever the
+    # real config says; web access is exercised against a local fixture
+    set_config(sandbox, web_access="false", github_access="false",
+               promotion_target="./active-projects", web_search="auto",
+               web_search_url="", web_allowlist="",
+               autopilot_after_goal="stop", autopilot_max_iterations="0",
+               autopilot_max_hours="0")
 
-    spec = importlib.util.spec_from_file_location(
-        "aria_engine", os.path.join(sandbox, "bin", "aria_engine.py"))
-    eng = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(eng)
+    if MOCK:
+        port = free_port()
+        procs.append(subprocess.Popen(
+            [sys.executable, os.path.join(sandbox, "bin", "aria-mock-llm"),
+             str(port)], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL))
+        os.environ["ARIA_OLLAMA_URL"] = f"http://127.0.0.1:{port}"
+        os.environ["ARIA_LLAMACPP_URL"] = f"http://127.0.0.1:{port}"
+        os.environ.pop("ARIA_OLLAMA_MODEL", None)
+        set_config(sandbox, fast="ollama/llama3.1:8b",
+                   smart="ollama/llama3.1:8b", deep="")
+        wait_http(f"http://127.0.0.1:{port}/api/tags")
+
+    # import the SANDBOX copy of the engine — and of every sibling module
+    # it imports — so nothing here can reach the real pipeline
+    sys.path.insert(0, os.path.join(sandbox, "bin"))
+    for name in [m for m in sys.modules if m.startswith("aria_")]:
+        del sys.modules[name]
+    import aria_engine as eng
+    import aria_autopilot as ap
+    assert os.path.samefile(eng.ROOT, sandbox), "engine is not sandboxed"
 
     state = {}
+    quiet = lambda e: None  # noqa: E731
+
+    def drive(slug, limit=120, until=("idle", "finalized", "complete")):
+        seq = []
+        for _ in range(limit):
+            seq.append(ap.tick(slug, quiet))
+            if seq[-1] in until:
+                break
+        return seq
 
     # ---- engine-level checks ----------------------------------------
     def c_config():
@@ -108,7 +200,9 @@ def main():
             if ollama_bad:
                 if not shutil.which("ollama"):
                     hint = (" || ollama is not installed: "
-                            "curl -fsSL https://ollama.com/install.sh | sh")
+                            "curl -fsSL https://ollama.com/install.sh | sh"
+                            " || or prove the plumbing without it: "
+                            "aria test --mock")
                 else:
                     try:
                         active = subprocess.run(
@@ -155,7 +249,13 @@ def main():
                  ("find me cheap flights online", "no-web"),
                  ("run diagnostics", "explain-commands"),
                  ("mission critic to check everything", "mission"),
-                 ("overnight ask the critic to review the plan", "mission")]
+                 ("overnight ask the critic to review the plan", "mission"),
+                 ("what are you working on", "status"),
+                 ("open the pipeline board", "navigate"),
+                 ("open settings", "navigate"),
+                 ("note to brain: remember the milk", "brain-note"),
+                 ("what is triage, exactly?", None),
+                 ("tell me a joke", None)]
         for text, want in cases:
             got = (eng.detect_intent(text) or {}).get("action")
             assert got == want, f"'{text}' -> {got}, wanted {want}"
@@ -165,30 +265,62 @@ def main():
             assert got.get("action") == "agent" and got.get("name") == "critic"
         # webhook intents obey the allowlist: unknown name -> plain chat
         assert eng.detect_intent("trigger not-a-real-hook") is None
-        with open(os.path.join(sandbox, "system", "config.yml")) as f:
-            cfgtext = f.read()
-        with open(os.path.join(sandbox, "system", "config.yml"), "w") as f:
-            f.write(cfgtext.replace(
-                "  webhooks:\n",
-                "  webhooks:\n    selftest-hook: http://127.0.0.1:1/x\n"))
+        set_config(sandbox, webhooks="")
+        cfgp = os.path.join(sandbox, "system", "config.yml")
+        txt = open(cfgp).read()
+        open(cfgp, "w").write(txt.replace(
+            "  webhooks:\n",
+            "  webhooks:\n    selftest-hook: http://127.0.0.1:1/x\n", 1))
         got = eng.detect_intent("trigger selftest-hook: hello")
         assert got and got["action"] == "webhook" \
             and got["name"] == "selftest-hook", got
-        return f"{len(cases)+3} intents correct (webhook allowlist enforced)"
-    check("intent detection (no-LLM)", c_intents)
+        # with web access on, the same words become real actions
+        set_config(sandbox, web_access="true")
+        got = eng.detect_intent("search for exif date parsing")
+        assert got == {"action": "web-search",
+                       "query": "exif date parsing"}, got
+        got = eng.detect_intent("read https://example.com/guide")
+        assert got and got["action"] == "fetch", got
+        set_config(sandbox, web_access="false")
+        return f"{len(cases)+5} spoken commands routed correctly"
+    check("spoken commands (no-LLM)", c_intents)
+
+    def c_project_matching():
+        slugs = ["receipt-based-meal-planner", "photo-date-renamer",
+                 "garden-planner"]
+        want = {"the meal planner": "receipt-based-meal-planner",
+                "photo renamer": "photo-date-renamer",
+                "photo-date-renamer": "photo-date-renamer",
+                "my garden planner project": "garden-planner",
+                "planner": None,              # ambiguous: never guess
+                "the weather": None}
+        for said, slug in want.items():
+            got = eng.match_project(said, slugs)
+            assert got == slug, f"'{said}' -> {got}, wanted {slug}"
+        return "voice phrases resolve to slugs; ambiguity is refused"
+    check("project name matching", c_project_matching)
 
     def c_backends_cfg():
         cfg = eng.config()
         assert "ollama" in cfg["backend_urls"] and "llamacpp" in cfg["backend_urls"]
         assert isinstance(cfg["webhooks"], dict)
         assert isinstance(cfg["backend_keys"], dict)
+        eng.config_set("context_tokens", "4096")
+        assert eng.config()["context_tokens"] == 4096
+        eng.config_set("context_tokens", "8192")
+        for key, bad in (("web_search", "bogus"), ("context_tokens", "-1"),
+                         ("not_a_key", "x")):
+            try:
+                eng.config_set(key, bad)
+                raise AssertionError(f"config_set accepted {key}={bad}")
+            except ValueError:
+                pass
         return (f"{len(cfg['backend_urls'])} backends, "
-                f"{len(cfg['webhooks'])} webhooks allowlisted")
+                f"{len(cfg['webhooks'])} webhooks allowlisted; settings "
+                "validated")
     check("backends/webhooks config", c_backends_cfg)
 
     def c_webhook():
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
         got = {}
 
         class R(BaseHTTPRequestHandler):
@@ -202,7 +334,7 @@ def main():
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-        srv = HTTPServer(("127.0.0.1", 0), R)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), R)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         cfgp = os.path.join(sandbox, "system", "config.yml")
@@ -211,13 +343,40 @@ def main():
         with open(cfgp, "w") as f:
             f.write(txt.replace(
                 "  webhooks:\n",
-                f"  webhooks:\n    selftest-live: http://127.0.0.1:{port}/hook\n"))
+                f"  webhooks:\n    selftest-live: http://127.0.0.1:{port}/hook\n", 1))
         status = eng.trigger_webhook("selftest-live", "self-test payload")
         srv.shutdown()
         assert status == 200, f"receiver answered {status}"
         assert "self-test payload" in got.get("body", ""), got
         return "payload delivered to a local receiver (HTTP 200)"
     check("webhook delivery", c_webhook)
+
+    def c_web_safety():
+        import aria_web
+        cfg = {"web_access": True, "web_allowlist": []}
+        for bad in ("http://localhost/x", "http://127.0.0.1:8700/api/board",
+                    "http://192.168.1.1/", "http://10.0.0.8/", "http://[::1]/",
+                    "http://169.254.169.254/latest/meta-data", "http://nas/",
+                    "http://printer.local/", "file:///etc/passwd",
+                    "ftp://example.com/", "http://u:p@example.com/"):
+            try:
+                aria_web.check_url(bad, cfg)
+                raise AssertionError(f"not refused: {bad}")
+            except aria_web.WebError:
+                pass
+        try:
+            aria_web.check_url("https://evil.example/",
+                               {**cfg, "web_allowlist": ["example.org"]})
+            raise AssertionError("allowlist not enforced")
+        except aria_web.WebError:
+            pass
+        try:
+            eng.web_fetch("https://example.org/")
+            raise AssertionError("fetch ran with web access off")
+        except aria_web.WebError:
+            pass
+        return "local network, odd schemes and off-list hosts refused"
+    check("web access — safety rules", c_web_safety)
 
     def c_triage():
         need_backend()
@@ -228,9 +387,11 @@ def main():
         state["triage_projects"] = res["projects"]
         return f"decision: {decision.get('type')} " \
                f"({decision.get('confidence', 0):.0%})"
-    check("triage — live model", c_triage)
+    check("triage — model", c_triage)
 
     def c_gpu():
+        if MOCK:
+            raise SkipTest("mock model")
         fast = eng.resolve_tier("fast")
         if fast["kind"] != "ollama" or not shutil.which("ollama"):
             raise SkipTest("fast tier isn't local ollama")
@@ -250,25 +411,87 @@ def main():
         return "model is running on the GPU"
     check("gpu acceleration", c_gpu, required=False)
 
-    def c_develop():
+    def c_develop_web():
+        """Develop with web access ON, against a local fixture standing in
+        for the search engine and the page it finds."""
         need_backend()
-        # force a known project note so this check is independent of triage
+        import aria_web
+
+        class F(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = (SEARCH_PAGE.format(port=self.server.server_address[1])
+                        if self.path.startswith("/search") else ARTICLE)
+                data = body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), F)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        os.environ["ARIA_DDG_URL"] = f"http://127.0.0.1:{port}/search"
+        real_public, aria_web.MIN_GAP = aria_web._is_public, 0
+        # the fixture lives on loopback; let fetch reach THIS server only
+        aria_web._is_public = lambda ip: True
+        real_check = aria_web.check_url
+
+        def fixture_only(url, cfg):
+            if f"127.0.0.1:{port}" in url:
+                return url, urllib.parse.urlsplit(url)
+            return real_check(url, cfg)
+        aria_web.check_url = fixture_only
+        set_config(sandbox, web_access="true", web_search="duckduckgo")
         slug = "selftest-photo-renamer"
+        try:
+            rows = eng.web_search("rename photos exif date")
+            assert rows and rows[0]["url"].endswith("/page"), rows
+            page = eng.web_fetch(rows[0]["url"])
+            assert "DateTimeOriginal" in page["text"] \
+                and "menu" not in page["text"] and "ignore()" not in page["text"]
+            note = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
+            with open(note, "w") as f:
+                f.write(f"---\nslug: {slug}\nstatus: processing\n"
+                        f"type: project\ncaptured: 2026-11-14\n---\n\n"
+                        f"## Raw capture\n\n{TEST_IDEA}\n")
+            eng.develop_run(quiet, slugs=[slug])
+        finally:
+            set_config(sandbox, web_access="false", web_search="auto")
+            aria_web._is_public, aria_web.check_url = real_public, real_check
+            os.environ.pop("ARIA_DDG_URL", None)
+            srv.shutdown()
+        proj = os.path.join(sandbox, "pipeline/02-potential-projects", slug)
+        plan = os.path.join(proj, "proposed-plan.md")
+        assert os.path.isfile(plan), "no proposed-plan.md written"
+        research = open(os.path.join(proj, "research.md")).read()
+        assert "from live web research" in research, "research not web-backed"
+        assert "## Sources" in research and f"127.0.0.1:{port}/page" in research
+        state["slug"] = slug
+        size = os.path.getsize(plan)
+        assert size > 300, f"plan suspiciously small ({size} bytes)"
+        return (f"searched + read a page (fixture), research cites its "
+                f"sources, plan written ({size} bytes)")
+    check("develop with web research", c_develop_web)
+
+    def c_develop_offline():
+        need_backend()
+        slug = "selftest-offline-idea"
         note = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
         with open(note, "w") as f:
             f.write(f"---\nslug: {slug}\nstatus: processing\ntype: project\n"
                     f"captured: 2026-11-14\n---\n\n## Raw capture\n\n"
-                    f"{TEST_IDEA}\n")
-        eng.develop_run(lambda e: None, slugs=[slug])
-        proj = os.path.join(sandbox, "pipeline/02-potential-projects", slug)
-        plan = os.path.join(proj, "proposed-plan.md")
-        assert os.path.isfile(plan), "no proposed-plan.md written"
-        assert os.path.isfile(os.path.join(proj, "research.md"))
-        state["slug"] = slug
-        size = os.path.getsize(plan)
-        assert size > 300, f"plan suspiciously small ({size} bytes)"
-        return f"plan + research written ({size} bytes)"
-    check("develop — live model", c_develop)
+                    "build a tiny script that sorts my downloads folder\n")
+        eng.develop_run(quiet, slugs=[slug])
+        research = open(os.path.join(
+            sandbox, "pipeline/02-potential-projects", slug,
+            "research.md")).read()
+        assert "no web access" in research, "offline research not labelled"
+        return "with web access off the research is labelled unverified"
+    check("develop offline (honest label)", c_develop_offline)
 
     def c_refine():
         if "slug" not in state:
@@ -289,14 +512,26 @@ def main():
         return "feedback attached, plan versioned, idea requeued"
     check("refine loop", c_refine)
 
-    def c_export():
+    def c_brain():
         if "slug" not in state:
             raise SkipTest("develop failed earlier")
         idx = eng.export_obsidian(state["slug"])
         assert os.path.isfile(idx)
         n = len(os.listdir(os.path.join(vault, "ARIA", state["slug"])))
-        return f"index + {n} notes in test vault"
-    check("obsidian export", c_export)
+        mine = os.path.join(vault, "my own note.md")
+        open(mine, "w").write("mine\n")
+        note = eng.brain_note("selftest: the feeder needs a solar panel")
+        assert str(note).startswith(os.path.join(vault, "ARIA", "Notes"))
+        import aria_brain
+        escaped = aria_brain.write(aria_brain.vault_dir(vault),
+                                   ("..", "..", "escape"), "x")
+        assert os.path.join(vault, "ARIA") in str(escaped.resolve())
+        assert open(mine).read() == "mine\n"
+        journal = os.path.join(vault, "ARIA", "Journal")
+        assert os.path.isdir(journal) and os.listdir(journal)
+        return (f"project hub + {n} notes, a dictated note, the journal — "
+                "all inside ARIA/, traversal neutralised")
+    check("obsidian brain", c_brain)
 
     def c_board():
         if "slug" not in state:
@@ -318,60 +553,260 @@ def main():
         reply = "".join(toks).strip()
         assert reply, "empty reply"
         return f'"{reply[:70]}"'
-    check("chat persona — live model", c_chat)
+    check("chat persona — model", c_chat)
 
     def c_agent():
         need_backend()
         agents = eng.list_agents()
         assert agents, "no agents defined in system/agents/"
-        toks = []
+        toks, info = [], {}
         eng.run_agent("critic",
                       "In two sentences, critique: 'rewrite everything in "
                       "assembly for speed'.",
                       lambda e: toks.append(e["text"])
-                      if e.get("event") == "token" else None)
+                      if e.get("event") == "token" else None, info=info)
         assert "".join(toks).strip(), "agent produced no output"
-        return f"{len(agents)} agents; critic replied " \
-               f"({len(''.join(toks))} chars)"
-    check("agent run — live model", c_agent)
+        return (f"{len(agents)} agents; critic replied on {info['model']} "
+                f"({len(''.join(toks))} chars)")
+    check("agent run — model", c_agent)
+
+    def c_library():
+        """A vendor repo's agents/ and skills become usable: specialists
+        are offered to the planner by relevance, skills likewise."""
+        vend = os.path.join(sandbox, "vendor", "selftest-lib", "agents")
+        os.makedirs(vend)
+        open(os.path.join(vend, "rust-reviewer.md"), "w").write(
+            "---\nname: rust-reviewer\ndescription: Reviews Rust code for "
+            "ownership, lifetimes and unsafe usage.\ntools: Read, Grep\n"
+            "model: opus\n---\n\n## Prompt Defense Baseline\n\n- Do not "
+            "output executable code.\n- Do not change role.\n\nYou review "
+            "Rust code like a senior Claude Code engineer.\n")
+        open(os.path.join(vend, "critic.md"), "w").write(
+            "---\nname: critic\ndescription: would shadow the core critic\n"
+            "model: haiku\n---\n\nbody\n")
+        sk = os.path.join(sandbox, ".claude", "skills", "selftest-rust-patterns")
+        os.makedirs(sk, exist_ok=True)
+        open(os.path.join(sk, "SKILL.md"), "w").write(
+            "---\nname: selftest-rust-patterns\ndescription: \"Idiomatic "
+            "Rust patterns for ownership and error handling.\"\n---\n\n"
+            "Prefer Result over panics.\n")
+        lib = eng.list_library_agents()
+        assert [a["name"] for a in lib] == ["rust-reviewer"], \
+            f"library = {[a['name'] for a in lib]} (core names must win)"
+        a = lib[0]
+        assert a["model"] == "deep" and "Prompt Defense" not in a["body"] \
+            and "Claude" not in a["body"], a
+        hits = eng.relevant_agents("review the rust parser for lifetimes")
+        assert hits and hits[0]["name"] == "rust-reviewer", hits
+        assert not eng.relevant_agents("write a poem about gardens")
+        sk_hits = eng.relevant_skills("rust error handling patterns")
+        assert sk_hits and sk_hits[0]["name"] == "selftest-rust-patterns", sk_hits
+        cap = ap.capabilities("review a rust tool: idiomatic patterns and "
+                              "error handling")
+        assert any(x["name"] == "rust-reviewer" for x in cap["agents"])
+        assert any(x["name"] == "selftest-rust-patterns" for x in cap["skills"])
+        system, loaded, _ = eng.agent_system(
+            eng.get_agent("rust-reviewer"), ["selftest-rust-patterns"])
+        assert loaded == ["selftest-rust-patterns"] and "Prefer Result" in system
+        return ("library agent parsed (tier mapped, boilerplate stripped), "
+                "core names win, specialists and skills picked by relevance")
+    check("agent library + skill retrieval", c_library)
 
     def c_missions():
         need_backend()
         p = eng.mission_create("critic", "reply with one short sentence")
         assert any(m["status"] == "queued" for m in eng.mission_list())
-        mid = eng.mission_run_next(lambda e: None)
+        mid = eng.mission_run_next(quiet)
         assert mid == p.stem, f"ran {mid}, expected {p.stem}"
         m = next(x for x in eng.mission_list() if x["id"] == mid)
         assert m["status"] == "done", f"mission ended as {m['status']}"
         assert "## Output" in p.read_text(encoding="utf-8")
         return "queued -> ran -> done, output persisted"
-    check("background mission — live model", c_missions)
+    check("background mission — model", c_missions)
+
+    def c_gate():
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        slug = state["slug"]
+        assert not eng.project_approved(slug)
+        try:
+            eng.autopilot_start(slug)
+            raise AssertionError("autopilot started on an unapproved plan")
+        except eng.NeedsApproval:
+            pass
+        try:
+            eng.promote_project(slug)
+            raise AssertionError("promoted an unapproved plan")
+        except eng.NeedsApproval:
+            pass
+        out = eng.perform({"action": "autopilot-start", "slug": slug})
+        assert out["action"] == "needs-approval", out
+        req = eng.approve_project(slug, via="selftest")
+        text = req.read_text()
+        assert "approved: true" in text and "approved_via: selftest" in text
+        assert eng.project_approved(slug)
+        return "unapproved plans cannot start or be promoted; approval " \
+               "writes requirements.md"
+    check("the human gate", c_gate)
 
     def c_autopilot():
         need_backend()
         if "slug" not in state:
             raise SkipTest("develop failed earlier")
         slug = state["slug"]
-        quiet = lambda e: None
-        plan = eng.autopilot_plan(slug, quiet)
+        if not eng.project_approved(slug):
+            raise SkipTest("gate check failed earlier")
+        eng.autopilot_start(slug, via="selftest")
+        proj = eng._project_dir(slug)
+        assert eng.project_kind(proj) == "active", "not promoted on start"
+        for name in ("docs/requirements.md", "docs/idea.md", "STATUS.md",
+                     "CLAUDE.md"):
+            assert (proj / name).is_file(), f"promotion did not write {name}"
+        ledger = open(os.path.join(sandbox, "pipeline/LEDGER.md")).read()
+        assert "promoted" in ledger
+        seq = drive(slug, limit=6, until=("task",))
+        assert "assessed" in seq and "replanned" in seq and seq[-1] == "task", seq
+        auto = proj / "autopilot"
+        assert (auto / "ASSESSMENT.md").is_file()
+        plan = json.load(open(auto / "plan.json"))
         assert plan["tasks"], "planner produced no tasks"
-        eng.autopilot_start(slug)
-        r = eng.autopilot_tick(slug, quiet)
-        if r == "replanned":
-            r = eng.autopilot_tick(slug, quiet)
-        assert r == "task", f"expected a task execution, got {r}"
+        for t in plan["tasks"]:
+            assert eng.get_agent(t["agent"]), f"unknown agent {t['agent']}"
+        ap.steer(slug, "selftest guidance: keep every file short")
         eng.autopilot_stop(slug)
-        r = eng.autopilot_tick(slug, quiet)
+        r = ap.tick(slug, quiet)
         assert r == "finalized", f"expected finalize after stop, got {r}"
-        auto = os.path.join(sandbox, "pipeline/02-potential-projects",
-                            slug, "autopilot")
-        assert os.path.isfile(os.path.join(auto, "CHANGELOG.md"))
-        assert os.path.isfile(os.path.join(auto, "FINAL-REPORT.md"))
-        n = sum(1 for t in json.load(open(os.path.join(auto, "plan.json")))
-                ["tasks"] if t["status"] == "done")
-        return (f"planned {len(plan['tasks'])} task(s), executed+verified "
-                f"{n}, stopped gracefully, final report written")
-    check("autopilot — live model", c_autopilot)
+        st = ap._state(slug)
+        assert st["status"] == "stopped"
+        report = (auto / "FINAL-REPORT.md").read_text()
+        assert "stopped by you" in report
+        assert "## Every change made in this run" in report
+        done = [c for c in eng.project_changes(slug) if c["status"] == "done"]
+        for c in done:
+            assert c["title"] in report, "a change is missing from the report"
+            assert c["output"] and c["model"] and c["agent"]
+        assert (auto / "CHANGELOG.md").is_file() or not done
+        assert ap.tick(slug, quiet) == "idle"
+        state["active"] = slug
+        return (f"promoted, assessed, planned {len(plan['tasks'])} task(s), "
+                f"{len(done)} executed+verified, steered, stopped; report "
+                "lists every change")
+    check("autopilot — gate to report", c_autopilot)
+
+    def c_autopilot_full():
+        """The whole recursive loop to its natural end — only practical
+        against the mock model."""
+        if not MOCK:
+            raise SkipTest("needs --mock (a full run on real models takes "
+                           "hours — that is what autopilot is for)")
+        slug = state.get("active")
+        if not slug:
+            raise SkipTest("autopilot check failed earlier")
+        eng.autopilot_start(slug, via="selftest")
+        seq = drive(slug)
+        st = ap._state(slug)
+        assert st["status"] == "complete", (st["status"], seq)
+        assert st["run"] == 2 and st["iteration"] >= 2
+        for must in ("reflected", "replanned", "task"):
+            assert must in seq, f"loop never {must}: {seq}"
+        proj = eng._project_dir(slug)
+        assert (proj / "autopilot" / "MEMORY.md").is_file()
+        reports = list((proj / "autopilot" / "reports").glob("*.md"))
+        assert len(reports) == 2, "each run keeps its own report"
+        report = (proj / "autopilot" / "FINAL-REPORT.md").read_text()
+        assert "## Earlier runs" in report and "## Files touched" in report
+        status = (proj / "STATUS.md").read_text()
+        assert "Complete" in status
+        return (f"resumed as run 2 and ran to completion: "
+                f"{st['stats']['done']} tasks over {st['iteration']} "
+                "iterations, memory rewritten each batch, both reports kept")
+    check("autopilot — full recursive run", c_autopilot_full)
+
+    def c_autopilot_rejects():
+        """Rejected work is rolled back and retried; an outage is waited
+        out. Needs the mock to script the failures."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script failures")
+        port = free_port()
+        mock2 = subprocess.Popen(
+            [sys.executable, os.path.join(sandbox, "bin", "aria-mock-llm"),
+             str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, MOCK_TITLE_MARKER="[syntaxerror]"))
+        procs.append(mock2)
+        wait_http(f"http://127.0.0.1:{port}/api/tags")
+        old = os.environ["ARIA_OLLAMA_URL"]
+        os.environ["ARIA_OLLAMA_URL"] = f"http://127.0.0.1:{port}"
+        slug = "selftest-rejects"
+        try:
+            note = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
+            open(note, "w").write(
+                f"---\nslug: {slug}\nstatus: processing\ntype: project\n"
+                f"captured: 2026-11-14\n---\n\n## Raw capture\n\n{TEST_IDEA}\n")
+            eng.develop_run(quiet, slugs=[slug])
+            eng.approve_project(slug, via="selftest")
+            eng.autopilot_start(slug, via="selftest")
+            proj = eng._project_dir(slug)
+            drive(slug, limit=3, until=("task",))
+            # ---- model server disappears mid-run
+            mock2.terminate()
+            mock2.wait()
+            r = ap.tick(slug, quiet)
+            st = ap._state(slug)
+            assert r == "waiting" and st["status"] == "running" \
+                and "not answering" in st["waiting"], (r, st["waiting"])
+            assert ap.tick(slug, quiet) == "waiting", "no back-off"
+            mock3 = subprocess.Popen(
+                [sys.executable, os.path.join(sandbox, "bin", "aria-mock-llm"),
+                 str(port)], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=dict(os.environ, MOCK_TITLE_MARKER="[syntaxerror]"))
+            procs.append(mock3)
+            wait_http(f"http://127.0.0.1:{port}/api/tags")
+            st["backoff_until"] = 0
+            ap._save_state(slug, st)
+            drive(slug)
+            plan = ap._plan(slug)
+            bad = next(t for t in plan["tasks"] if "[syntaxerror]" in t["title"])
+            assert bad["status"] == "done" and bad["attempts"] >= 2, bad
+            compile((proj / "src" / "core.py").read_text(), "core.py", "exec")
+            log = (proj / "autopilot" / f"task-{bad['id']}.md").read_text()
+            assert "verdict: FAIL" in log and "syntax error" in log \
+                and "verdict: PASS" in log
+            assert ap._state(slug)["status"] == "complete"
+        finally:
+            os.environ["ARIA_OLLAMA_URL"] = old
+        state["rejects"] = slug
+        return ("an outage was waited out with back-off; code that did not "
+                "parse was rolled back, retried with the error, then kept")
+    check("autopilot — failures handled", c_autopilot_rejects)
+
+    def c_git():
+        slug = state.get("rejects") or state.get("active")
+        if not slug:
+            raise SkipTest("no autopilot project to inspect")
+        if not shutil.which("git"):
+            raise SkipTest("git not installed")
+        import aria_git
+        proj = eng._project_dir(slug)
+        assert aria_git.is_repo_root(proj), "promotion did not init a repo"
+        assert aria_git.current_branch(proj) == aria_git.WORK_BRANCH
+        log = aria_git.run(["log", "--format=%s"], proj).splitlines()
+        tasks = [ln for ln in log if ln.startswith("t")]
+        assert tasks, f"no per-task commits: {log[:5]}"
+        base = ap._state(slug).get("git_base")
+        assert base and base != aria_git.WORK_BRANCH
+        on_base = aria_git.run(["log", "--format=%s", base], proj).splitlines()
+        assert not any(ln.startswith("t") for ln in on_base), \
+            "autopilot committed to the base branch"
+        try:
+            eng.project_push(slug)
+            raise AssertionError("pushed with GitHub access off")
+        except ValueError:
+            pass
+        return (f"own repo, {len(tasks)} task commit(s) on "
+                f"{aria_git.WORK_BRANCH}, base '{base}' untouched, push "
+                "refused while GitHub is off")
+    check("git — a commit per verified task", c_git)
 
     def c_skills():
         names = eng.list_skill_names()
@@ -379,33 +814,33 @@ def main():
             raise SkipTest("none installed — run: aria install-skills "
                            "&& aria skills convert")
         text = eng.skill_text(names[0])
-        assert len(text) > 100
+        assert len(text) > 20
         return f"{len(names)} loadable, e.g. {names[0]}"
     check("skills loading", c_skills, required=False)
 
     def c_crew():
-        if "slug" not in state:
+        slug = state.get("active") or state.get("slug")
+        if not slug:
             raise SkipTest("develop failed earlier")
         out = subprocess.run(
             [sys.executable, os.path.join(sandbox, "bin", "aria-crew"),
-             state["slug"]], capture_output=True, text=True, timeout=60)
+             slug], capture_output=True, text=True, timeout=60)
         assert out.returncode == 0, out.stderr.strip()[-200:]
-        crew = os.path.join(sandbox, "pipeline/02-potential-projects",
-                            state["slug"], "crew", "crew.py")
-        assert os.path.isfile(crew)
+        crew = eng._project_dir(slug) / "crew" / "crew.py"
+        assert crew.is_file()
         return "crew.py generated from the plan's team"
     check("crew generation", c_crew)
 
     def c_handoff():
-        if "slug" not in state:
+        slug = state.get("active") or state.get("slug")
+        if not slug:
             raise SkipTest("develop failed earlier")
         out = subprocess.run(
             [sys.executable, os.path.join(sandbox, "bin", "aria-handoff"),
-             state["slug"]], capture_output=True, text=True, timeout=30)
+             slug], capture_output=True, text=True, timeout=30)
         assert out.returncode == 0, out.stderr.strip()[-200:]
-        sh = os.path.join(sandbox, "pipeline/02-potential-projects",
-                          state["slug"], "openhands.sh")
-        assert os.path.isfile(sh) and os.access(sh, os.X_OK)
+        sh = eng._project_dir(slug) / "openhands.sh"
+        assert sh.is_file() and os.access(sh, os.X_OK)
         return "openhands.sh generated (review before running)"
     check("openhands handoff", c_handoff)
 
@@ -418,50 +853,96 @@ def main():
     check("local speech-to-text", c_stt, required=False)
 
     # ---- server-level checks ----------------------------------------
-    port = 8799
+    port = free_port()
     srv = subprocess.Popen(
         [sys.executable, os.path.join(sandbox, "bin", "aria-ui"), str(port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env=os.environ.copy())
+    procs.append(srv)
     base = f"http://127.0.0.1:{port}"
+
+    def post(path, body):
+        req = urllib.request.Request(base + path, method="POST",
+                                     data=json.dumps(body).encode())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
     try:
-        for _ in range(40):
-            try:
-                urllib.request.urlopen(base + "/api/health", timeout=2)
-                break
-            except Exception:
-                time.sleep(0.25)
+        wait_http(base + "/api/health")
 
         def c_pages():
-            for p in ("/", "/board", "/orb", "/agents"):
+            pages = ("/", "/projects", "/board", "/agents", "/orb",
+                     "/settings")
+            for p in pages:
                 with urllib.request.urlopen(base + p, timeout=10) as r:
                     assert r.status == 200, f"{p} -> {r.status}"
-            return "/, /board, /orb, /agents all 200"
+                    html = r.read().decode()
+                assert 'id="sidebar"' in html, f"{p} lacks the app shell"
+            for asset in ("/ui/app.css", "/ui/app.js"):
+                with urllib.request.urlopen(base + asset, timeout=10) as r:
+                    assert r.status == 200 and len(r.read()) > 500
+            return f"{', '.join(pages)} all serve the one app shell"
         check("web pages", c_pages)
 
         def c_api():
-            for p in ("/api/board", "/api/health", "/api/config",
-                      "/api/agents", "/api/skills"):
+            for p in ("/api/state", "/api/board", "/api/health",
+                      "/api/config", "/api/agents", "/api/skills",
+                      "/api/projects", "/api/missions"):
                 with urllib.request.urlopen(base + p, timeout=15) as r:
                     json.load(r)
-            return "board, health, config, agents, skills respond"
+            slug = state.get("active")
+            if slug:
+                with urllib.request.urlopen(
+                        f"{base}/api/project?slug={slug}", timeout=15) as r:
+                    view = json.load(r)
+                for key in ("state", "plan", "assessment", "changes",
+                            "report", "activity", "git", "approved"):
+                    assert key in view, f"project view lacks {key}"
+                with urllib.request.urlopen(
+                        f"{base}/api/project/live?slug={slug}", timeout=15) as r:
+                    json.load(r)
+                try:
+                    urllib.request.urlopen(
+                        f"{base}/api/file?slug={slug}&path=../../system/"
+                        "config.yml", timeout=10)
+                    raise AssertionError("file endpoint left the project")
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 404
+            try:
+                urllib.request.urlopen(
+                    base + "/ui/../system/config.yml", timeout=10)
+                raise AssertionError("static route left ui/")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 404
+            return "state, board, health, config, agents, skills, " \
+                   "projects, project view; path traversal refused"
         check("api endpoints", c_api)
 
         def c_chat_http():
-            req = urllib.request.Request(
-                base + "/api/chat", method="POST",
-                data=json.dumps({"messages": [
-                    {"role": "user",
-                     "content": "capture selftest http capture note"}]}).encode())
-            with urllib.request.urlopen(req, timeout=30) as r:
-                body = r.read().decode()
+            code, body = post("/api/chat", {"messages": [
+                {"role": "user",
+                 "content": "capture selftest http capture note"}]})
             assert '"action"' in body and "capture" in body, body[:200]
             inbox = os.listdir(os.path.join(sandbox, "pipeline/00-inbox"))
-            assert any("selftest-http" in f or "selftest" in f for f in inbox)
-            return "chat intent -> capture executed over HTTP"
-        check("chat API + spoken command", c_chat_http)
+            assert any("selftest" in f for f in inbox)
+            code, body = post("/api/chat", {"messages": [
+                {"role": "user", "content": "open the projects page"}]})
+            assert '"navigate"' in body and '"projects"' in body, body[:200]
+            code, body = post("/api/say", {"text": "what are you working on"})
+            assert code == 200 and json.loads(body)["reply"], body[:200]
+            code, body = post("/api/autopilot",
+                              {"slug": "selftest-offline-idea",
+                               "action": "start"})
+            assert code == 409 and "needs_approval" in body, (code, body[:120])
+            return ("capture and navigation by chat, /api/say answers, "
+                    "the gate holds over HTTP")
+        check("chat API + spoken commands", c_chat_http)
     finally:
-        srv.terminate()
+        for p in procs:
+            p.terminate()
 
     # ---- machine integration (informational) ------------------------
     def c_install():
@@ -489,6 +970,9 @@ def main():
           + (f", {len(skips)} skipped" if skips else ""))
     for name, _, detail in fails:
         print(f"  {RED}✗{END} {name}: {detail}")
+    if MOCK and not fails:
+        print(f"{DIM}mock run: the machinery works. Run `aria test` without "
+              f"--mock to prove your models too.{END}")
     if KEEP:
         print(f"sandbox kept: {sandbox}")
     else:

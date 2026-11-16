@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""aria-mock-llm — a stand-in model server for testing A.R.I.A. without a GPU.
+
+  aria-mock-llm [port]        default 11435, binds 127.0.0.1
+
+Speaks enough of Ollama's API (/api/tags, /api/chat with streaming) and of
+the OpenAI API (/v1/models, /v1/chat/completions) for the whole engine to
+run against it. It recognises which stage is asking from the prompt and
+answers with a small, deterministic, well-formed reply — a triage verdict,
+a plan, a batch of autopilot tasks, a file, a review verdict — so the
+plumbing can be exercised end to end in seconds: `aria test --mock`.
+
+It is a test double, not a model: the "work" it produces is filler.
+
+Steering the mock from a test: put a marker in a task title —
+  [fail]         the reviewer always rejects it
+  [flaky]        rejected on the first attempt, accepted on the second
+  [syntaxerror]  the first attempt writes Python that does not parse
+Environment:
+  MOCK_BATCHES   how many build batches the planner offers (default 2)
+  MOCK_DELAY     seconds between streamed chunks (default 0)
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MODELS = [("llama3.1:8b", 4_900_000_000), ("qwen3:30b", 18_000_000_000),
+          ("mock-coder:14b", 9_000_000_000)]
+STATE = {"plans": {}, "attempts": {}, "audits": {}, "calls": []}
+DELAY = float(os.environ.get("MOCK_DELAY", "0") or 0)
+BATCHES = int(os.environ.get("MOCK_BATCHES", "2") or 2)
+
+
+def _slug(text, default="project"):
+    m = re.search(r'PROJECT:?\s*"?([\w.-]+)', text) or \
+        re.search(r'inside the project "([\w.-]+)"', text)
+    return m.group(1) if m else default
+
+
+_COMMON = set("a an the my our your that this it to of for by in on and or "
+              "with build make create small little new some i we want need "
+              "would like which what when they were was is are be".split())
+
+
+def _kebab(text, limit=5):
+    words = [w for w in re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()
+             if w not in _COMMON]
+    return "-".join(words[:limit]) or "untitled"
+
+
+# ------------------------------------------------------------ the answers
+
+def triage(prompt):
+    note = prompt.split("Classify this note:")[-1]
+    note = re.sub(r"<!--.*?-->", "", note.split("## Raw capture")[-1],
+                  flags=re.S).strip().lower()
+    slug = _kebab(note, 4)
+    if len(note.split()) < 3:
+        return {"type": "unclear", "confidence": 0.3, "slug": slug,
+                "list": "tasks", "reasoning": "too little to go on",
+                "questions": ["What did you want done with this?"]}
+    if re.search(r"\b(someday|one day|eventually)\b", note):
+        kind = "someday"
+    elif re.search(r"\b(tiktok|video|post|reel|blog)\b", note):
+        kind = "content"
+    elif re.search(r"\b(build|app|tool|website|plan|system|make|create|"
+                   r"automate|planner)\b", note):
+        kind = "project"
+    elif re.search(r"\b(buy|milk|eggs|bread|grocer)", note):
+        return {"type": "task", "confidence": 0.93, "slug": slug,
+                "list": "grocery", "reasoning": "a shopping item"}
+    elif re.search(r"\b(email|call|book|remind|pay)\b", note):
+        kind = "task"
+    else:
+        kind = "note"
+    return {"type": kind, "confidence": 0.9, "slug": slug, "list": "tasks",
+            "reasoning": f"reads as a {kind}"}
+
+
+def proposed_plan(prompt):
+    idea = prompt.split("Write the proposed plan for this idea:")[-1]
+    idea = idea.split("---\nResearch findings")[0]
+    idea = re.sub(r"<!--.*?-->", "", idea.split("## Raw capture")[-1],
+                  flags=re.S).strip()
+    name = " ".join(_kebab(idea, 4).split("-")).title()
+    return f"""# Proposed plan: {name}
+
+> **Pitch:** A small, focused tool that does what the note asks for.
+
+## What we're building
+
+{' '.join(idea.split())[:240]}
+
+## Recommended approach
+
+A single Python package with a command-line entry point. It is the smallest
+thing that works and needs no services.
+
+## Scope
+
+**In:**
+- the core function
+- a command-line interface
+- tests
+
+**Out (for v1):**
+- a web interface
+- cloud sync
+
+## Milestones
+
+| # | Milestone | Rough effort | Done means |
+|---|---|---|---|
+| 1 | Design | 2h | a design note exists |
+| 2 | Core | 4h | the core function works on sample input |
+| 3 | Tests and docs | 3h | tests exist and the README explains usage |
+
+## Recommended team
+
+- developer — builds the tool and its tests
+- reviewer — checks the work against the requirements
+
+## Decisions needed from you
+
+- Which platforms matter first?
+
+## Risks
+
+- Scope creep — keep v1 to the three milestones.
+"""
+
+
+def research(prompt):
+    cite = " [1]" if "[1]" in prompt else ""
+    return f"""## Prior art
+
+Several tools cover parts of this{cite}; none match the exact workflow.
+
+## Tools and building blocks
+
+A scripting language with a good standard library is enough.
+
+## Audience
+
+People with the same recurring chore.
+
+## Feasibility
+
+A weekend for a first version; the hard part is messy real-world input.
+
+## Open questions
+
+- How much of this already exists and is good enough?
+"""
+
+
+def assessment(prompt):
+    slug = _slug(prompt)
+    return f"""## What needs to be done
+- A design note for {slug}
+- The core module and its command-line entry point
+- Tests for the core behaviour
+- A README that explains how to use it
+
+## What I can do with what I have
+- planner drafts the design; coder writes the module and the tests on the
+  smart model; scribe writes the README on the fast model
+- every Python file is syntax-checked before it is kept
+
+## Gaps and risks
+- I cannot run the tests — the owner should run them once
+- No real sample data — the code is written against invented examples
+
+## Approach
+1. Design note
+2. Core module
+3. Tests
+4. README
+"""
+
+
+def plan_batch(prompt):
+    slug = _slug(prompt)
+    n = STATE["plans"].get(slug, 0)
+    if "AN AUDIT FOUND THESE GAPS" in prompt:
+        tasks = [{"id": "g1", "title": "Close the audit gap",
+                  "detail": "Write docs/gap-closure.md addressing the gap "
+                            "the audit named.",
+                  "why": "the audit found a requirement unmet",
+                  "agent": "scribe", "skills": [], "model": "fast",
+                  "phase": "hardening", "est_hours": 1, "depends_on": [],
+                  "reads": [], "research": False,
+                  "done_when": "docs/gap-closure.md exists"}]
+    elif "MODE: the stated goal is met" in prompt:
+        key = slug + "#improve"
+        if STATE["plans"].get(key):
+            return {"tasks": [], "project_complete": True}
+        STATE["plans"][key] = 1
+        tasks = [{"id": "i1", "title": "Add a troubleshooting section",
+                  "detail": "Extend README.md with a troubleshooting "
+                            "section.",
+                  "why": "the goal is met; this is the most useful polish",
+                  "agent": "scribe", "skills": [], "model": "fast",
+                  "phase": "polish", "est_hours": 1, "depends_on": [],
+                  "reads": ["README.md"], "research": False,
+                  "done_when": "README.md has a Troubleshooting heading"}]
+    elif n == 0:
+        tasks = [
+            {"id": "a", "title": "Write the design note",
+             "detail": "Produce docs/design.md covering inputs, outputs "
+                       "and the module layout.",
+             "why": "everything else builds on an agreed design",
+             "agent": "planner", "skills": [], "model": "",
+             "phase": "design", "est_hours": 2, "depends_on": [],
+             "reads": [], "research": "web access is OFF" not in prompt,
+             "done_when": "docs/design.md describes inputs, outputs and "
+                          "layout"},
+            {"id": "b", "title": "Implement the core module",
+             "detail": "Write src/core.py with a run() function following "
+                       "docs/design.md.",
+             "why": "the core is the product; the coder is the right hands",
+             "agent": "coder", "skills": [], "model": "smart",
+             "phase": "build", "est_hours": 4, "depends_on": ["a"],
+             "reads": [], "research": False,
+             "done_when": "src/core.py defines run() and parses"},
+            {"id": "c", "title": "Write tests for the core module",
+             "detail": "Write tests/test_core.py exercising run().",
+             "why": "the work cannot be run here, so tests are the owner's "
+                    "safety net",
+             "agent": "coder", "skills": [], "model": "",
+             "phase": "build", "est_hours": 3, "depends_on": ["b"],
+             "reads": [], "research": False,
+             "done_when": "tests/test_core.py has at least two tests"},
+            {"id": "d", "title": "Write the README",
+             "detail": "Write README.md: what it is, how to run it.",
+             "why": "simple prose — the fast model is enough",
+             "agent": "scribe", "skills": [], "model": "fast",
+             "phase": "docs", "est_hours": 1, "depends_on": ["b"],
+             "reads": [], "research": False,
+             "done_when": "README.md explains how to run the tool"},
+        ]
+    elif n < BATCHES:
+        tasks = [
+            {"id": "e", "title": f"Add the command-line entry point {n}",
+             "detail": "Write src/cli.py that calls run() from src/core.py.",
+             "why": "the core needs a way to be invoked",
+             "agent": "coder", "skills": [], "model": "",
+             "phase": "build", "est_hours": 2, "depends_on": [],
+             "reads": ["src/core.py"], "research": False,
+             "done_when": "src/cli.py has a main() that calls run()"},
+            {"id": "f", "title": f"Document the command line {n}",
+             "detail": "Update README.md with a usage section for the CLI.",
+             "why": "the new entry point must be documented",
+             "agent": "scribe", "skills": [], "model": "fast",
+             "phase": "docs", "est_hours": 1, "depends_on": ["e"],
+             "reads": ["README.md"], "research": False,
+             "done_when": "README.md has a Usage section"},
+        ]
+    else:
+        return {"tasks": [], "project_complete": True}
+    STATE["plans"][slug] = n + 1
+    marker = os.environ.get("MOCK_TITLE_MARKER", "")
+    if marker and n == 0:
+        tasks[1]["title"] += " " + marker
+    return {"tasks": tasks, "project_complete": False}
+
+
+def task_output(prompt):
+    title = re.search(r"YOUR TASK: (.+)", prompt)
+    title = title.group(1).strip() if title else "task"
+    detail = re.search(r"Detail: (.+)", prompt)
+    detail = detail.group(1) if detail else ""
+    key = _slug(prompt) + "/" + title
+    STATE["attempts"][key] = attempt = STATE["attempts"].get(key, 0) + 1
+    paths = re.findall(r"\b((?:[\w.-]+/)*[\w.-]+\.(?:py|md|json|txt|sh))\b",
+                       detail) or [f"docs/{_kebab(title)}.md"]
+    path = paths[0]
+    cited = " It draws on the research provided [1]." \
+        if "RESEARCH MATERIAL" in prompt else ""
+    if path.endswith(".py"):
+        if "[syntaxerror]" in title and attempt == 1:
+            body = "def run(:\n    return 1\n"
+        elif "test" in path:
+            body = ("from src.core import run\n\n\n"
+                    "def test_run_returns_dict():\n"
+                    "    assert isinstance(run([]), dict)\n\n\n"
+                    "def test_run_counts_items():\n"
+                    "    assert run(['a', 'b'])['count'] == 2\n")
+        elif "cli" in path:
+            body = ("import sys\n\nfrom src.core import run\n\n\n"
+                    "def main():\n    print(run(sys.argv[1:]))\n\n\n"
+                    "if __name__ == '__main__':\n    main()\n")
+        else:
+            body = ('"""Core module."""\n\n\ndef run(items):\n'
+                    '    """Summarise the items it is given."""\n'
+                    "    return {'count': len(items), "
+                    "'items': list(items)}\n")
+        fence, lang = "```", ""
+    elif path.endswith(".json"):
+        body, fence = json.dumps({"title": title, "ok": True}, indent=2) \
+            + "\n", "```"
+    else:
+        existing = ""
+        m = re.search(rf"--- {re.escape(path)} ---\n(.*?)(?=\n--- |\n\n[A-Z]"
+                      r"{3,}|\Z)", prompt, re.S)
+        if m:
+            existing = m.group(1).strip() + "\n\n"
+        heading = "Troubleshooting" if "troubleshooting" in title.lower() \
+            else ("Usage" if "command line" in title.lower()
+                  or "usage" in title.lower() else title)
+        body = (existing + f"## {heading}\n\n" if existing
+                else f"# {title}\n\n") + (
+            f"This document was produced for the task “{title}”.{cited}\n\n"
+            "```bash\npython -m src.cli one two\n```\n\n"
+            "- Inputs: a list of items\n- Outputs: a summary\n"
+            "- Layout: `src/core.py`, `src/cli.py`, `tests/`\n")
+        fence = "````"
+    return (f"Here is the finished work.\n\n{fence}file:{path}\n{body}"
+            f"{fence}\n\n## Notes\n\nI wrote `{path}` as the task asked. "
+            "I kept it small on purpose so it is easy to verify, and relied "
+            f"on the project files I was shown.{cited}\n")
+
+
+def verdict(prompt):
+    title = re.search(r"TASK: (.+)", prompt)
+    title = title.group(1).strip() if title else ""
+    key = "verify/" + title
+    STATE["attempts"][key] = n = STATE["attempts"].get(key, 0) + 1
+    if "[fail]" in title:
+        return {"pass": False, "feedback": "the work does not meet the "
+                                           "criterion (mock: always fails)"}
+    if "[flaky]" in title and n == 1:
+        return {"pass": False, "feedback": "the usage example is missing"}
+    return {"pass": True, "feedback": "meets the done-when criterion"}
+
+
+def audit(prompt):
+    slug = "audit"
+    STATE["audits"][slug] = n = STATE["audits"].get(slug, 0) + 1
+    if os.environ.get("MOCK_AUDIT_GAPS") and n == 1:
+        return {"met": False,
+                "gaps": ["there is no note on known limitations"]}
+    return {"met": True, "gaps": []}
+
+
+def memory(prompt):
+    batch = re.search(r"THIS BATCH[^\n]*\n(.*?)\n\nFILES NOW", prompt, re.S)
+    lines = (batch.group(1).strip().splitlines() if batch else [])[:6]
+    return ("## State of the project\nThe files listed under FILES NOW "
+            "exist and were verified.\n\n## Decisions made\n- Keep it a "
+            "single small Python package.\n\n## Lessons\n- Small files pass "
+            "review first time.\n\n## Still to do\n"
+            + ("\n".join(lines) if lines else "- nothing queued") + "\n")
+
+
+def reply_for(system, prompt):
+    s, p = " ".join((system or "").split()), prompt or ""
+    if "triage classifier" in s:
+        return json.dumps(triage(p))
+    if "You write concise project plans from raw idea notes" in s:
+        return proposed_plan(p)
+    if "You turn a research need into web search queries" in s:
+        words = [w for w in re.findall(r"[a-z]{4,}", p.lower())
+                 if w not in ("research", "need")][:5]
+        return json.dumps({"queries": [" ".join(words) or "idea prior art"]})
+    if "lead planner, about to run a project autonomously" in s:
+        return assessment(p)
+    if "You are the project planner inside A.R.I.A." in s:
+        return json.dumps(plan_batch(p))
+    if "verification judge" in s:
+        return json.dumps(verdict(p))
+    if "You audit whether a project's requirements are met" in s:
+        return json.dumps(audit(p))
+    if "working memory of an autonomous project" in s:
+        return memory(p)
+    if "opening summary of a report" in s:
+        return ("The run completed its planned work: the design, the core "
+                "module, its tests and the documentation were written and "
+                "verified. Nothing was executed, so run the tests once "
+                "before relying on it.")
+    if "answering a question from live web research" in s:
+        return ("Based on what I found, the short answer is yes — the "
+                "sources describe it directly [1].")
+    if "summarising a web page" in s:
+        return ("The page is a short reference on the topic; its key "
+                "points are the ones in its headings.")
+    if "YOUR TASK:" in p:
+        return task_output(p)
+    if p.startswith("From prior knowledge only") \
+            or p.startswith("Using the live web research"):
+        return research(p)
+    if "You are A.R.I.A. (Autonomous Reasoning" in s:
+        return "All systems are operational and I'm ready when you are."
+    if "specialist agent inside A.R.I.A." in s:
+        return ("Here is my finished work on that. The main point stands "
+                "on its own; the one thing to verify is the estimate.")
+    return "Understood."
+
+
+# ------------------------------------------------------------ the server
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _json(self, obj, code=200):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/api/tags":
+            self._json({"models": [{"name": n, "size": s}
+                                   for n, s in MODELS]})
+        elif self.path == "/v1/models":
+            self._json({"data": [{"id": n} for n, _ in MODELS]})
+        elif self.path == "/mock/calls":
+            self._json({"calls": STATE["calls"][-200:]})
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        if self.path == "/mock/reset":
+            for key in ("plans", "attempts", "audits"):
+                STATE[key].clear()
+            STATE["calls"].clear()
+            return self._json({"ok": True})
+        messages = body.get("messages") or []
+        system = " ".join(m.get("content", "") for m in messages
+                          if m.get("role") == "system")
+        prompt = next((m.get("content", "") for m in reversed(messages)
+                       if m.get("role") == "user"), "")
+        model = body.get("model", "")
+        if self.path == "/api/chat" and not any(
+                model == n or n.startswith(model + ":") for n, _ in MODELS):
+            return self._json({"error": f"model '{model}' not found"}, 404)
+        text = reply_for(system, prompt)
+        STATE["calls"].append({"model": model, "system": system[:80],
+                               "num_ctx": (body.get("options") or {})
+                               .get("num_ctx"), "chars": len(prompt)})
+        chunks = [text[i:i + 24] for i in range(0, len(text), 24)] or [""]
+        self.send_response(200)
+        self.send_header("Connection", "close")
+        if self.path == "/api/chat":
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            for c in chunks:
+                self.wfile.write(json.dumps(
+                    {"message": {"role": "assistant", "content": c},
+                     "done": False}).encode() + b"\n")
+                self.wfile.flush()
+                if DELAY:
+                    time.sleep(DELAY)
+            self.wfile.write(json.dumps(
+                {"message": {"role": "assistant", "content": ""},
+                 "done": True}).encode() + b"\n")
+        elif self.path == "/v1/chat/completions":
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for c in chunks:
+                self.wfile.write(b"data: " + json.dumps(
+                    {"choices": [{"delta": {"content": c}}]}).encode()
+                    + b"\n\n")
+                self.wfile.flush()
+                if DELAY:
+                    time.sleep(DELAY)
+            self.wfile.write(b"data: [DONE]\n\n")
+        self.close_connection = True
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() \
+        else 11435
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"aria-mock-llm -> http://127.0.0.1:{port}  (Ctrl+C to stop)",
+          flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+if __name__ == "__main__":
+    main()
