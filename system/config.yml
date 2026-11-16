@@ -98,3 +98,73 @@ aria:
 
   # Whether /develop may use web search for research.
   research_web_access: true
+
+  # ---- reach: the internet ------------------------------------------
+  # On: "search for …" and "read <url>" are real actions in chat and voice,
+  # the develop stage researches ideas on the live web, and autopilot
+  # tasks marked research get sourced material. Search queries leave your
+  # machine when this is on — switch it off here (or in Settings) for a
+  # fully offline A.R.I.A.; she then says plainly that she cannot browse.
+  web_access: true
+
+  # Where searches go:
+  #   auto        your SearxNG if web_search_url is set, else Brave if a key
+  #               is set, else DuckDuckGo, else Wikipedia — first to answer
+  #   duckduckgo  no key, no setup (the no-JavaScript results page)
+  #   brave       official API — free key from brave.com/search/api, put it
+  #               in the environment as ARIA_KEY_BRAVE
+  #   searxng     your own instance (most private): set web_search_url
+  #   wikipedia   encyclopedia only
+  #   none        fetch pages you name, but never search
+  web_search: auto
+
+  # Your self-hosted SearxNG search endpoint, JSON format enabled, e.g.
+  #   web_search_url: http://localhost:8888/search
+  web_search_url:
+
+  # Optional: confine page fetching to these sites (comma-separated).
+  # Empty = any public site. Your local network is always off limits —
+  # private, loopback and link-local addresses are refused.
+  #   web_allowlist: en.wikipedia.org, docs.python.org, github.com
+  web_allowlist:
+
+  # ---- reach: git and GitHub ---------------------------------------
+  # Autopilot commits every verified task when the project is its own git
+  # repository (never inside a repository that merely contains it), on the
+  # branch aria/autopilot — your base branch is never committed to.
+  autopilot_git: true
+
+  # GitHub is off until you say so. On: `aria github publish <slug>`
+  # creates a private repository for a project, and autopilot pushes its
+  # branch and keeps a pull request open as it works. Needs the gh CLI,
+  # signed in once with `gh auth login` (or a token in ARIA_GITHUB_TOKEN).
+  github_access: false
+  github_base_branch: main
+
+  # ---- autopilot ----------------------------------------------------
+  # Context window, in tokens, requested from Ollama for every call (its
+  # own default silently truncates long prompts) and used to size prompts.
+  # Raise it if your models and VRAM allow; 0 leaves the backend's own
+  # setting alone.
+  context_tokens: 8192
+
+  # After the goal is met and audited:  improve = keep going with
+  # improvements until you stop her (or two batches add nothing);
+  # stop = write the final report and stand down.
+  autopilot_after_goal: improve
+
+  # Optional budgets for one run — 0 means no limit. When either is
+  # reached she finishes the step in flight and writes the report.
+  autopilot_max_iterations: 0
+  autopilot_max_hours: 0
+
+  # Minutes a fast/smart model may stay silent before an attempt is
+  # abandoned and retried. The deep tier and hand-picked models are never
+  # cut off — a giant can take an hour to produce its first token.
+  autopilot_idle_minutes: 30
+
+  # ---- the Obsidian brain -------------------------------------------
+  # With obsidian_vault set (above), she writes into <vault>/ARIA/ only:
+  # project hubs, notes you dictate ("note to brain: …"), research she
+  # did, and — when this is on — a daily journal of what she worked on.
+  brain_journal: true
