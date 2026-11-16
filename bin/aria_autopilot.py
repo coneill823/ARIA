@@ -855,6 +855,11 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     done_titles = {_norm_title(t["title"]) for t in plan["tasks"]
                    if t["status"] == "done"}
     iteration = state["iteration"] + 1
+    # ids never repeat — also not for a plan written by an older version,
+    # which numbered tasks without keeping a counter
+    used = [int(t["id"][1:]) for t in plan["tasks"]
+            if re.fullmatch(r"t\d+", str(t.get("id", "")))]
+    state["next_id"] = max(state["next_id"], max(used, default=0) + 1)
     fresh, idmap = [], {}
     for raw in raw_tasks[:10]:
         title = " ".join(str(raw.get("title") or "").split())[:140]
@@ -1439,6 +1444,14 @@ def _tick(slug, emit):
         return "idle"
     auto = _auto(slug)
     emit = _emitter(slug, emit)
+    if not eng.project_approved(slug):
+        # e.g. a run begun under an older version that had no gate
+        state.update(status="idle", phase="", current=None, waiting="")
+        _save_state(slug, state)
+        emit({"event": "error",
+              "log": f"{slug}: paused — its plan has not been approved. "
+                     "Approve it and start again; nothing is lost."})
+        return "idle"
     if (auto / "STOP").exists():
         _finalize(slug, emit, "stopped")
         return "finalized"
