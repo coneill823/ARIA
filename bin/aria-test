@@ -373,6 +373,49 @@ def main():
                 f"{n}, stopped gracefully, final report written")
     check("autopilot — live model", c_autopilot)
 
+    def c_guardrails():
+        # no LLM calls: the gate and the budget cap both return before
+        # any model is contacted
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        slug = state["slug"]
+        quiet = lambda e: None
+        logs = []
+        auto = os.path.join(sandbox, "pipeline/02-potential-projects",
+                            slug, "autopilot")
+        plan = {"tasks": [{
+            "id": "g1", "title": "Pick the product name", "detail": "x",
+            "agent": "planner", "skills": [], "model": "", "phase": "work",
+            "est_hours": 1, "depends_on": [], "done_when": "named",
+            "needs_human": True, "status": "todo"}],
+            "project_complete": False}
+        with open(os.path.join(auto, "plan.json"), "w") as f:
+            json.dump(plan, f)
+        with open(os.path.join(auto, "state.json"), "w") as f:
+            json.dump({"status": "running", "iteration": 1}, f)
+        r = eng.autopilot_tick(slug, lambda e: logs.append(e.get("log", "")))
+        assert r == "idle", f"gated task should idle, got {r}"
+        assert any("waiting on YOU" in (l or "") for l in logs), \
+            "no waiting-on-you notice emitted"
+        with open(os.path.join(auto, "state.json"), "w") as f:
+            json.dump({"status": "running", "iteration": 1,
+                       "tasks_run": 99}, f)
+        cfgp = os.path.join(sandbox, "system", "config.yml")
+        txt = open(cfgp).read()
+        with open(cfgp, "w") as f:
+            f.write(txt.replace("autopilot_max_tasks: 0",
+                                "autopilot_max_tasks: 1"))
+        try:
+            r = eng.autopilot_tick(slug, quiet)
+        finally:
+            with open(cfgp, "w") as f:
+                f.write(txt)
+        assert r == "budget", f"cap should pause the run, got {r}"
+        with open(os.path.join(auto, "state.json")) as f:
+            assert json.load(f)["status"] == "budget"
+        return "needs_human gates with a notice; task cap pauses as budget"
+    check("autopilot guardrails (no-LLM)", c_guardrails)
+
     def c_skills():
         names = eng.list_skill_names()
         if not names:
@@ -433,10 +476,10 @@ def main():
                 time.sleep(0.25)
 
         def c_pages():
-            for p in ("/", "/board", "/orb", "/agents"):
+            for p in ("/", "/projects", "/board", "/orb", "/agents"):
                 with urllib.request.urlopen(base + p, timeout=10) as r:
                     assert r.status == 200, f"{p} -> {r.status}"
-            return "/, /board, /orb, /agents all 200"
+            return "/, /projects, /board, /orb, /agents all 200"
         check("web pages", c_pages)
 
         def c_api():

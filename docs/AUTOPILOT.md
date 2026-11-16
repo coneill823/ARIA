@@ -50,6 +50,31 @@ closing every tab changes nothing. A restart recovers stranded tasks and
 restarts them. Autopilot never blocks triage, chat, or missions; it
 shares only the hardware.
 
+## Guardrails for long unattended runs
+
+Built for "leave it running for days", each tunable in `system/config.yml`:
+
+- **Rolling memory.** At every iteration boundary the loop distils the
+  changelog into `autopilot/lessons.md`; the planner and every task read
+  it, so settled questions stay settled across iterations.
+- **Duplicate guard.** Replanned task titles are checked against
+  everything already done or seen; repeats are dropped (and logged).
+- **Stall detection.** `autopilot_stall_limit` (default 3) consecutive
+  replans that add no new work auto-pause the run as **stalled** and
+  fire the `mission-done` webhook. Press Start to resume.
+- **Budget caps.** `autopilot_max_tasks` / `autopilot_max_hours`
+  (0 = unlimited) pause the run as **budget** at the cap instead of
+  burning a week of GPU unnoticed.
+- **Human-gate tasks.** The planner can mark a task `needs_human` (pick
+  the product name, approve spending). The loop works around it, and when
+  it is all that is left, waits and tells you; approve it with one click
+  in the task's card on the Projects page.
+- **Git per task.** With `autopilot_git: true`, every completed task is
+  committed — *only* in projects that are their own git repo (`git init`
+  in the project folder, or promoted projects). Pipeline folders and the
+  A.R.I.A. repo itself are never auto-committed. This gives diffable
+  history and true rollback, and makes the final report verifiable.
+
 ## Honest limits
 
 - Agents produce text and files; they cannot execute code or browse. For
@@ -57,5 +82,7 @@ shares only the hardware.
   (`aria handoff <slug>`) or the generated CrewAI crew.
 - Quality tracks the models you assign. Give drafting to fast models and
   judgment to big ones; the verifier is only as sharp as your smart tier.
-- An unattended loop on a weak model can iterate busily without real
-  progress — skim the changelog daily on long runs.
+  The lessons keeper runs on the smart tier too — weak smart model, weak
+  memory.
+- The stall and budget guards bound busy non-progress, but they can't
+  make a weak model produce good work — skim the changelog on long runs.

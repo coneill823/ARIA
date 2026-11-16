@@ -195,6 +195,26 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "action must be start|stop"}, 400)
                     return
                 self.send_json({"ok": True, "state": state})
+            elif url.path == "/api/approve-task":
+                slug = str(body.get("slug", "")).strip().lower()
+                task_id = str(body.get("id", "")).strip()
+                plan_path = eng._auto_plan_path(slug)
+                if not plan_path.is_file():
+                    self.send_json({"error": "no plan for that project"}, 404)
+                    return
+                plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                hit = False
+                for t in plan.get("tasks", []):
+                    if t.get("id") == task_id and t.get("needs_human"):
+                        t["needs_human"] = False
+                        hit = True
+                if not hit:
+                    self.send_json(
+                        {"error": "no waiting task with that id"}, 404)
+                    return
+                plan_path.write_text(json.dumps(plan, indent=2) + "\n",
+                                     encoding="utf-8")
+                self.send_json({"ok": True, "approved": task_id})
             elif url.path == "/api/plan":
                 self.plan_project(body)
             elif url.path == "/api/chat":

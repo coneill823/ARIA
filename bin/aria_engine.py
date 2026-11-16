@@ -78,6 +78,11 @@ def config():
         "obsidian_vault": os.environ.get(
             "ARIA_OBSIDIAN_VAULT", find("obsidian_vault", "")),
         "stt_model": find("stt_model", "base"),
+        "autopilot_git": find("autopilot_git", "true").lower()
+            in ("true", "yes", "on", "1"),
+        "autopilot_stall_limit": int(find("autopilot_stall_limit", "3")),
+        "autopilot_max_tasks": int(find("autopilot_max_tasks", "0")),
+        "autopilot_max_hours": float(find("autopilot_max_hours", "0")),
         "tiers": {"fast": find("fast", ""), "smart": find("smart", ""),
                   "deep": find("deep", "")},
         "backend_urls": {k: v.rstrip("/") for k, v in backends.items()},
@@ -1161,14 +1166,26 @@ Respond with ONLY JSON:
 {"tasks": [{"id": "t1", "title": "...", "detail": "what exactly to produce",
   "agent": "<one of: %s>", "skills": [], "model": "",
   "phase": "<short phase name>", "est_hours": 2,
-  "depends_on": [], "done_when": "<observable criterion>"}],
+  "depends_on": [], "done_when": "<observable criterion>",
+  "needs_human": false}],
  "project_complete": false}
 Rules: 3-10 tasks, concrete and self-contained; depends_on refers to ids
 in THIS list; "skills" only from: %s (or empty); "model" empty for the
 agent's default, or fast/smart/deep, or a backend/model spec; order tasks
-so each builds on its dependencies. If the changelog shows the project
-goal is genuinely met and nothing worthwhile remains, return
+so each builds on its dependencies. NEVER repeat a title listed under
+ALREADY DONE — plan what comes NEXT. Set "needs_human": true only for a
+decision or action that genuinely requires the owner (spending money,
+irreversible choices, external accounts). Respect the LESSONS section —
+do not replan approaches it says failed. If the changelog shows the
+project goal is genuinely met and nothing worthwhile remains, return
 {"tasks": [], "project_complete": true} instead."""
+
+AUTOPILOT_LESSONS = """You are the lessons keeper for an autonomous
+project run. Rewrite the lessons file: merge the existing lessons with
+what the latest changelog entries teach (what worked, what failed and
+why, decisions made, approaches to avoid, owner preferences observed).
+Output ONLY the new lessons file: terse markdown bullets, max 25 lines,
+most important first. Never lose a lesson that is still true."""
 
 AUTOPILOT_TASK = """You are working autonomously inside project
 "{slug}". Overall goal:
@@ -1264,9 +1281,45 @@ def list_projects():
     return out
 
 
+def _lessons_path(slug):
+    return _auto_dir(slug) / "lessons.md"
+
+
+def _lessons(slug, limit=1200):
+    f = _lessons_path(slug)
+    return f.read_text(encoding="utf-8")[:limit] if f.is_file() else ""
+
+
+def update_lessons(slug, emit):
+    """Rolling memory: distil the recent changelog into lessons.md so the
+    planner stops re-litigating settled questions between iterations."""
+    cl = _auto_dir(slug) / "CHANGELOG.md"
+    if not cl.is_file():
+        return
+    emit({"event": "thinking", "label": f"updating lessons for {slug}"})
+    try:
+        new = chat_stream(
+            resolve_tier("smart", config()),
+            "EXISTING LESSONS:\n" + (_lessons(slug, 2000) or "(none yet)")
+            + "\n\nLATEST CHANGELOG ENTRIES:\n"
+            + cl.read_text(encoding="utf-8")[-4000:],
+            AUTOPILOT_LESSONS)
+        _lessons_path(slug).write_text(new.strip() + "\n", encoding="utf-8")
+        emit({"event": "stage_done", "stage": "lessons",
+              "log": f"{slug}: lessons.md updated"})
+    except Exception as exc:
+        emit({"event": "error",
+              "log": f"lessons update failed (non-fatal): {exc}"})
+
+
+def _norm_title(title):
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
+
 def autopilot_plan(slug, emit):
     """(Re)plan the project: merge-safe — done tasks are kept, new tasks
-    appended with fresh ids."""
+    appended with fresh ids; titles already seen are dropped (duplicate
+    guard for recursive replanning)."""
     cfg = config()
     agents = list_agents()
     names = ", ".join(a["name"] for a in agents)
@@ -1277,12 +1330,17 @@ def autopilot_plan(slug, emit):
     if plan_path.is_file():
         old = json.loads(plan_path.read_text(encoding="utf-8"))
     done = [t for t in old["tasks"] if t.get("status") == "done"]
+    state = _auto_state(slug)
+    seen = set(state.get("seen_titles", []))
+    seen |= {_norm_title(t["title"]) for t in done}
     changelog = ""
     cl = _auto_dir(slug) / "CHANGELOG.md"
     if cl.is_file():
         changelog = cl.read_text(encoding="utf-8")[-3000:]
+    lessons = _lessons(slug)
     prompt = (f"PROJECT {slug}\n\nGOAL / REQUIREMENTS:\n"
               + _project_goal(slug)
+              + (f"\n\nLESSONS (respect these):\n{lessons}" if lessons else "")
               + (f"\n\nCHANGELOG SO FAR:\n{changelog}" if changelog else "")
               + (f"\n\nALREADY DONE: "
                  + "; ".join(t["title"] for t in done) if done else ""))
@@ -1294,11 +1352,16 @@ def autopilot_plan(slug, emit):
     valid_agents = {a["name"] for a in agents}
     fresh = []
     base = len(done)
-    for i, t in enumerate(data.get("tasks", [])):
-        tid = f"t{base + i + 1}"
+    for t in data.get("tasks", []):
+        title = str(t.get("title", "untitled"))[:120]
+        if _norm_title(title) in seen:
+            emit({"event": "error",
+                  "log": f"dropped duplicate task: {title}"})
+            continue
+        tid = f"t{base + len(fresh) + 1}"
         fresh.append({
             "id": tid, "orig_id": str(t.get("id", tid)),
-            "title": str(t.get("title", "untitled"))[:120],
+            "title": title,
             "detail": str(t.get("detail", ""))[:1500],
             "agent": (t.get("agent") if t.get("agent") in valid_agents
                       else "planner"),
@@ -1310,6 +1373,7 @@ def autopilot_plan(slug, emit):
             "depends_on": [str(d) for d in (t.get("depends_on") or [])],
             "done_when": str(t.get("done_when")
                              or "the work product exists and is complete")[:300],
+            "needs_human": bool(t.get("needs_human")),
             "status": "todo",
         })
     # remap depends_on from the model's ids to our assigned ids
@@ -1323,6 +1387,9 @@ def autopilot_plan(slug, emit):
             "project_complete": bool(data.get("project_complete"))
             and not fresh}
     plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    state["seen_titles"] = sorted(seen | {_norm_title(t["title"])
+                                          for t in fresh})[-200:]
+    _auto_save_state(slug, state)
     emit({"event": "stage_done", "stage": "plan",
           "log": f"plan for {slug}: {len(fresh)} new task(s), "
                  f"{len(done)} already done"})
@@ -1354,9 +1421,47 @@ def _write_file_blocks(slug, output, emit):
     return written
 
 
+def _pause(slug, state, reason, emit):
+    state["status"] = reason
+    _auto_save_state(slug, state)
+    emit({"event": "error",
+          "log": f"{slug}: autopilot paused ({reason}) — press Start to "
+                 "resume"})
+    try:
+        if "mission-done" in config()["webhooks"]:
+            trigger_webhook("mission-done",
+                            f"autopilot {slug} paused: {reason}")
+    except Exception:
+        pass
+
+
+def _git_commit(slug, message, emit):
+    """Roadmap #3: version every task when the project folder is its own
+    git repo (promoted projects are; pipeline folders are skipped so the
+    main A.R.I.A. repo never gets surprise commits)."""
+    if not config()["autopilot_git"]:
+        return
+    proj = _project_dir(slug)
+    if not (proj / ".git").is_dir():
+        return
+    import subprocess
+    try:
+        subprocess.run(["git", "-C", str(proj), "add", "-A"],
+                       capture_output=True, timeout=60)
+        r = subprocess.run(["git", "-C", str(proj), "commit", "-m", message],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            emit({"event": "stage_done", "stage": "git",
+                  "log": f"{slug}: committed — {message}"})
+    except Exception as exc:
+        emit({"event": "error", "log": f"git commit failed: {exc}"})
+
+
 def autopilot_tick(slug, emit):
     """Run ONE step of the autopilot. Returns what happened:
-    'task' (executed one), 'replanned', 'finalized', 'complete', 'idle'."""
+    'task' (executed one), 'replanned', 'finalized', 'complete', 'idle',
+    'stalled', 'budget'."""
+    cfg = config()
     state = _auto_state(slug)
     if state.get("status") != "running":
         return "idle"
@@ -1365,6 +1470,22 @@ def autopilot_tick(slug, emit):
         _finalize(slug, emit, stopped=True)
         return "finalized"
 
+    # budget guardrails (0 = unlimited)
+    if cfg["autopilot_max_tasks"] and \
+            state.get("tasks_run", 0) >= cfg["autopilot_max_tasks"]:
+        _pause(slug, state, "budget", emit)
+        return "budget"
+    if cfg["autopilot_max_hours"] and state.get("started"):
+        try:
+            began = datetime.datetime.strptime(state["started"],
+                                               "%Y-%m-%dT%H:%M")
+            hours = (datetime.datetime.now() - began).total_seconds() / 3600
+            if hours >= cfg["autopilot_max_hours"]:
+                _pause(slug, state, "budget", emit)
+                return "budget"
+        except ValueError:
+            pass
+
     plan_path = _auto_plan_path(slug)
     if not plan_path.is_file():
         autopilot_plan(slug, emit)
@@ -1372,8 +1493,17 @@ def autopilot_tick(slug, emit):
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     done_ids = {t["id"] for t in plan["tasks"] if t["status"] == "done"}
     todo = [t for t in plan["tasks"] if t["status"] in ("todo", "blocked")
+            and not t.get("needs_human")
             and all(d in done_ids for d in t["depends_on"])]
+    gated = [t for t in plan["tasks"]
+             if t["status"] == "todo" and t.get("needs_human")]
     if not todo:
+        if gated:   # nothing runnable and approval-gated work exists
+            emit({"event": "error",
+                  "log": f"{slug}: waiting on YOU — approve "
+                         + ", ".join(t["id"] for t in gated)
+                         + " on the Projects page"})
+            return "idle"
         if all(t["status"] == "done" for t in plan["tasks"]):
             if plan.get("project_complete"):
                 _finalize(slug, emit, stopped=False)
@@ -1382,10 +1512,22 @@ def autopilot_tick(slug, emit):
             _auto_save_state(slug, state)
             emit({"event": "start", "stage": "autopilot",
                   "log": f"{slug}: iteration {state['iteration']} — replanning"})
+            update_lessons(slug, emit)
             plan = autopilot_plan(slug, emit)
+            state = _auto_state(slug)
             if plan.get("project_complete"):
                 _finalize(slug, emit, stopped=False)
                 return "complete"
+            fresh = [t for t in plan["tasks"] if t["status"] == "todo"]
+            if not fresh:   # replanning produced nothing new — strike
+                state["stale_strikes"] = state.get("stale_strikes", 0) + 1
+                _auto_save_state(slug, state)
+                if state["stale_strikes"] >= cfg["autopilot_stall_limit"]:
+                    _pause(slug, state, "stalled", emit)
+                    return "stalled"
+                return "idle"
+            state["stale_strikes"] = 0
+            _auto_save_state(slug, state)
             return "replanned"
         # recover: a crash/restart can strand tasks inprogress/reviewing
         # (restart them), and blocked tasks are parked so replanning can
@@ -1419,6 +1561,9 @@ def autopilot_tick(slug, emit):
         if f.is_file():
             deps += (f"\nOutput of dependency {d} (excerpt):\n"
                      + f.read_text(encoding="utf-8")[:2000] + "\n")
+    lessons = _lessons(slug, 800)
+    if lessons:
+        deps += f"\nLESSONS from this project so far (respect them):\n{lessons}\n"
     prompt = AUTOPILOT_TASK.format(slug=slug, goal=_project_goal(slug, 1500),
                                    title=task["title"], detail=task["detail"],
                                    done_when=task["done_when"], deps=deps)
@@ -1463,6 +1608,11 @@ def autopilot_tick(slug, emit):
         return "task"
 
     plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    state = _auto_state(slug)
+    state["tasks_run"] = state.get("tasks_run", 0) + 1
+    if task["status"] == "done":
+        state["stale_strikes"] = 0
+    _auto_save_state(slug, state)
     summary = " ".join(output.split())[:300]
     _changelog(slug,
                f"- **{task['title']}** [{task['id']}] by {agent_name} — "
@@ -1470,6 +1620,8 @@ def autopilot_tick(slug, emit):
                + (f" Files: {', '.join(written)}." if written else "")
                + f" Reasoning/result: {summary}… "
                f"(full output: autopilot/task-{task['id']}.md)")
+    _git_commit(slug, f"autopilot({slug}): {task['title']} [{task['id']}]",
+                emit)
     emit({"event": "stage_done", "stage": "autopilot",
           "log": f"{slug}: {task['id']} {task['status']}"})
     return "task"

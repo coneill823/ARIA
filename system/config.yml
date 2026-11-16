@@ -67,6 +67,19 @@ aria:
   # develop whatever became a project — idea in, proposed plan out.
   auto_pipeline: true
 
+  # ---- autopilot guardrails (for long unattended runs) ----
+  # Auto-commit after every completed autopilot task — only fires inside
+  # projects that have their own .git (run `git init` in the project dir);
+  # the pipeline folders and the A.R.I.A. repo itself are never touched.
+  autopilot_git: true
+  # Consecutive replans that add no new work before the run auto-pauses
+  # as "stalled" (and notifies the mission-done webhook if configured).
+  autopilot_stall_limit: 3
+  # Soft caps: pause the run as "budget" after this many executed tasks /
+  # this many wall-clock hours. 0 = unlimited.
+  autopilot_max_tasks: 0
+  autopilot_max_hours: 0
+
   # Absolute path to your Obsidian vault to enable the UI's "→ Obsidian"
   # button (exports a project's idea/research/plan plus an index note with
   # tags and wikilinks into <vault>/ARIA/). Empty = disabled.
