@@ -1,7 +1,12 @@
 # Skill sources — one git repo per line; # disables a line.
-# `aria install-skills` clones/updates each into vendor/ and links every
-# folder containing a SKILL.md into .claude/skills/ (first source wins on
-# name collisions). Then `aria skills convert` rebuilds the universal pack.
+# `aria install-skills` clones/updates each into vendor/ and links its
+# skills where A.R.I.A. can load them (first source wins on name
+# collisions). Then `aria skills convert` rebuilds the universal pack.
+#
+# A source marked `engine-only` is linked into skills-library/ instead of
+# .claude/skills/: A.R.I.A.'s own agents, chat and autopilot use it, but
+# Claude Code sessions in this repo are not handed hundreds of extra skills.
+# A source's agents/ folder becomes her agent library either way.
 
 # Anthropic's official Agent Skills (docx/pdf/pptx/xlsx, design, mcp...)
 https://github.com/anthropics/skills
@@ -15,7 +20,10 @@ https://github.com/multica-ai/andrej-karpathy-skills
 # 53 marketing skills (copywriting, SEO, launches, pricing, ads...)
 https://github.com/coreyhaines31/marketingskills
 
-# ECC: 300+ engineering skills + 71 agents. HUGE — enable deliberately.
-# In Claude Code it's better installed as a plugin:
+# ECC: ~330 engineering skills and ~70 specialist agents (reviewers,
+# build-fixers, architects, a loop operator…). Autopilot does not load
+# them wholesale — for each project it offers the planner only the
+# specialists and skills that fit the goal, and each task loads at most a
+# few. For Claude Code itself, install it as a plugin instead:
 #   /plugin marketplace add https://github.com/affaan-m/ECC
-# https://github.com/affaan-m/ecc
+https://github.com/affaan-m/ecc  engine-only
