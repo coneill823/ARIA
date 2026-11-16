@@ -58,14 +58,10 @@ def main():
     slug = sys.argv[1]
 
     cfg = eng.config()
-    target = Path(cfg["promotion_target"])
-    if not target.is_absolute():
-        target = (eng.ROOT / target).resolve()
-    project = None
-    for base in (target / slug, eng.POTENTIAL / slug):
-        if base.is_dir():
-            project = base
-            break
+    try:
+        project = eng._project_dir(slug)
+    except ValueError:
+        project = None
     if project is None:
         print(f"no project found for slug: {slug}", file=sys.stderr)
         return 1

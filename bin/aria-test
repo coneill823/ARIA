@@ -285,6 +285,10 @@ def main():
                        "query": "exif date parsing"}, got
         got = eng.detect_intent("read https://example.com/guide")
         assert got and got["action"] == "fetch", got
+        # a local address is still recognised as a fetch — so that it gets
+        # the explicit refusal instead of a chat model's improvisation
+        got = eng.detect_intent("read http://127.0.0.1:8700/api/board")
+        assert got and got["action"] == "fetch", got
         set_config(sandbox, web_access="false")
         return f"{len(cases)+5} spoken commands routed correctly"
     check("spoken commands (no-LLM)", c_intents)

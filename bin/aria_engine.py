@@ -1177,20 +1177,20 @@ def board():
         for p in lists_dir.glob("*.md"):
             open_tasks += p.read_text(encoding="utf-8").count("- [ ]")
 
-    cfg = config()
-    target = Path(cfg["promotion_target"])
-    if not target.is_absolute():
-        target = (ROOT / target).resolve()
+    target = promotion_dir()
     active = []
     if target.is_dir():
         for d in sorted(target.iterdir()):
             status_file = d / "STATUS.md"
-            if not d.is_dir() or not status_file.exists():
+            if not d.is_dir():
                 continue
-            text = status_file.read_text(encoding="utf-8")
-            phase = re.search(r"\*\*Phase:\*\*\s*(.+)", text)
-            active.append({"slug": d.name,
-                           "phase": phase.group(1).strip() if phase else "?"})
+            if status_file.exists():
+                text = status_file.read_text(encoding="utf-8")
+                phase = re.search(r"\*\*Phase:\*\*\s*(.+)", text)
+                active.append({"slug": d.name, "phase": phase.group(1).strip()
+                               if phase else "?"})
+            elif (d / ".aria").is_dir():           # an adopted codebase
+                active.append({"slug": d.name, "phase": "adopted codebase"})
 
     return {
         "inbox": _note_cards(INBOX),
@@ -1386,7 +1386,8 @@ INTENT_TRIGGER = re.compile(
 INTENT_FETCH = re.compile(
     r"^\s*(?:fetch|read|open|summari[sz]e|load)\s+(?:the\s+)?"
     r"(?:(?:web\s?)?page\s+|url\s+|site\s+|link\s+)?(?:at\s+)?"
-    r"((?:https?://)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:[/?#]\S*)?)\s*$", re.I)
+    r"(https?://\S+|localhost(?::\d+)?(?:[/?#]\S*)?|"
+    r"[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?::\d+)?(?:[/?#]\S*)?)\s*$", re.I)
 INTENT_SEARCH = re.compile(
     r"^\s*(?:please\s+)?(?:run\s+(?:a\s+)?)?(?:(?:web\s+)?search"
     r"(?:\s+the\s+(?:web|internet))?(?:\s+for)?|look\s+up|google|"
@@ -1483,7 +1484,8 @@ def detect_intent(text):
         return {"action": "webhook", "name": m.group(1).lower(),
                 "message": (m.group(2) or "").strip()}
     m = INTENT_FETCH.match(text)
-    if m and (m.group(1).lower().startswith("http") or "/" in m.group(1)
+    if m and (m.group(1).lower().startswith(("http", "localhost"))
+              or "/" in m.group(1)
               or re.search(r"\.(?:com|org|net|io|dev|ai|co|uk|gov|edu|app|"
                            r"info|me|us|de|fr|ca|au|wiki)\b", m.group(1), re.I)):
         return {"action": "fetch" if cfg["web_access"] else "no-web",
