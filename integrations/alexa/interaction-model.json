@@ -1,0 +1,386 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "my aria",
+      "intents": [
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NavigateHomeIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        },
+        {
+          "name": "StatusAllIntent",
+          "samples": [
+            "what are you working on",
+            "what you are working on",
+            "what's happening",
+            "what is happening",
+            "status",
+            "status report",
+            "for a status report",
+            "what's waiting on me",
+            "what is waiting on me",
+            "how are things going"
+          ]
+        },
+        {
+          "name": "TriageIntent",
+          "samples": [
+            "run triage",
+            "triage",
+            "triage the inbox",
+            "run the triage"
+          ]
+        },
+        {
+          "name": "DevelopIntent",
+          "samples": [
+            "develop the plans",
+            "run develop",
+            "make the plans"
+          ]
+        },
+        {
+          "name": "CaptureIntent",
+          "samples": [
+            "capture {text}",
+            "remember {text}",
+            "note down {text}",
+            "add an idea {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "WorkIntent",
+          "samples": [
+            "work on {text}",
+            "start working on {text}",
+            "start work on {text}",
+            "get to work on {text}",
+            "resume work on {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "StopWorkIntent",
+          "samples": [
+            "stop working on {text}",
+            "stop work on {text}",
+            "stand down on {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "StatusIntent",
+          "samples": [
+            "status of {text}",
+            "status on {text}",
+            "progress on {text}",
+            "how is {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "ChangesIntent",
+          "samples": [
+            "what changed in {text}",
+            "what has changed in {text}",
+            "what did you change in {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "SearchIntent",
+          "samples": [
+            "search for {text}",
+            "search the web for {text}",
+            "look up {text}",
+            "google {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "BrainIntent",
+          "samples": [
+            "note to brain {text}",
+            "note to my brain {text}",
+            "save to obsidian {text}",
+            "write to obsidian {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "SayIntent",
+          "samples": [
+            "say {text}",
+            "tell her {text}",
+            "tell her that {text}",
+            "chat {text}",
+            "question {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhatIntent",
+          "samples": [
+            "what {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhatsIntent",
+          "samples": [
+            "what's {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskHowIntent",
+          "samples": [
+            "how {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhyIntent",
+          "samples": [
+            "why {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhenIntent",
+          "samples": [
+            "when {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhereIntent",
+          "samples": [
+            "where {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhoIntent",
+          "samples": [
+            "who {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWhichIntent",
+          "samples": [
+            "which {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskIsIntent",
+          "samples": [
+            "is {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskAreIntent",
+          "samples": [
+            "are {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskCanIntent",
+          "samples": [
+            "can {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskCouldIntent",
+          "samples": [
+            "could {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskDoIntent",
+          "samples": [
+            "do {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskDoesIntent",
+          "samples": [
+            "does {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskDidIntent",
+          "samples": [
+            "did {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskShouldIntent",
+          "samples": [
+            "should {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        },
+        {
+          "name": "AskWillIntent",
+          "samples": [
+            "will {text}"
+          ],
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.SearchQuery"
+            }
+          ]
+        }
+      ],
+      "types": []
+    }
+  }
+}

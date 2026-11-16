@@ -125,17 +125,18 @@ def main():
     procs = []
 
     # ---- build the sandbox ------------------------------------------
-    for sub in ("bin", "system", "ui"):
+    for sub in ("bin", "system", "ui", "integrations"):
         shutil.copytree(os.path.join(REAL_ROOT, sub),
                         os.path.join(sandbox, sub), symlinks=False,
-                        ignore=shutil.ignore_patterns("__pycache__"))
+                        ignore=shutil.ignore_patterns("__pycache__",
+                                                      "voice-token"))
     for d in ("pipeline/00-inbox", "pipeline/01-processing",
               "pipeline/02-potential-projects", "pipeline/knowledge/lists",
               "pipeline/knowledge/notes", "pipeline/knowledge/content-ideas",
               "pipeline/knowledge/someday", "pipeline/archive",
               "active-projects"):
         os.makedirs(os.path.join(sandbox, d), exist_ok=True)
-    for src in (".claude/skills", "skills"):
+    for src in (".claude/skills", "skills", "skills-library"):
         s = os.path.join(REAL_ROOT, src)
         if os.path.isdir(s):
             shutil.copytree(s, os.path.join(sandbox, src), symlinks=False,
@@ -254,6 +255,9 @@ def main():
                  ("open the pipeline board", "navigate"),
                  ("open settings", "navigate"),
                  ("note to brain: remember the milk", "brain-note"),
+                 ("work on a project that does not exist", "no-project"),
+                 ("status of nothing at all", "no-project"),
+                 ("how is your day going", None),
                  ("what is triage, exactly?", None),
                  ("tell me a joke", None)]
         for text, want in cases:
@@ -807,6 +811,188 @@ def main():
                 f"{aria_git.WORK_BRANCH}, base '{base}' untouched, push "
                 "refused while GitHub is off")
     check("git — a commit per verified task", c_git)
+
+    def c_github():
+        """Push + pull request, against a local bare repository standing
+        in for GitHub and a stub `gh` that records what it was asked."""
+        slug = state.get("rejects") or state.get("active")
+        if not slug:
+            raise SkipTest("no autopilot project to push")
+        if not shutil.which("git"):
+            raise SkipTest("git not installed")
+        import aria_git
+        proj = eng._project_dir(slug)
+        bare = os.path.join(sandbox, "_origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", bare], check=True)
+        aria_git.run(["remote", "add", "origin", bare], proj)
+        stub = os.path.join(sandbox, "_stubbin")
+        os.makedirs(stub)
+        log = os.path.join(sandbox, "_gh.log")
+        with open(os.path.join(stub, "gh"), "w") as f:
+            f.write('#!/bin/sh\necho "$@" >> "%s"\ncase "$1 $2" in\n'
+                    ' "pr view") exit 1;;\n "pr create") echo '
+                    'https://github.com/you/demo/pull/1;;\nesac\n' % log)
+        os.chmod(os.path.join(stub, "gh"), 0o755)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = stub + os.pathsep + old_path
+        set_config(sandbox, github_access="true")
+        try:
+            out = eng.project_push(slug)
+        finally:
+            set_config(sandbox, github_access="false")
+            os.environ["PATH"] = old_path
+        assert out["pr"] == "https://github.com/you/demo/pull/1", out
+        heads = subprocess.run(["git", "--git-dir", bare, "branch"],
+                               capture_output=True, text=True).stdout
+        assert "aria/autopilot" in heads, heads
+        base = ap._state(slug).get("git_base") or "main"
+        assert base not in heads.replace("aria/autopilot", ""), \
+            f"the base branch was pushed: {heads}"
+        asked = open(log).read()
+        assert "pr create" in asked and f"--base {base}" in asked \
+            and "--head aria/autopilot" in asked, asked
+        return ("only aria/autopilot reached the remote; a pull request "
+                f"was opened against {base}")
+    check("github — push + pull request", c_github)
+
+    def c_adopt():
+        """An existing repository is put under autopilot: her records stay
+        in an ignored .aria/, its history gains only verified work."""
+        if not MOCK:
+            raise SkipTest("needs --mock (runs a whole project)")
+        if not shutil.which("git"):
+            raise SkipTest("git not installed")
+        import aria_git
+        src = os.path.join(sandbox, "_existing-repo")
+        os.makedirs(os.path.join(src, "src"))
+        open(os.path.join(src, "README.md"), "w").write("# Existing tool\n")
+        open(os.path.join(src, "src", "old.py"), "w").write("x = 1\n")
+        subprocess.run("git init -q . && git add -A && git -c user.name=t "
+                       "-c user.email=t@t commit -q -m 'their history'",
+                       shell=True, cwd=src, check=True)
+        try:
+            eng.adopt_project("file://" + src, "")
+            raise AssertionError("adopted without a goal")
+        except ValueError:
+            pass
+        dest = eng.adopt_project("file://" + src, "Add a command line "
+                                 "entry point and document it.",
+                                 slug="adopted-tool")
+        assert dest.name == "adopted-tool" and (dest / ".aria/GOAL.md").is_file()
+        assert eng.project_approved("adopted-tool")
+        assert ".aria/" in (dest / ".git/info/exclude").read_text()
+        eng.autopilot_start("adopted-tool", via="selftest")
+        drive("adopted-tool")
+        st = ap._state("adopted-tool")
+        assert st["status"] == "complete" and st["stats"]["done"] >= 2, st
+        assert not (dest / "autopilot").exists(), "records leaked into the tree"
+        assert (dest / ".aria/FINAL-REPORT.md").is_file()
+        assert (dest / "src/old.py").read_text() == "x = 1\n"
+        tracked = aria_git.run(["ls-files"], dest)
+        assert ".aria" not in tracked and "src/core.py" in tracked, tracked
+        status = aria_git.run(["status", "--porcelain"], dest)
+        assert ".aria" not in status, status
+        log = aria_git.run(["log", "--format=%s"], dest).splitlines()
+        assert log[-1] == "their history" and len(log) > 2
+        return (f"cloned, goal recorded, {st['stats']['done']} tasks "
+                "committed on aria/autopilot; .aria/ stayed out of git")
+    check("adopt an existing repository", c_adopt)
+
+    def c_voice_gateway():
+        """The one route a tunnel may reach: secret required, nothing
+        else answers, and it will not open the human gate."""
+        ui_port, gw_port = free_port(), free_port()
+        ui = subprocess.Popen(
+            [sys.executable, os.path.join(sandbox, "bin", "aria-ui"),
+             str(ui_port)], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=os.environ.copy())
+        gw = subprocess.Popen(
+            [sys.executable, os.path.join(sandbox, "bin",
+                                          "aria-voice-gateway"), str(gw_port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, ARIA_URL=f"http://127.0.0.1:{ui_port}",
+                     ARIA_VOICE_TOKEN="selftest-secret"))
+        procs.extend([ui, gw])
+
+        def call(path="/say", token=None, body=None, method="POST"):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{gw_port}{path}", method=method,
+                data=json.dumps(body).encode() if body is not None else None,
+                headers={"X-Aria-Token": token} if token else {})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return r.status, json.load(r)
+            except urllib.error.HTTPError as exc:
+                return exc.code, {}
+        try:
+            wait_http(f"http://127.0.0.1:{ui_port}/api/health")
+            for _ in range(40):
+                if call(method="GET")[0] == 404:
+                    break
+                time.sleep(0.1)
+            assert call(body={"text": "status"})[0] == 403
+            assert call(token="wrong", body={"text": "status"})[0] == 403
+            assert call(path="/api/board", token="selftest-secret",
+                        body={})[0] == 404
+            assert call(method="GET", token="selftest-secret")[0] == 404
+            code, out = call(token="selftest-secret",
+                             body={"text": "what are you working on"})
+            assert code == 200 and out["reply"], (code, out)
+            gated = "selftest-offline-idea"
+            code, out = call(token="selftest-secret",
+                             body={"text": f"approve {gated}"})
+            assert code == 200 and "in the app" in out["reply"], out
+            assert not eng.project_approved(gated), "voice opened the gate"
+            # the Alexa skill's Lambda, fed simulated Alexa requests
+            import importlib.util
+            os.environ.update(
+                ARIA_GATEWAY_URL=f"http://127.0.0.1:{gw_port}/say",
+                ARIA_TOKEN="selftest-secret", ARIA_SKILL_ID="skill-1")
+            spec = importlib.util.spec_from_file_location(
+                "alexa_lambda", os.path.join(sandbox, "integrations",
+                                             "alexa", "lambda_function.py"))
+            lam = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(lam)
+
+            def alexa(kind, name="", said="", app="skill-1"):
+                req = {"type": kind}
+                if name:
+                    req["intent"] = {"name": name, "slots": {
+                        "text": {"value": said}} if said else {}}
+                out = lam.lambda_handler(
+                    {"session": {"application": {"applicationId": app}},
+                     "request": req}, None)["response"]
+                return out.get("outputSpeech", {}).get("text", ""), \
+                    out.get("shouldEndSession")
+            assert alexa("LaunchRequest")[1] is False
+            said, _ = alexa("IntentRequest", "StatusAllIntent")
+            assert "autopilot" in said or "running" in said, said
+            said, _ = alexa("IntentRequest", "CaptureIntent",
+                            "selftest idea from alexa")
+            assert said.startswith("Captured"), said
+            said, _ = alexa("IntentRequest", "StatusIntent", gated.replace("-", " "))
+            assert "approval" in said, said
+            assert alexa("IntentRequest", "AMAZON.StopIntent")[1] is True
+            try:
+                alexa("LaunchRequest", app="someone-elses-skill")
+                raise AssertionError("another skill was accepted")
+            except ValueError:
+                pass
+            model = json.load(open(os.path.join(
+                sandbox, "integrations", "alexa", "interaction-model.json")))
+            names = {i["name"] for i in model["interactionModel"]
+                     ["languageModel"]["intents"]
+                     if not i["name"].startswith("AMAZON.")}
+            assert names == set(lam.PREFIX) | set(lam.FIXED), \
+                "skill model and Lambda disagree about the intents"
+        finally:
+            ui.terminate()
+            gw.terminate()
+            for key in ("ARIA_GATEWAY_URL", "ARIA_TOKEN", "ARIA_SKILL_ID"):
+                os.environ.pop(key, None)
+        return ("secret required, one route only, the gate stays shut by "
+                "voice; the Alexa Lambda round-trips simulated requests")
+    check("voice gateway (Alexa door)", c_voice_gateway)
 
     def c_skills():
         names = eng.list_skill_names()
