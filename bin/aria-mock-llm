@@ -244,15 +244,16 @@ def plan_batch(prompt):
              "done_when": "README.md explains how to run the tool"},
         ]
     elif n < BATCHES:
+        suffix = "" if n == 1 else f" (pass {n})"
         tasks = [
-            {"id": "e", "title": f"Add the command-line entry point {n}",
+            {"id": "e", "title": "Add the command-line entry point" + suffix,
              "detail": "Write src/cli.py that calls run() from src/core.py.",
              "why": "the core needs a way to be invoked",
              "agent": "coder", "skills": [], "model": "",
              "phase": "build", "est_hours": 2, "depends_on": [],
              "reads": ["src/core.py"], "research": False,
              "done_when": "src/cli.py has a main() that calls run()"},
-            {"id": "f", "title": f"Document the command line {n}",
+            {"id": "f", "title": "Document the command line" + suffix,
              "detail": "Update README.md with a usage section for the CLI.",
              "why": "the new entry point must be documented",
              "agent": "scribe", "skills": [], "model": "fast",

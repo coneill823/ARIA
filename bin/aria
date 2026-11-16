@@ -7,6 +7,7 @@
 #   aria auto                  triage, then develop new projects (idea -> plan)
 #   aria projects              every project and what autopilot is doing
 #   aria approve <slug>        THE HUMAN GATE: approve a proposed plan
+#   aria adopt <repo|folder> "goal"   put an existing codebase under autopilot
 #   aria autopilot <slug> start|stop|status|run|steer "guidance"
 #                              autonomous project execution (run = work in
 #                              this terminal, without the always-on server)
@@ -42,7 +43,7 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then
@@ -166,7 +167,7 @@ DESKTOP
     exec python3 "$ARIA_ROOT/bin/aria-test" "$@"
     ;;
 
-  agent|mission|missions|projects|approve|autopilot|plan|search|fetch|brain|github|trigger)
+  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger)
     exec python3 "$ARIA_ROOT/bin/aria-do" "$cmd" "$@"
     ;;
 

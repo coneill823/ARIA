@@ -672,9 +672,14 @@ def assess(slug, emit):
     goal = eng._project_goal(slug, 3500)
     cap = capabilities(goal, cfg)
     rows = inventory(_proj(slug))
+    key = [r["path"] for r in rows if r["path"].lower() in (
+        "readme.md", "readme.rst", "readme.txt", "package.json",
+        "pyproject.toml", "cargo.toml", "go.mod", "makefile")]
+    excerpts = _read_for_task(slug, key, 2400)
     prompt = (f"PROJECT: {slug}\n\nGOAL / REQUIREMENTS\n{goal}\n\n"
               f"WHAT I HAVE TO WORK WITH\n{capabilities_text(cap)}\n\n"
               f"FILES THAT ALREADY EXIST\n{_inventory_text(rows, 1200)}"
+              + (f"\n\nKEY FILES (excerpts)\n{excerpts}" if excerpts else "")
               + _steering_text(slug))
     emit({"event": "thinking", "label": f"assessing {slug}"})
     text = eng.strip_think(eng.chat_stream(
@@ -1049,6 +1054,8 @@ def _verify(slug, task, output, records, problems, cfg, emit):
     try:
         data = eng.ask_json(eng.resolve_tier("smart", cfg),
                             eng.clip(body, budget + 1500), VERIFY_SYSTEM,
+                            on_token=lambda t: emit({"event": "token",
+                                                     "text": t}),
                             timeout=_idle_timeout(cfg, "smart"))
         if not isinstance(data, dict) or "pass" not in data:
             raise ValueError("no verdict in the judge's reply")
@@ -1146,10 +1153,13 @@ def _run_task(slug, state, plan, task, cfg, emit):
     task["attempts"] += 1
     task["started"] = _stamp()
     _save_plan(slug, plan)
+    picked = eng.get_agent(task["agent"])
+    target = eng.resolve_model(
+        task["model"] or (picked["model"] if picked else "smart"), cfg)
     state.update(phase="working", waiting="", current={
         "id": task["id"], "title": task["title"], "agent": task["agent"],
-        "model": task["model"] or "agent default", "started": _stamp(),
-        "attempt": task["attempts"]})
+        "model": (target or {}).get("spec") or task["model"] or "smart",
+        "started": _stamp(), "attempt": task["attempts"]})
     _save_state(slug, state)
     emit({"event": "start", "stage": "autopilot",
           "log": f"{slug}: {task['id']} — {task['title']} → {task['agent']}"

@@ -25,7 +25,7 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
   POST /api/capture    {"text"} -> new inbox note
   POST /api/refine     {"slug", "feedback"} -> idea goes back to processing
   POST /api/export     {"slug"} -> publish project into the Obsidian vault
-  POST /api/brain      {"text", "title"?} -> note in the Obsidian vault
+  POST /api/brain      {"text", "title"?, "sources"?} -> note in the vault
   POST /api/autopilot  {"slug", "action": approve|start|stop|steer, "text"?}
   POST /api/plan       {"slug"} -> streamed (re)plan
   POST /api/github     {"slug", "action": init|publish|push}
@@ -295,8 +295,17 @@ class Handler(BaseHTTPRequestHandler):
             index = eng.export_obsidian(text("slug"))
             self.send_json({"ok": True, "path": str(index)})
         elif path == "/api/brain":
-            p = eng.brain_note(text("text"), title=text("title") or None,
-                               source="ui")
+            sources = body.get("sources")
+            if isinstance(sources, list) and sources:   # research + sources
+                p = eng.brain_research(
+                    text("title") or "web research", text("text"),
+                    [{"title": str(x.get("title", "")),
+                      "url": str(x.get("url", ""))}
+                     for x in sources if isinstance(x, dict)])
+                eng.brain_journal(f"kept research: [[{p.stem}]]")
+            else:
+                p = eng.brain_note(text("text"), title=text("title") or None,
+                                   source="ui")
             self.send_json({"ok": True, "path": str(p), "name": p.stem})
         elif path == "/api/config":
             for key in CONFIG_KEYS:

@@ -25,10 +25,9 @@ function sourcesBlock(msg) {
   const save = h('button', { text: 'save to brain', title: 'keep this answer and its sources in your Obsidian vault',
     onclick: async () => {
       try {
-        const lines = msg.sources.map((s, i) => `[${i + 1}] ${s.title || s.url} — ${s.url}`);
         const r = await api.post('/api/brain', {
-          title: msg.question || 'web research',
-          text: msg.content + '\n\n## Sources\n\n' + lines.join('\n') });
+          title: msg.question || 'web research', text: msg.content,
+          sources: msg.sources });
         toast('Saved to your brain: ' + r.name, 'good');
       } catch (e) { toast(e.message, 'bad'); }
     } });

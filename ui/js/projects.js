@@ -480,9 +480,9 @@ function updateLive() {
     kids.push(h('div', { class: 'now', text: PHASE_SAY[st.phase] || 'Working…' }));
     kids.push(h('div', { class: 'now-sub', text: 'iteration ' + st.iteration }));
   }
-  if (st.status === 'running' && (lv.text || lv.label)) {
-    kids.push(h('div', { class: 'hint', text: lv.label || '' }));
-    kids.push(h('div', { class: 'tokens live', text: lv.text || '' }));
+  if (st.status === 'running' && !st.waiting && (lv.text || lv.label)) {
+    kids.push(h('div', { class: 'hint', text: (lv.label || '') + (lv.text ? '' : ' …') }));
+    if (lv.text) kids.push(h('div', { class: 'tokens live', text: lv.text }));
   }
   const tok = now.querySelector('.tokens');
   const pinned = !tok || tok.scrollHeight - tok.scrollTop - tok.clientHeight < 60;
@@ -511,7 +511,8 @@ function panel(name, node, extra) {
 }
 
 function brief() {
-  const docs = h('span', {},
+  const docs = data.auto_dir === '.aria' ? h('span', {},
+    h('button', { class: 'btn small', text: 'Goal', onclick: () => openFile('.aria/GOAL.md') })) : h('span', {},
     h('button', { class: 'btn small', text: 'Requirements', onclick: () => openDoc('requirements') }), ' ',
     h('button', { class: 'btn small', text: 'Plan', onclick: () => openDoc('proposed-plan') }), ' ',
     h('button', { class: 'btn small', text: 'Research', onclick: () => openDoc('research') }), ' ',

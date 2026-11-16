@@ -1496,22 +1496,27 @@ def detect_intent(text):
         slug = match_project(m.group(1) or m.group(2))
         if slug:
             return {"action": "github-push", "slug": slug}
+    # commands that name a project: an unmatched name gets a straight "no
+    # such project" rather than a chat model's improvisation
     m = INTENT_APPROVE.match(text)
     if m:
         slug = match_project(m.group(1))
         if slug:
             return {"action": "approve", "slug": slug,
                     "start": bool(m.group(2))}
+        return {"action": "no-project", "said": m.group(1).strip()}
     m = INTENT_AUTOPILOT_STOP.match(text)
     if m:
         slug = match_project(m.group(1))
         if slug:
             return {"action": "autopilot-stop", "slug": slug}
+        return {"action": "no-project", "said": m.group(1).strip()}
     m = INTENT_AUTOPILOT.match(text)
     if m:
         slug = match_project(m.group(1))
         if slug:
             return {"action": "autopilot-start", "slug": slug}
+        return {"action": "no-project", "said": m.group(1).strip()}
     agent_names = {a["name"] for a in list_agents() + list_library_agents()}
     m = INTENT_MISSION.match(text)
     if m and m.group(1).lower() in agent_names:
@@ -1539,6 +1544,8 @@ def detect_intent(text):
         slug = match_project(m.group(1))
         if slug:
             return {"action": "status", "slug": slug}
+        if re.match(r"\s*(?:status|progress)\b", text, re.I):
+            return {"action": "no-project", "said": m.group(1).strip()}
     m = INTENT_NAVIGATE.match(text)
     if m:
         target = _nav_target(m.group(1))
@@ -1604,6 +1611,12 @@ def perform(intent, source="chat"):
             out["say"] = f"Couldn't trigger {intent['name']}: {exc}"
     elif action == "no-web":
         out["say"] = NO_WEB_SAY
+    elif action == "no-project":
+        names = [p["slug"].replace("-", " ") for p in list_projects()]
+        out["say"] = (f"I don't have a project matching “{intent['said']}”. "
+                      + ("Your projects are: " + ", ".join(names) + "."
+                         if names else "There are no projects yet — "
+                         "capture an idea and I'll plan one."))
     elif action == "explain-commands":
         out["say"] = "That's not a command I have. " + known_commands_text()
     elif action == "approve":
@@ -1756,22 +1769,29 @@ def transcribe_audio(data, suffix=".webm"):
 
 # ---------------------------------------------------------------- skills
 
+SKILL_DIRS = (ROOT / "skills",              # converted universal pack
+              ROOT / ".claude" / "skills",    # shared with Claude Code
+              ROOT / "skills-library")        # engine-only sources (ECC…)
+
+
 def skill_text(name):
     """Instructions for a named skill: prefers the converted universal pack
-    (skills/<name>/PROMPT.md), falls back to the raw Claude skill."""
+    (skills/<name>/PROMPT.md), falls back to the raw skill as installed."""
     if not re.fullmatch(r"[\w.-]+", name) or ".." in name:
         raise ValueError(f"invalid skill name: {name}")
-    for f in (ROOT / "skills" / name / "PROMPT.md",
-              ROOT / ".claude" / "skills" / name / "SKILL.md"):
+    for f in (SKILL_DIRS[0] / name / "PROMPT.md",
+              SKILL_DIRS[1] / name / "SKILL.md",
+              SKILL_DIRS[2] / name / "SKILL.md"):
         if f.is_file():
-            return f.read_text(encoding="utf-8")
+            text = f.read_text(encoding="utf-8")
+            return parse_note(f)[2].strip() if f.name == "SKILL.md" else text
     raise ValueError(f"skill not found: {name} — run: aria install-skills "
                      "then aria skills convert")
 
 
 def list_skill_names():
     names = set()
-    for base in (ROOT / "skills", ROOT / ".claude" / "skills"):
+    for base in SKILL_DIRS:
         if base.is_dir():
             for d in base.iterdir():
                 if (d / "PROMPT.md").is_file() or (d / "SKILL.md").is_file():
@@ -1791,11 +1811,11 @@ def _unquote(value):
 
 def skill_index():
     """[{name, description, execution}] for every installed skill."""
-    idx = ROOT / "skills" / "index.json"
-    raw = ROOT / ".claude" / "skills"
+    idx = SKILL_DIRS[0] / "index.json"
+    names = list_skill_names()
     sig = (idx.stat().st_mtime if idx.is_file() else 0,
-           raw.stat().st_mtime if raw.is_dir() else 0,
-           len(list_skill_names()))
+           tuple(d.stat().st_mtime if d.is_dir() else 0 for d in SKILL_DIRS),
+           len(names))
     if _SKILL_CACHE["sig"] == sig:
         return _SKILL_CACHE["rows"]
     rows = {}
@@ -1808,15 +1828,17 @@ def skill_index():
                                    "execution": r.get("execution", "")}
         except (ValueError, KeyError, TypeError):
             rows = {}
-    for name in list_skill_names():
+    for name in names:
         if name in rows:
             continue
         desc = ""
-        f = raw / name / "SKILL.md"
-        if f.is_file():
-            desc = _unquote(parse_note(f)[0].get("description", ""))
+        for base in SKILL_DIRS[1:]:
+            f = base / name / "SKILL.md"
+            if f.is_file():
+                desc = _unquote(parse_note(f)[0].get("description", ""))
+                break
         rows[name] = {"name": name, "description": desc,
-                      "execution": "claude-only"}
+                      "execution": "as-installed"}
     _SKILL_CACHE.update(sig=sig, rows=sorted(rows.values(),
                                              key=lambda r: r["name"]))
     return _SKILL_CACHE["rows"]
@@ -2465,6 +2487,60 @@ def promote_project(slug):
         location = str(dest)
     ledger_update(slug, "project", "promoted", location, captured)
     brain_journal(f"promoted [[{slug}]] to an active project")
+    return dest
+
+
+def adopt_project(source, goal, slug=""):
+    """Bring an existing codebase under autopilot. `source` is a git URL,
+    a GitHub `owner/repo`, or a folder on this machine; it becomes an
+    active project whose contract is the goal the owner states here —
+    stating it is the approval. Her bookkeeping goes in a hidden .aria/
+    folder that git is told to ignore, so the codebase's own tree and
+    history only ever receive the verified work. Returns the project
+    folder."""
+    goal = goal.strip()
+    if not goal:
+        raise ValueError('say what you want done: aria adopt <repo> "goal"')
+    source = source.strip()
+    local = Path(os.path.expanduser(source))
+    is_url = bool(re.match(r"^(https?://|git@|ssh://|file://)", source)) or (
+        bool(re.fullmatch(r"[\w.-]+/[\w.-]+", source)) and not local.exists())
+    stem = re.sub(r"\.git$", "", source.rstrip("/").split("/")[-1])
+    name = slugify(slug or stem.replace("_", "-").replace(".", "-"), limit=5)
+    if name in project_slugs() or name == "untitled":
+        raise ValueError(f"a project called {name} already exists — pass "
+                         "--slug to name this one differently")
+    dest = promotion_dir() / name
+    if dest.exists():
+        raise ValueError(f"{dest} already exists — not overwriting it")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if is_url:
+        url = source if re.match(r"^(\w+://|git@)", source) \
+            else f"https://github.com/{source}"
+        aria_git.clone(url, dest)
+    else:
+        local = local.resolve()
+        if not local.is_dir():
+            raise ValueError(f"not a folder: {local}")
+        dest.symlink_to(local, target_is_directory=True)
+    state = dest / ".aria"
+    state.mkdir(exist_ok=True)
+    today = datetime.date.today().isoformat()
+    (state / "GOAL.md").write_text(
+        f"# Goal for {name}\n\n> Stated by the owner on {today} when this "
+        "codebase was adopted. It is the contract autopilot works to; "
+        "change direction with a steering note.\n\n" + goal + "\n",
+        encoding="utf-8")
+    exclude = dest / ".git" / "info" / "exclude"
+    if (dest / ".git").is_dir():
+        exclude.parent.mkdir(exist_ok=True)
+        have = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ".aria/" not in have.splitlines():
+            exclude.write_text(have.rstrip("\n") + "\n.aria/\n",
+                               encoding="utf-8")
+    ledger_update(name, "project", "adopted",
+                  str(dest if is_url else local), today)
+    brain_journal(f"adopted [[{name}]] — goal: {excerpt(goal, 100)}")
     return dest
 
 

@@ -9,6 +9,7 @@ itself and hands everything below to this script:
   missions [run]                 list missions / drain the queue here
   projects                       every project and what autopilot is doing
   approve <slug>                 THE HUMAN GATE: approve a proposed plan
+  adopt <repo|folder> "goal"     put an existing codebase under autopilot
   autopilot <slug> start|stop|status|run|steer "guidance"
   plan <slug>                    assess + (re)plan a project now
   search "query"                 web search
@@ -96,6 +97,20 @@ def cmd_approve(args):
     path = eng.approve_project(args[0], via="cli")
     print(f"approved -> {path}")
     print(f"start work with: aria autopilot {args[0]} start")
+
+
+def cmd_adopt(args):
+    usage = 'adopt <git-url | owner/repo | folder> "what you want done" [--slug name]'
+    slug = ""
+    if "--slug" in args:
+        i = args.index("--slug")
+        need(args, i + 2, usage)
+        slug = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    need(args, 2, usage)
+    dest = eng.adopt_project(args[0], " ".join(args[1:]), slug=slug)
+    print(f"adopted -> {dest}")
+    print(f"start work with: aria autopilot {dest.name} start")
 
 
 def cmd_autopilot(args):
