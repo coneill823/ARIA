@@ -9,8 +9,9 @@
 #   3. installs systemd user services:
 #        aria.service    — server at login  -> http://127.0.0.1:8700
 #        aria-auto.timer — pipeline self-runs hourly (recursive mode)
-#   4. installs Anthropic's Agent Skills + builds the universal skills pack
-#      (needs network; skipped cleanly if offline)
+#   4. installs the skills and specialist agents listed in
+#      system/skill-sources.txt (Anthropic, ECC, …) and builds the skills
+#      pack (needs network; skipped cleanly if offline)
 #
 # Optional extras afterwards:
 #   pip install faster-whisper      # local voice input for Firefox
@@ -44,8 +45,10 @@ fi
 echo
 echo "== done =="
 echo "open the app:   from your app menu (A.R.I.A.), or http://127.0.0.1:8700"
-echo "talk to her:    the chat IS the interface — 'capture …', 'run triage',"
-echo "                'ask the critic to …', 'use skill docx', or just talk"
-echo "voice (Firefox): pip install faster-whisper"
+echo "talk to her:    'capture <idea>' -> read the plan -> 'approve <project>'"
+echo "                -> 'work on <project>' ... 'stop working on <project>'"
+echo "check it works: bin/aria test --mock   (seconds, no GPU needed)"
+echo "her reach:      Settings -> Internet, Obsidian brain, Git & GitHub"
+echo "voice (Firefox): pip install faster-whisper     Alexa: docs/ALEXA.md"
 echo "bigger models:  ollama pull qwen3:30b   then Settings -> smart: ollama/qwen3:30b"
 echo "stop recursion: systemctl --user stop aria-auto.timer"

@@ -1,51 +1,81 @@
-# Roadmap — making the recursive agent stronger
+# What helps an agent that runs on its own for days
 
-Additions that most improve a long-running autonomous loop, roughly in
-order of value-per-effort. (The loop today: plan → execute → verify →
-advance → replan, with changelog, graceful stop, and a final report.)
+A loop that plans, works and replans without anyone watching fails in a
+few predictable ways: it forgets, it spins, it drifts from the goal, it
+breaks things it cannot see, and nobody notices until morning. This is the
+list of what guards against that — first what A.R.I.A. already does, then
+what would help most next, in rough order of value for effort.
 
-## Memory & learning
-1. **Per-project rolling memory** — a `lessons.md` the planner updates
-   each iteration (what worked, what failed, decisions made) and reads
-   when replanning. Stops the loop re-litigating settled questions; the
-   single highest-value addition.
-2. **Cross-project memory vault** — distilled lessons promoted to a
-   global store the planner always sees ("markdown tables render badly in
-   X", "user prefers Y"). ECC's memory design is the reference.
+## In place
 
-## Progress & safety
-3. **Git auto-commit per task** — every completed task commits inside the
-   project repo. Gives diffable history, true rollback, and makes the
-   final report verifiable against real diffs.
-4. **Stall detection** — hash/compare each iteration's outputs; N
-   consecutive low-novelty iterations → auto-pause + webhook notify.
-   The main failure mode of unattended loops is busy non-progress.
-5. **Budget meter** — track tokens/wall-clock per project with soft
-   caps; pause and notify at the cap instead of burning a week of GPU.
-6. **Task watchdog** — per-task wall-clock limit (giants excepted by
-   config) so one hung generation can't stall the queue silently.
-7. **Human-gate tasks** — let the planner emit `needs_human: true` tasks
-   that pause the lane until approved on the Projects page. Autonomy
-   with brakes at the decisions that genuinely need you.
+| Failure it prevents | What she does |
+|---|---|
+| **Forgetting** — the context fills up and early decisions vanish | Working memory (`MEMORY.md`) rewritten after every batch; prompts budgeted to the context window; the window requested from the model server explicitly rather than left to a silent default |
+| **Re-doing finished work** | The planner sees memory, the file list and recent results; a new task whose title repeats a finished one is dropped |
+| **Spinning on a failing task** | Three attempts, then the task is failed and the planner routes around it |
+| **Hammering a dead model server** | Outages are waited out with a growing pause and cost the task nothing |
+| **Busy non-progress** | Two batches that complete nothing, or a planner that keeps returning nothing, and she pauses herself and says why |
+| **Leaving broken work behind** | Code is parsed before a judge sees it; rejected attempts are rolled back, so the tree only ever holds verified work |
+| **Grading its own homework** | "Done" is audited against the requirements; gaps become the next batch |
+| **Working blind** | Tasks are shown the project files they need; the assessment reads the key files of an existing codebase |
+| **Recalled "facts"** | Research tasks get live web material with sources, carried into the report |
+| **No way back** | A commit per verified task on its own branch |
+| **Running forever** | Optional budgets in hours and batches |
+| **Unreadable history** | A structured change record, and a final report built from it — complete however long the run |
+| **Being unsteerable** | Guidance mid-run replans unstarted work without stopping anything |
+| **A hung generation** | Fast and smart tiers are abandoned after a silent spell and retried |
 
-## Capability
-8. **Sandboxed code execution** — a runner (container/firejail) so the
-   coder's output can be *executed and tested*, with results fed to the
-   verifier. Turns "writes code" into "ships working code"; the single
-   biggest capability jump, and the riskiest — allowlisted commands,
-   no network, project-dir only.
-9. **Web research lane** — a task type that routes through the Claude
-   engine (or a self-hosted SearxNG with an allowlist) so research tasks
-   produce sourced facts instead of recalled ones.
-10. **Checkpointed generations** — persist partial tokens for giant-model
-    tasks so a restart resumes mid-generation instead of restarting.
+## Next, in order of value for effort
 
-## Orchestration
-11. **Parallel lanes** — independent tasks on different backends at once
-    (coder on :8082 while deepseek reasons on :8080); dependency graph
-    already supports it, the worker just needs N lanes.
-12. **Duplicate-task guard** — title/content similarity check at replan
-    time so iterations don't re-add work that's already done.
-13. **Nightly digest** — changelog summary through the `mission-done`
-    webhook each morning: what happened overnight, what's blocked, what
-    needs you. Closes the loop for multi-day runs.
+1. **Run what she writes, in a sandbox.** A container with no network and
+   only the project folder, running the project's tests and feeding real
+   results to the verifier. The single biggest jump — from "writes code
+   that parses" to "ships code that passes" — and the riskiest, which is
+   why it is not a quick addition: allowlisted commands, resource limits,
+   nothing outside the project.
+2. **A second opinion that is not the author.** Verify with a different
+   model family than the one that did the work; for the audit, two judges
+   that must agree. Correlated blind spots are the main reason a
+   self-reviewing loop approves its own mistakes.
+3. **Have the critic attack the plan before it is executed.** One extra
+   call per batch that catches missing steps and bad task boundaries while
+   they are still cheap to fix.
+4. **Edits as patches, not whole files.** Rewriting a 600-line file to
+   change four lines wastes the context and invites regressions. A
+   search-and-replace block format, applied and verified mechanically,
+   makes large files safe to touch.
+5. **Let agents look things up.** A small read-only tool loop — list,
+   read, search within the project — so an agent can fetch the file it
+   realises it needs instead of relying on what the planner packed.
+6. **Tell you when she needs you.** A push (ntfy, a webhook, the Echo)
+   when she stalls, finishes, or has waited an hour on the model server —
+   and a morning digest of what happened overnight.
+7. **Decisions that wait for you.** Let the planner mark a task
+   `needs_human`: that branch parks until you answer on the Projects page
+   while independent work carries on. Autonomy with brakes exactly where
+   a decision is genuinely yours.
+8. **Trace every task to a requirement.** Each task names the requirement
+   it serves; the audit then reports coverage per requirement instead of
+   an overall verdict, and orphan work stands out.
+9. **Memory across projects.** Lessons that keep recurring ("this model
+   writes better tests when shown one first", "you prefer SQLite")
+   promoted to a store every planner reads.
+10. **Parallel lanes.** Independent tasks on different backends at once —
+    a coder model on one server while a deep model reasons on another. The
+    dependency graph already says what can overlap.
+11. **A budget she can see.** Tokens and minutes per task, shown on the
+    board and in the report, so an expensive dead end is visible while it
+    is happening.
+12. **A fallback model per task.** If the assigned model is gone or keeps
+    timing out, drop to the next tier and say so, rather than failing.
+13. **A regression suite for the loop itself.** A handful of small fixed
+    projects run against any new model, prompt or planner change, scored
+    on first-attempt passes and audit gaps — so "is this model better at
+    being A.R.I.A.?" has a number.
+14. **Resumable giant generations.** Persist partial output from very
+    large models so a restart continues instead of starting over.
+15. **Turn lessons into skills.** When the same lesson shows up in three
+    projects, draft a skill from it for you to approve — the loop
+    improving its own toolbox.
+16. **Mind the machine.** Check VRAM, temperature and disk before starting
+    a heavy model; schedule the deep tier for the night.

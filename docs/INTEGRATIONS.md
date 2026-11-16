@@ -1,10 +1,87 @@
 # Integrations
 
-How A.R.I.A. connects to the wider ecosystem — what's wired in, what's one
-config line away, and what's documented-only (with the reason). Guiding
-rule: **A.R.I.A. gets as much reach as possible through allowlists you
-control** — named webhooks, named backends, named skills — never arbitrary
-shell access for a local model.
+How A.R.I.A. connects to the wider world — what is wired in, what is one
+switch away, and what is documented-only (with the reason). Guiding rule:
+**every reach is something you switched on, and each has a boundary she
+cannot talk her way across** — the web but never your local network,
+GitHub but never your base branch, your vault but only her own folder,
+webhooks but only the ones you named.
+
+## Her reach
+
+### The internet
+
+`web_access: true` (Settings → Internet) makes three things real:
+
+- **In chat and by voice** — "search for …" runs a search, reads the best
+  pages and answers from them with numbered sources; "read <url>" fetches
+  a page and summarises it. With the switch off she says plainly that she
+  cannot browse — she never pretends.
+- **In the develop stage** — a new idea is researched on the live web
+  before its plan is drafted, and `research.md` lists its sources. With
+  the switch off the research is labelled as unverified recall.
+- **In autopilot** — tasks the planner marks *research* (and anything the
+  `researcher` agent does) get sourced material attached, and the sources
+  travel into the change record and the final report.
+
+Where searches go is `web_search`: `auto` tries your SearxNG (if
+`web_search_url` is set), then Brave (if `ARIA_KEY_BRAVE` is set), then
+DuckDuckGo, then Wikipedia. The last two need no key and no setup.
+
+What she cannot do with it, whatever a web page tells her: reach your
+**local network** (private, loopback and link-local addresses are refused
+on every redirect hop, and the connection is pinned to the address that
+was checked), send anything but a read request, or act on instructions
+found in a page — fetched text is handed to the model marked as untrusted
+material, and the model has no tools to act with anyway. `web_allowlist`
+narrows fetching to sites you name.
+
+The honest cost: with this on, search queries leave your machine.
+
+### GitHub
+
+Local first: when a project is its own git repository, autopilot commits
+every verified task to the branch `aria/autopilot`
+(`autopilot_git: true`). She stages only the files a task wrote and never
+commits to your base branch.
+
+`github_access: true` (Settings → Git & GitHub) adds the remote:
+
+```bash
+aria github init <slug>      # make a project its own repository
+aria github publish <slug>   # create a private GitHub repo and push it
+aria github push <slug>      # push aria/autopilot, open a pull request
+```
+
+At the end of every run she pushes the branch and makes sure a pull
+request is open against `github_base_branch`. Nothing is ever forced and
+the base branch is never pushed to — merging is yours. She stores no
+credentials: GitHub is reached through the `gh` CLI you signed in with
+(`gh auth login`), or a token in `ARIA_GITHUB_TOKEN`.
+
+To work on a repository she did not create:
+`aria adopt <git-url | owner/repo | folder> "what you want done"`.
+
+### Your Obsidian vault
+
+Set `obsidian_vault` (Settings → Obsidian brain) and she writes into
+`<vault>/ARIA/` — and nowhere else in the vault:
+
+| Where | What |
+|---|---|
+| `ARIA/<project>.md` + `ARIA/<project>/` | a hub note linking the idea, research, plan and requirements, and — once autopilot has run — her assessment, memory, changelog and final report. Refreshed after every batch. |
+| `ARIA/Notes/` | things you tell her to keep: "note to brain: …" |
+| `ARIA/Research/` | web answers you save from chat, with their sources |
+| `ARIA/Journal/YYYY-MM-DD.md` | one line for each thing she did that day |
+
+Every note carries tags and wikilinks, so it joins your graph.
+
+### Voice
+
+The app's microphone works everywhere (Chrome's built-in recognition, or
+local whisper elsewhere). For Echo devices see **[ALEXA.md](ALEXA.md)**:
+a skill, a small Lambda, and `aria voice-gateway` — the one
+authenticated route a tunnel is ever pointed at.
 
 ## Wired in
 
@@ -20,7 +97,7 @@ shell access for a local model.
 | [OmniRoute](https://github.com/cheaper-inference/OmniRoute) | Self-hosted AI gateway (1 endpoint, 1400+ models) | Any OpenAI-compatible server is a backend now: uncomment `omniroute:` under `aria.backends`, add its key under `backend_keys` (or `ARIA_KEY_OMNIROUTE`), set e.g. `deep: omniroute/auto`. Note: routing to cloud providers leaves your machine — keep tiers local where privacy matters. |
 | [colibri](https://github.com/JustVugg/colibri) | Tiny C engine that streams MoE experts from disk | Another way to run huge models on your 16GB/64GB box: `coli serve` exposes `/v1`, so `backends: colibri: http://localhost:8338` + `deep: colibri/<model>`. Candidate replacement for the llama.cpp deep preset if RAM gets tight. |
 | [Soup](https://github.com/MakazhanAlpamys/Soup) | Fine-tune LLMs from one YAML | Two hooks: `soup serve` is OpenAI-compatible (add as a backend), and longer-term you can fine-tune a personal triage model on your own ledger history, export to GGUF, `ollama create`, and point `fast` at it. |
-| [ECC](https://github.com/affaan-m/ecc) | 300+ skills, 71 agents for coding harnesses | Opt-in line in `skill-sources.txt` (it's huge). Better in Claude Code sessions as a plugin: `/plugin marketplace add https://github.com/affaan-m/ECC` — promoted-project PMs benefit most. |
+| [ECC](https://github.com/affaan-m/ecc) | ~330 skills and ~70 specialist agents for coding harnesses | An `engine-only` skill source (`system/skill-sources.txt`): `aria install-skills` links its skills into `skills-library/` and its `agents/` folder becomes the **agent library**. Autopilot never loads them wholesale — for each project the planner is offered the specialists and skills that fit the goal (a Django project sees `django-reviewer` and `django-patterns`; a marketing one sees `seo-specialist`). For Claude Code itself, install it as a plugin: `/plugin marketplace add https://github.com/affaan-m/ECC`. |
 
 ## Documented — use alongside, not inside
 
@@ -54,8 +131,16 @@ shell access for a local model.
 
 ## The control model
 
-Everything above follows one pattern: **capability through named
-allowlists**. A.R.I.A. can only hit webhooks you listed, backends you
-named, skills you installed, agents you defined. She has no shell, no
-arbitrary URLs, and the server never leaves 127.0.0.1. That's what "as
-much control as possible" means here: maximum reach, no blank cheque.
+Everything above follows one pattern: **a switch you flip, and a boundary
+that holds whatever a model says.**
+
+- She has no shell. Agents produce text and files; files land only inside
+  their project, never over the approved requirements or her own records.
+- The web is read-only and stops at your local network.
+- Git stays on `aria/autopilot`; nothing is forced; merging is yours.
+- The vault is written only under `ARIA/`.
+- Webhooks, backends, skills and agents are the ones you named.
+- The server binds 127.0.0.1 and has no login — never expose it. The only
+  thing built to face the internet is `aria voice-gateway`.
+- The human gate: nothing is executed without a plan you approved, and a
+  voice cannot approve one.

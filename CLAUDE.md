@@ -24,6 +24,21 @@ Configuration lives in `system/config.yml`. Templates live in
 `system/templates/` — always instantiate from templates rather than
 inventing document structures.
 
+### The local app works the same folders
+
+`bin/aria ui` and its autopilot drive this pipeline on the user's local
+models. Two things follow for you:
+
+- **Approval in the app is approval.** The Approve button, "approve
+  <slug>" in its chat, or `aria approve <slug>` writes `requirements.md`
+  (`approved: true`, with `approved_via:`) and promotes the project. Treat
+  such a project as approved. It changes nothing about *your* rule: you
+  never approve on your own initiative.
+- **`autopilot/` belongs to the local engine.** An active project may
+  hold `autopilot/` (her plan, memory, change record, reports) and commits
+  on the branch `aria/autopilot`. Read them for context; do not edit or
+  remove them.
+
 ## Note conventions
 
 Every pipeline note carries YAML frontmatter:
