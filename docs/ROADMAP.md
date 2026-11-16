@@ -11,16 +11,18 @@ what would help most next, in rough order of value for effort.
 | Failure it prevents | What she does |
 |---|---|
 | **Forgetting** — the context fills up and early decisions vanish | Working memory (`MEMORY.md`) rewritten after every batch; prompts budgeted to the context window; the window requested from the model server explicitly rather than left to a silent default |
-| **Re-doing finished work** | The planner sees memory, the file list and recent results; a new task whose title repeats a finished one is dropped |
+| **Re-doing finished work** | The planner sees memory, the file list and recent results; a task that repeats one already done, one you declined, or one that has failed twice is dropped — also long after the original has left the board |
 | **Spinning on a failing task** | Three attempts, then the task is failed and the planner routes around it |
 | **Hammering a dead model server** | Outages are waited out with a growing pause and cost the task nothing |
-| **Busy non-progress** | Two batches that complete nothing, or a planner that keeps returning nothing, and she pauses herself and says why |
+| **Busy non-progress** | `autopilot_stall_limit` batches in a row that complete nothing, or a planner that keeps returning nothing, and she pauses herself and says why |
 | **Leaving broken work behind** | Code is parsed before a judge sees it; rejected attempts are rolled back, so the tree only ever holds verified work |
 | **Grading its own homework** | "Done" is audited against the requirements; gaps become the next batch |
 | **Working blind** | Tasks are shown the project files they need; the assessment reads the key files of an existing codebase |
 | **Recalled "facts"** | Research tasks get live web material with sources, carried into the report |
 | **No way back** | A commit per verified task on its own branch |
-| **Running forever** | Optional budgets in hours and batches |
+| **Running forever** | Optional budgets in hours, batches and tasks; at one she writes the report and pauses |
+| **Deciding what is yours to decide** | A task the planner marks `needs_human` waits for your answer — approve it with your decision, or skip it — while everything that does not depend on it carries on |
+| **Nobody noticing** | The `mission-done` webhook is called when a run ends, for whatever reason, and when a task starts waiting on you |
 | **Unreadable history** | A structured change record, and a final report built from it — complete however long the run |
 | **Being unsteerable** | Guidance mid-run replans unstarted work without stopping anything |
 | **A hung generation** | Fast and smart tiers are abandoned after a silent spell and retried |
@@ -47,35 +49,32 @@ what would help most next, in rough order of value for effort.
 5. **Let agents look things up.** A small read-only tool loop — list,
    read, search within the project — so an agent can fetch the file it
    realises it needs instead of relying on what the planner packed.
-6. **Tell you when she needs you.** A push (ntfy, a webhook, the Echo)
-   when she stalls, finishes, or has waited an hour on the model server —
-   and a morning digest of what happened overnight.
-7. **Decisions that wait for you.** Let the planner mark a task
-   `needs_human`: that branch parks until you answer on the Projects page
-   while independent work carries on. Autonomy with brakes exactly where
-   a decision is genuinely yours.
-8. **Trace every task to a requirement.** Each task names the requirement
+6. **A morning digest, and a nudge on your phone.** The webhook already
+   fires when a run ends or a task needs you. Next: a daily summary of
+   what happened overnight, a push when she has waited an hour on the
+   model server, and the same through the Echo.
+7. **Trace every task to a requirement.** Each task names the requirement
    it serves; the audit then reports coverage per requirement instead of
    an overall verdict, and orphan work stands out.
-9. **Memory across projects.** Lessons that keep recurring ("this model
+8. **Memory across projects.** Lessons that keep recurring ("this model
    writes better tests when shown one first", "you prefer SQLite")
    promoted to a store every planner reads.
-10. **Parallel lanes.** Independent tasks on different backends at once —
-    a coder model on one server while a deep model reasons on another. The
-    dependency graph already says what can overlap.
-11. **A budget she can see.** Tokens and minutes per task, shown on the
-    board and in the report, so an expensive dead end is visible while it
-    is happening.
-12. **A fallback model per task.** If the assigned model is gone or keeps
+9. **Parallel lanes.** Independent tasks on different backends at once —
+   a coder model on one server while a deep model reasons on another. The
+   dependency graph already says what can overlap.
+10. **A budget she can see.** The task budget counts tasks; tokens and
+    minutes per task, shown on the board and in the report, would make an
+    expensive dead end visible while it is happening.
+11. **A fallback model per task.** If the assigned model is gone or keeps
     timing out, drop to the next tier and say so, rather than failing.
-13. **A regression suite for the loop itself.** A handful of small fixed
+12. **A regression suite for the loop itself.** A handful of small fixed
     projects run against any new model, prompt or planner change, scored
     on first-attempt passes and audit gaps — so "is this model better at
     being A.R.I.A.?" has a number.
-14. **Resumable giant generations.** Persist partial output from very
+13. **Resumable giant generations.** Persist partial output from very
     large models so a restart continues instead of starting over.
-15. **Turn lessons into skills.** When the same lesson shows up in three
+14. **Turn lessons into skills.** When the same lesson shows up in three
     projects, draft a skill from it for you to approve — the loop
     improving its own toolbox.
-16. **Mind the machine.** Check VRAM, temperature and disk before starting
+15. **Mind the machine.** Check VRAM, temperature and disk before starting
     a heavy model; schedule the deep tier for the night.

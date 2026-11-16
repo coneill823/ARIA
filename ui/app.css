@@ -79,6 +79,9 @@ code { font-family: var(--mono); font-size: .92em; color: #a9c4dc;
                         animation: pulse 1.6s ease-in-out infinite; }
 .work.waiting { border-color: #57430e88; background: rgba(251,191,36,.05); }
 .work.waiting .w-name::before { color: var(--warn); }
+.work .w-ask { margin-left: auto; font-size: 10px; color: var(--warn);
+               border: 1px solid #57430e; border-radius: 99px; padding: 0 6px;
+               white-space: nowrap; }
 .work .w-task { font-size: 11.5px; color: var(--dim); overflow: hidden;
                 text-overflow: ellipsis; white-space: nowrap; }
 .work .w-bar { height: 3px; background: var(--line); border-radius: 3px;
@@ -138,7 +141,7 @@ a.btn { text-decoration: none; display: inline-block; }
 .pill { font-size: 12px; border: 1px solid var(--line); border-radius: 99px;
         padding: 2px 11px; color: var(--dim); white-space: nowrap; }
 .pill.running { color: var(--ok); border-color: #14532d; }
-.pill.waiting, .pill.ask { color: var(--warn); border-color: #57430e; }
+.pill.waiting, .pill.ask, .pill.budget { color: var(--warn); border-color: #57430e; }
 .pill.complete { color: var(--accent); border-color: var(--accent-dim); }
 .pill.stalled { color: var(--err); border-color: #5e1b1b; }
 .badge { display: inline-block; font-size: 10px; padding: 1px 7px;
@@ -151,6 +154,8 @@ a.btn { text-decoration: none; display: inline-block; }
 .badge.proposed { color: var(--warn); border-color: #57430e; }
 .badge.bad, .badge.unclear, .badge.failed { color: var(--err); border-color: #5e1b1b; }
 .badge.web { color: #7dd3fc; border-color: #1e4d66; }
+.badge.ask { color: var(--warn); border-color: #57430e;
+             background: rgba(251,191,36,.08); }
 .tabs { display: flex; gap: 2px; padding: 0 20px; border-bottom: 1px solid var(--line);
         flex: none; align-items: center; overflow-x: auto; }
 .tabs button { color: var(--dim); padding: 9px 12px; border-bottom: 2px solid transparent;
@@ -323,6 +328,14 @@ pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mon
 .task.reviewing { border-color: #4c2a6b; box-shadow: 0 0 14px rgba(192,132,252,.14); }
 .task.failed { border-color: #5e1b1b; opacity: .85; }
 .task.skipped { opacity: .5; }
+.task.gated { border-color: #57430e; border-style: dashed;
+              box-shadow: 0 0 14px rgba(251,191,36,.10); }
+.gatebox { border: 1px solid #57430e; background: rgba(251,191,36,.06);
+           border-radius: var(--radius); padding: 12px 14px;
+           margin-bottom: 14px; font-size: 13px; line-height: 1.5; }
+.gatebox b { color: var(--warn); }
+#modal-body .gatebox textarea { display: block; width: 100%;
+                                 margin-top: 10px; min-height: 58px; }
 .task.ghost { border-style: dashed; cursor: default; color: var(--dim); }
 .task.ghost .t::after { content: " ▋"; color: var(--accent);
                         animation: blink 1s steps(1) infinite; }

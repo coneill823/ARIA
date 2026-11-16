@@ -159,7 +159,7 @@ function runAction(ev) {
       bus.emit('pipeline:changed');
       break;
     case 'approve': case 'autopilot-start': case 'autopilot-stop':
-    case 'steer': case 'github-push':
+    case 'steer': case 'github-push': case 'task-decision':
       bus.emit('projects:changed', ev.slug);
       break;
   }

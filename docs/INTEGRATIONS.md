@@ -142,5 +142,6 @@ that holds whatever a model says.**
 - Webhooks, backends, skills and agents are the ones you named.
 - The server binds 127.0.0.1 and has no login — never expose it. The only
   thing built to face the internet is `aria voice-gateway`.
-- The human gate: nothing is executed without a plan you approved, and a
-  voice cannot approve one.
+- The human gate: nothing is executed without a plan you approved, a
+  task she marks as yours to decide waits for your answer, and a voice
+  can give neither.

@@ -149,8 +149,8 @@ aria:
   context_tokens: 8192
 
   # After the goal is met and audited:  improve = keep going with
-  # improvements until you stop her (or two batches add nothing);
-  # stop = write the final report and stand down.
+  # improvements until you stop her (or she runs out of improvements
+  # worth making);  stop = write the final report and stand down.
   autopilot_after_goal: improve
 
   # Optional budgets for one run, 0 = no limit: task attempts, batches,

@@ -38,6 +38,11 @@ models. Two things follow for you:
   hold `autopilot/` (her plan, memory, change record, reports) and commits
   on the branch `aria/autopilot`. Read them for context; do not edit or
   remove them.
+- **A task that waits on the user is theirs to answer.** A task in
+  `autopilot/plan.json` with `needs_human: true` is waiting for the
+  user's decision (Approve / Skip on its card, or
+  `aria autopilot <slug> approve-task|skip-task <id>`). Surface it in
+  `/status`; never answer it yourself.
 
 ## Note conventions
 

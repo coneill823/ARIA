@@ -30,8 +30,19 @@ How one project is worked
               batch, otherwise she moves on to improvements (or stops, per
               aria.autopilot_after_goal).
 
+Guardrails for runs that last days
+  - A task the planner marks needs_human waits for the owner's answer;
+    everything that does not depend on it carries on, and she only stops
+    to wait when nothing else is left.
+  - Budgets (hours, batches, tasks) and the stall limit end a run with its
+    report instead of letting it burn a week unnoticed.
+  - Work that is already done, was declined, or failed twice is dropped
+    when the planner proposes it again.
+
 Everything lives in <project>/autopilot/. The loop is driven by tick(): one
 call = one step, so a crash or restart loses at most the step in flight.
+Signals from outside the loop are files (STOP, STEER, decision-<id>.json):
+the plan and the state are only ever written by whoever holds the lock.
 """
 
 import contextlib
@@ -129,7 +140,8 @@ def _state(slug):
     for key, default in (("status", "idle"), ("iteration", 0), ("run", 0),
                          ("next_id", 1), ("mode", "build"), ("dry", 0),
                          ("errors", 0), ("audits", 0), ("phase", ""),
-                         ("waiting", ""), ("backoff_until", 0)):
+                         ("waiting", ""), ("backoff_until", 0),
+                         ("run_tasks", 0), ("empty_plans", 0)):
         state.setdefault(key, default)
     state.setdefault("stats", {})
     for key in ("done", "failed", "skipped", "files", "calls"):
@@ -153,6 +165,11 @@ def _plan(slug):
         t.setdefault("depends_on", [])
         t.setdefault("skills", [])
         t.setdefault("reads", [])
+        t.setdefault("title", "untitled")
+        t.setdefault("detail", "")
+        t.setdefault("agent", "planner")
+        t.setdefault("model", "")
+        t.setdefault("done_when", "the work product exists and is complete")
     return plan
 
 
@@ -592,7 +609,7 @@ designs or code files. Respond with ONLY a JSON object:
   "model": "", "phase": "<short phase name>", "est_hours": 2,
   "depends_on": ["<id of an earlier task in this list>"],
   "reads": ["<existing project file this task must see>"],
-  "research": false,
+  "research": false, "needs_human": false,
   "done_when": "<observable criterion a reviewer can check>"}],
  "project_complete": false}
 
@@ -606,6 +623,11 @@ Rules:
 - "depends_on": ids from THIS list whose output the task builds on.
 - "reads": files from FILES that the task must see to do its work.
 - "research": true only for tasks that need facts from the live web%s
+- "needs_human": true ONLY when the task turns on something that is the
+  owner's to decide or do — spending money, an irreversible choice, an
+  account or credential only they hold. Such a task waits for their answer
+  while the rest carries on, so make nothing depend on it that does not
+  have to. Everything else you decide yourself.
 - Never repeat finished work; build on the files that exist.
 - If the goal is completely met and nothing worthwhile remains, answer
   {"tasks": [], "project_complete": true}."""
@@ -662,6 +684,160 @@ autonomous project run, for the project's owner. At most 170 words of plain
 prose, no headings or lists: what was accomplished, what state the project
 is in now, and anything the owner should check or worry about. Only use
 what you are given."""
+
+
+# ------------------------------------------------------------ memory
+
+def _memory(slug):
+    """The working memory. A project first run under the earlier autopilot
+    kept its lessons in lessons.md — they carry over until the first
+    rewrite folds them into MEMORY.md."""
+    auto = _auto(slug)
+    for name in ("MEMORY.md", "lessons.md"):
+        if (auto / name).is_file():
+            return (auto / name).read_text(encoding="utf-8", errors="replace")
+    return ""
+
+
+def _remember(state, key, title, cap=400):
+    """Keep a normalised task title in one of the state's bounded lists."""
+    norm = _norm_title(title)
+    if norm:
+        state[key] = ([x for x in state.get(key, []) if x != norm]
+                      + [norm])[-cap:]
+
+
+def _notify(cfg, text):
+    """Reach the owner through the mission-done webhook, if they named one."""
+    try:
+        if "mission-done" in cfg["webhooks"]:
+            eng.trigger_webhook("mission-done", text)
+    except Exception:
+        pass                               # a notification is never fatal
+
+
+# ------------------------------------------------------------ the owner's gate
+#
+# A task marked needs_human is the owner's to decide. It stays in To Do
+# until they answer — approve (optionally with the decision the task must
+# follow) or decline — and so does everything that builds on it. The rest
+# of the project carries on around it.
+
+def _gated(plan):
+    """Tasks that wait for the owner's answer before they may run."""
+    return [t for t in plan["tasks"]
+            if t["status"] == "todo" and t.get("needs_human")]
+
+
+def _held(plan):
+    """Ids of the unstarted tasks that cannot move until the owner answers:
+    the gated ones and everything that builds on them."""
+    held = {t["id"] for t in _gated(plan)}
+    grew = bool(held)
+    while grew:
+        grew = False
+        for t in plan["tasks"]:
+            if t["status"] == "todo" and t["id"] not in held \
+                    and any(d in held for d in t["depends_on"]):
+                held.add(t["id"])
+                grew = True
+    return held
+
+
+def _pending_decisions(auto):
+    """Answers the owner has given that are not folded into the plan yet."""
+    out = {}
+    for f in sorted(auto.glob("decision-*.json")):
+        d = _read_json(f, None)
+        if isinstance(d, dict) and d.get("task") \
+                and d.get("answer") in ("approved", "declined"):
+            out[str(d["task"])] = d
+    return out
+
+
+def _settle(task, decision, run=0):
+    """Apply the owner's answer to a task."""
+    note = str(decision.get("note") or "")
+    task["needs_human"] = False
+    task["decision"] = {"answer": decision["answer"], "note": note,
+                        "via": str(decision.get("via") or ""),
+                        "at": str(decision.get("at") or ""), "run": run}
+    if decision["answer"] == "declined":
+        task["status"] = "skipped"
+        task["finished"] = _stamp()
+        task["feedback"] = "declined by you" + (f" — {note}" if note else "")
+
+
+def _apply_decisions(slug, state):
+    """Fold the owner's answers into the plan. Only ever called with the
+    project lock held. Returns how many were applied."""
+    auto = _auto(slug)
+    files = sorted(auto.glob("decision-*.json"))
+    if not files:
+        return 0
+    plan = _plan(slug)
+    by = {t["id"]: t for t in plan["tasks"]}
+    applied = 0
+    for f in files:
+        d = _read_json(f, None)
+        task = by.get(str((d or {}).get("task"))) if isinstance(d, dict) \
+            else None
+        if task is not None and task["status"] == "todo" \
+                and task.get("needs_human") \
+                and d.get("answer") in ("approved", "declined"):
+            _settle(task, d, state["run"])
+            if d["answer"] == "declined":
+                state["stats"]["skipped"] += 1
+                _remember(state, "declined_titles", task["title"], 100)
+            applied += 1
+        f.unlink(missing_ok=True)
+    if applied:
+        _save_plan(slug, plan)
+        state["gate_wait"] = False
+        _save_state(slug, state)
+    return applied
+
+
+def decide(slug, task_id, approve=True, note="", via="app"):
+    """The owner's answer on a task that waits for them. `note` is the
+    decision itself ("call it Larder", "use the free tier") — an approved
+    task is told to follow it. The answer is a file, like STOP: it shows in
+    the app at once and is folded into the plan before her next step."""
+    eng._project_dir(slug)                       # validates the slug
+    task_id = str(task_id or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,40}", task_id):
+        raise ValueError("that is not a task id")
+    auto = _auto(slug)
+    task = next((t for t in _plan(slug)["tasks"] if t["id"] == task_id), None)
+    if task is None or task["status"] != "todo" \
+            or not task.get("needs_human") \
+            or task_id in _pending_decisions(auto):
+        raise ValueError(f"no task with the id {task_id} is waiting on you "
+                         f"in {slug}")
+    note = " ".join(str(note or "").split())[:600]
+    decision = {"task": task_id, "answer": "approved" if approve
+                else "declined", "note": note, "via": via, "at": _stamp()}
+    _write_json(auto / f"decision-{task_id}.json", decision)
+    _activity(slug, "info",
+              f"you {'approved' if approve else 'declined'} {task_id} — "
+              f"{task['title']}" + (f": {note}" if note else ""))
+    try:
+        with _locked(slug):
+            _apply_decisions(slug, _state(slug))
+    except Busy:
+        pass                 # she is mid-step; it is applied before the next
+    return {"title": task["title"], **decision}
+
+
+def _with_decisions(plan, auto):
+    """The plan as the owner should see it: their answers show at once,
+    also while she is mid-step and has not folded them in yet."""
+    pending = _pending_decisions(auto)
+    for t in plan["tasks"]:
+        d = pending.get(t["id"])
+        if d and t["status"] == "todo" and t.get("needs_human"):
+            _settle(t, d)
+    return plan
 
 
 # ------------------------------------------------------------ assess
@@ -780,6 +956,12 @@ def _break_cycles(tasks):
             visit(t["id"])
 
 
+def _truthy(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return value is True or value == 1
+
+
 def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     """Ask the planner for the next batch and merge it into plan.json.
     Returns (number of new tasks, planner says the project is complete)."""
@@ -792,11 +974,11 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     web_rule = "." if eng.web_ready(cfg) else \
         " — web access is OFF, so always false."
     system = PLAN_SYSTEM % web_rule
+    held = _held(plan)
 
     sections = [f"PROJECT: {slug}",
                 f"GOAL / REQUIREMENTS\n{goal}"]
-    memory = (auto / "MEMORY.md").read_text(encoding="utf-8") \
-        if (auto / "MEMORY.md").is_file() else ""
+    memory = _memory(slug)
     if memory:
         sections.append("PROJECT MEMORY (what has happened so far)\n"
                         + eng.clip(memory, 2600))
@@ -804,14 +986,28 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
         sections.append("YOUR ASSESSMENT\n" + eng.clip(
             (auto / "ASSESSMENT.md").read_text(encoding="utf-8"), 2600))
     sections.append("FILES (what exists now)\n" + _inventory_text(rows, 1500))
-    finished = [t for t in plan["tasks"] if t["status"] in ("done", "failed")]
+    declined = [t for t in plan["tasks"]
+                if (t.get("decision") or {}).get("answer") == "declined"]
+    finished = [t for t in plan["tasks"]
+                if t["status"] in ("done", "failed") or t in declined]
     if finished:
         recent = finished[-14:]
         sections.append("RECENT RESULTS\n" + "\n".join(
-            f"- {t['title']} — {t['status']}"
-            + (f" ({eng.clip(t.get('feedback', ''), 140)})"
-               if t["status"] == "failed" else "") for t in recent))
-    unstarted = [t for t in plan["tasks"] if t["status"] == "todo"]
+            f"- {t['title']} — "
+            + ("declined by the owner" + (
+                f" ({eng.clip(t['decision']['note'], 140)})"
+                if t["decision"].get("note") else "") if t in declined
+               else t["status"] + (
+                   f" ({eng.clip(t.get('feedback', ''), 140)})"
+                   if t["status"] == "failed" else "")) for t in recent))
+    if held:
+        sections.append(
+            "WAITING ON THE OWNER'S DECISION (already planned — do not plan "
+            "these again, and plan nothing that needs their outcome)\n"
+            + "\n".join(f"- {t['title']}" for t in plan["tasks"]
+                        if t["id"] in held))
+    unstarted = [t for t in plan["tasks"]
+                 if t["status"] == "todo" and t["id"] not in held]
     if replace_unstarted and unstarted:
         sections.append(
             "CURRENTLY PLANNED, NOT STARTED (keep, change or drop these — "
@@ -825,10 +1021,14 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             + "\n".join(f"- {g}" for g in state["audit_gaps"]))
     if state.get("mode") == "improve":
         sections.append(
-            "MODE: the stated goal is met and audited. Plan the most "
-            "valuable IMPROVEMENTS now — fix weaknesses, harden, document, "
-            "extend toward the obvious next step. Only real improvements: "
-            "if nothing worthwhile is left, answer project_complete.")
+            "MODE: the stated goal is met"
+            + (" and audited." if not state.get("audit_gaps") else
+               " as far as you could take it; the gaps above are still "
+               "open — close them first if files can close them.")
+            + " Plan the most valuable IMPROVEMENTS now — fix weaknesses, "
+            "harden, document, extend toward the obvious next step. Only "
+            "real improvements: if nothing worthwhile is left, answer "
+            "project_complete.")
     steering = _steering_text(slug)
     if steering:
         sections.append(steering.strip())
@@ -852,21 +1052,45 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     skill_names = set(eng.list_skill_names())
     installed = eng.installed_models(cfg)
     existing_files = {r["path"] for r in rows}
-    done_titles = {_norm_title(t["title"]) for t in plan["tasks"]
-                   if t["status"] == "done"}
+    # the duplicate guard: what is done stays done however often the planner
+    # proposes it again — also after the task has left the board. The list
+    # is seeded once from the complete record.
+    if "done_titles" not in state:
+        state["done_titles"] = []
+        for r in eng.project_changes(slug):
+            if r.get("status") == "done":
+                _remember(state, "done_titles", r.get("title", ""))
+    done_titles = set(state["done_titles"]) | {
+        _norm_title(t["title"]) for t in plan["tasks"]
+        if t["status"] == "done"}
+    declined_titles = set(state.get("declined_titles", []))
+    failed_twice = {k for k, n in state.get("failed_titles", {}).items()
+                    if n >= 2}
+    held_by_title = {_norm_title(t["title"]): t["id"]
+                     for t in plan["tasks"] if t["id"] in held}
     iteration = state["iteration"] + 1
     # ids never repeat — also not for a plan written by an older version,
     # which numbered tasks without keeping a counter
     used = [int(t["id"][1:]) for t in plan["tasks"]
             if re.fullmatch(r"t\d+", str(t.get("id", "")))]
     state["next_id"] = max(state["next_id"], max(used, default=0) + 1)
-    fresh, idmap = [], {}
+    fresh, idmap, by_title, dropped = [], {}, {}, []
     for raw in raw_tasks[:10]:
         title = " ".join(str(raw.get("title") or "").split())[:140]
-        if not title or _norm_title(title) in done_titles \
-                or _norm_title(title) in {_norm_title(t["title"])
-                                          for t in fresh}:
-            continue                       # empty, or a repeat of done work
+        norm = _norm_title(title)
+        if not norm:
+            continue
+        again = held_by_title.get(norm) or by_title.get(norm)
+        reason = ("already done" if norm in done_titles else
+                  "you declined it" if norm in declined_titles else
+                  "it failed twice before" if norm in failed_twice else
+                  "already waiting on you" if norm in held_by_title else
+                  "listed twice" if norm in by_title else "")
+        if reason:
+            if again:              # what builds on it builds on the original
+                idmap[str(raw.get("id"))] = again
+            dropped.append(f"{title} ({reason})")
+            continue
         detail = str(raw.get("detail") or "").strip()[:1800]
         agent = str(raw.get("agent") or "").lower().strip()
         if agent not in roster:
@@ -887,6 +1111,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
         tid = f"t{state['next_id']}"
         state["next_id"] += 1
         idmap[str(raw.get("id", tid))] = tid
+        by_title[norm] = tid
         fresh.append({
             "id": tid, "title": title, "detail": detail,
             "why": str(raw.get("why") or "").strip()[:500],
@@ -900,13 +1125,15 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
                       if isinstance(p, str)
                       and str(p).lstrip("./") in existing_files][:6],
             "research": bool(raw.get("research")) and eng.web_ready(cfg),
+            "needs_human": _truthy(raw.get("needs_human")),
             "done_when": str(raw.get("done_when") or "the work product "
                              "exists and is complete").strip()[:400],
             "status": "todo", "attempts": 0, "iteration": iteration,
         })
     for t in fresh:
-        t["depends_on"] = [idmap[d] for d in t["depends_on"]
-                           if d in idmap and idmap[d] != t["id"]]
+        t["depends_on"] = list(dict.fromkeys(
+            idmap[d] for d in t["depends_on"]
+            if d in idmap and idmap[d] != t["id"]))
     _break_cycles(fresh)
 
     if fresh or replace_unstarted:
@@ -939,8 +1166,21 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
               "task(s): " + "; ".join(
                   f"{t['title']} → {t['agent']}"
                   + (f" on {t['model']}" if t["model"] else "")
+                  + (" (needs you)" if t["needs_human"] else "")
                   for t in fresh[:8])
               if fresh else "the planner has nothing more to add")})
+    if dropped:
+        emit({"event": "stage_done", "stage": "plan",
+              "log": f"{slug}: left out {len(dropped)} task(s) the planner "
+                     "proposed again — " + "; ".join(dropped[:5])})
+    gates = [t for t in fresh if t["needs_human"]]
+    if gates:
+        names = "; ".join(f"{t['id']} — {t['title']}" for t in gates[:4])
+        emit({"event": "stage_done", "stage": "plan",
+              "log": f"{slug}: {len(gates)} task(s) need your decision "
+                     f"before they can run — {names}. I'm carrying on with "
+                     "everything that does not depend on them."})
+        _notify(cfg, f"autopilot {slug} needs your decision: {names}")
     return len(fresh), complete
 
 
@@ -967,6 +1207,7 @@ def _runnable(plan):
     done = {t["id"] for t in plan["tasks"] if t["status"] == "done"}
     known = {t["id"] for t in plan["tasks"]}
     ready = [t for t in plan["tasks"] if t["status"] == "todo"
+             and not t.get("needs_human")       # the owner has not answered
              and all(d in done or d not in known for d in t["depends_on"])]
     # first attempts before retries, so one stubborn task cannot starve
     # the rest of the batch
@@ -978,6 +1219,14 @@ def _task_prompt(slug, task, plan, cfg):
     rows = inventory(_proj(slug))
     budget = int(eng.prompt_budget(cfg) * 0.55)      # the rest: system prompt
     parts = []
+    decision = task.get("decision") or {}
+    if decision.get("answer") == "approved":
+        parts.append(
+            "THE OWNER APPROVED THIS TASK"
+            + (f" WITH THIS DECISION: {decision['note']}\nFollow it exactly "
+               "— it is theirs to make, not yours to revisit."
+               if decision.get("note") else
+               " — go ahead and make the call the task asks for."))
     if task.get("feedback") and task["attempts"] > 1:
         parts.append(
             "A REVIEWER REJECTED YOUR PREVIOUS ATTEMPT (it was rolled "
@@ -1002,10 +1251,9 @@ def _task_prompt(slug, task, plan, cfg):
             parts.append(f"OUTPUT OF EARLIER TASK “{d['title']}”\n"
                          + eng.clip(f.read_text(encoding="utf-8"),
                                     int(budget * 0.2)))
-    memory = auto / "MEMORY.md"
-    if memory.is_file():
-        parts.append("PROJECT MEMORY\n" + eng.clip(
-            memory.read_text(encoding="utf-8"), 1400))
+    memory = _memory(slug)
+    if memory:
+        parts.append("PROJECT MEMORY\n" + eng.clip(memory, 1400))
     parts.append("ALL PROJECT FILES\n" + _inventory_text(rows, 900))
     steering = _steering_text(slug, limit=4)
     if steering:
@@ -1077,6 +1325,13 @@ def _verify(slug, task, output, records, problems, cfg, emit):
                             "unreviewed"}
 
 
+def _decision_line(decision, lead):
+    """How the owner's answer on a gated task reads in the records."""
+    return (f"{lead}Your decision: {decision.get('answer', 'approved')}"
+            + (f" via {decision['via']}" if decision.get("via") else "")
+            + (f" — “{decision['note']}”" if decision.get("note") else ""))
+
+
 def _record(slug, state, task, records, info, verdict, output, commit=""):
     """Step 5: the structured change record + the readable changelog."""
     auto = _auto(slug)
@@ -1095,6 +1350,8 @@ def _record(slug, state, task, records, info, verdict, output, commit=""):
         "output": f"{auto.name}/task-{task['id']}.md", "commit": commit,
         "seconds": task.get("seconds", 0),
     }
+    if task.get("decision"):
+        row["decision"] = task["decision"]
     with (auto / "changes.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
     line = (f"- **{task['title']}** [{task['id']}] — {task['status']} "
@@ -1112,6 +1369,8 @@ def _record(slug, state, task, records, info, verdict, output, commit=""):
         line += f"\n  - What was done: {row['notes'][:400]}"
     if verdict.get("feedback"):
         line += f"\n  - Review: {verdict['feedback']}"
+    if task.get("decision"):
+        line += _decision_line(task["decision"], "\n  - ")
     refs = [f"`{row['output']}`"] + ([f"commit `{commit}`"] if commit else [])
     refs += [f"[{s.get('title') or s['url']}]({s['url']})"
              for s in row["sources"][:6]]
@@ -1224,6 +1483,8 @@ def _run_task(slug, state, plan, task, cfg, emit):
         state["stats"]["done"] += 1
         state["stats"]["files"] += len(task["files"])
         state["iter_done"] = state.get("iter_done", 0) + 1
+        state["run_tasks"] += 1
+        _remember(state, "done_titles", task["title"])
         _save_plan(slug, plan)
         sha = _commit(
             slug, state, cfg, task["files"],
@@ -1245,6 +1506,11 @@ def _run_task(slug, state, plan, task, cfg, emit):
             task["status"] = "failed"
             task["finished"] = _stamp()
             state["stats"]["failed"] += 1
+            state["run_tasks"] += 1
+            norm = _norm_title(task["title"])
+            failed = dict(state.get("failed_titles", {}))
+            failed[norm] = failed.pop(norm, 0) + 1      # newest last
+            state["failed_titles"] = dict(list(failed.items())[-200:])
             _record(slug, state, task, [], info, verdict, output)
             emit({"event": "error",
                   "log": f"{slug}: {task['id']} failed after "
@@ -1269,7 +1535,7 @@ def _reflect(slug, state, batch, cfg, emit):
     """Step 6: rewrite the memory from what this batch taught."""
     auto = _auto(slug)
     path = auto / "MEMORY.md"
-    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    old = _memory(slug)
     results = []
     for t in batch:
         results.append(
@@ -1309,14 +1575,12 @@ def _reflect(slug, state, batch, cfg, emit):
 
 def _audit(slug, state, cfg, emit):
     """When the planner says "done": check that against the requirements."""
-    auto = _auto(slug)
     rows = inventory(_proj(slug))
     key = [r["path"] for r in rows if r["lines"]][:8]
     prompt = (f"REQUIREMENTS\n{eng._project_goal(slug, 3500)}\n\n"
               f"FILES THAT EXIST\n{_inventory_text(rows, 1500)}\n\n"
-              + ("MEMORY OF THE RUN\n" + eng.clip(
-                  (auto / "MEMORY.md").read_text(encoding="utf-8"), 2000)
-                 + "\n\n" if (auto / "MEMORY.md").is_file() else "")
+              + ("MEMORY OF THE RUN\n" + eng.clip(_memory(slug), 2000)
+                 + "\n\n" if _memory(slug) else "")
               + "EXCERPTS\n" + _read_for_task(
                   slug, key, int(eng.prompt_budget(cfg) * 0.45)))
     emit({"event": "thinking",
@@ -1338,9 +1602,10 @@ def _audit(slug, state, cfg, emit):
 def _close_iteration(slug, state, plan, cfg, emit):
     """A batch has nothing left to run: settle it and learn from it."""
     it = state["iteration"]
+    held = _held(plan)                 # waiting on the owner: they carry over
     for t in plan["tasks"]:
-        if t["status"] == "todo":            # its dependencies never landed
-            t["status"] = "skipped"
+        if t["status"] == "todo" and t["id"] not in held:
+            t["status"] = "skipped"          # its dependencies never landed
             t["feedback"] = "a task it depends on did not complete"
             state["stats"]["skipped"] += 1
     _save_plan(slug, plan)
@@ -1355,15 +1620,21 @@ def _close_iteration(slug, state, plan, cfg, emit):
         for t in batch:
             t["reflected"] = True
         _save_plan(slug, plan)
-        state["dry"] = 0 if state.get("iter_done") else state["dry"] + 1
+        if state.get("iter_done"):
+            state["dry"] = 0
+        elif any(t["status"] == "failed" for t in batch):
+            # work was attempted and none of it landed. (A batch you
+            # declined or steered away from is not a dry one.)
+            state["dry"] += 1
     state["iter_done"] = 0
     state["closed_iteration"] = it
     _save_state(slug, state)
     _commit(slug, state, cfg, [], f"iteration {it}: memory and records", emit)
     _sync_brain(slug)
-    if state["dry"] >= 2:
+    limit = cfg["autopilot_stall_limit"]
+    if state["dry"] >= limit:
         _finalize(slug, emit, "stalled",
-                  "two batches in a row completed nothing")
+                  f"{limit} batch(es) in a row completed nothing")
         return "finalized"
     return "reflected"
 
@@ -1373,27 +1644,39 @@ def _advance(slug, state, cfg, emit):
     state["phase"] = "planning"
     _save_state(slug, state)
     added, complete = _plan_next(slug, state, emit, cfg)
+    plan = _plan(slug)
+    gated = _gated(plan)
     if added:
         state["empty_plans"] = 0
+    if gated and not _runnable(plan):
+        # all that is left — or all that was just planned — waits on the
+        # owner. Park: "done" cannot be claimed over their head, and
+        # planning on around tasks nobody may run would never end.
+        return _wait_for_owner(slug, state, gated, cfg, emit)
+    if added:
         state["phase"] = "working"
         _save_state(slug, state)
         return "replanned"
     if not state["stats"]["done"]:
         # nothing has ever been completed and the planner offers nothing:
         # that is a planner problem, never "the goal is met"
-        state["empty_plans"] = state.get("empty_plans", 0) + 1
+        state["empty_plans"] += 1
         _save_state(slug, state)
-        if state["empty_plans"] >= 2:
+        limit = cfg["autopilot_stall_limit"]
+        if state["empty_plans"] >= limit:
             _finalize(slug, emit, "stalled",
-                      "the planner returned no tasks twice — check the "
-                      "smart-tier model")
+                      f"the planner returned no tasks {limit} time(s) in a "
+                      "row — check the smart-tier model")
             return "finalized"
         return "replanned"
+    open_gaps = state.get("audit_gaps") or []
     if state["mode"] == "improve":
         _save_state(slug, state)
         _finalize(slug, emit, "complete",
                   "the goal is met and no further improvement was worth "
-                  "making")
+                  "making" if not open_gaps else
+                  "the planner has nothing more to add; an audit still "
+                  "lists: " + "; ".join(open_gaps[:4]))
         return "complete"
     if state["audits"] < 2:
         state["phase"] = "auditing"
@@ -1408,19 +1691,48 @@ def _advance(slug, state, cfg, emit):
                          "the requirements — planning to close them: "
                          + "; ".join(gaps[:3])})
             return "audited"
+        state.pop("audit_gaps", None)
         emit({"event": "stage_done", "stage": "audit",
               "log": f"{slug}: audit passed — the requirements are met"})
     state["audits"] = 0
+    open_gaps = state.get("audit_gaps") or []     # audited twice, not closed
     if cfg["autopilot_after_goal"] == "improve":
         state["mode"] = "improve"
         _save_state(slug, state)
         emit({"event": "stage_done", "stage": "autopilot",
-              "log": f"{slug}: goal met — moving on to improvements until "
-                     "you stop me"})
+              "log": f"{slug}: " + (
+                  "goal met — moving on to improvements until you stop me"
+                  if not open_gaps else
+                  f"the planner has nothing more to add and {len(open_gaps)} "
+                  "audit gap(s) stay open — moving on to improvements with "
+                  "those first")})
         return "improving"
     _save_state(slug, state)
-    _finalize(slug, emit, "complete", "the goal is met and audited")
+    _finalize(slug, emit, "complete",
+              "the goal is met and audited" if not open_gaps else
+              "the planner has nothing more to add; an audit still lists: "
+              + "; ".join(open_gaps[:4]))
     return "complete"
+
+
+def _wait_for_owner(slug, state, gated, cfg, emit):
+    """Everything that can be done without the owner is done. Park the run
+    — no model is called again until they answer, steer, or stop."""
+    names = ", ".join(f"{t['id']} ({t['title']})" for t in gated[:3]) \
+        + (f" and {len(gated) - 3} more" if len(gated) > 3 else "")
+    ids = sorted(t["id"] for t in gated)
+    fresh_wait = state.get("gate_notified") != ids
+    state.update(gate_wait=True, phase="waiting", current=None,
+                 waiting=f"for your decision on {names}", gate_notified=ids)
+    _save_state(slug, state)
+    _update_status_file(slug, state)
+    if fresh_wait:
+        emit({"event": "stage_done", "stage": "autopilot",
+              "log": f"{slug}: everything that does not need you is done — "
+                     f"waiting for your decision on {names}"})
+        _notify(cfg, f"autopilot {slug} is waiting for your decision on "
+                     f"{names}")
+    return "waiting"
 
 
 # ------------------------------------------------------------ the loop
@@ -1482,20 +1794,58 @@ def _tick(slug, emit):
     return result
 
 
+def _over_budget(state, cfg):
+    """Which of the run's budgets has been reached, in words — or ""."""
+    hours = (time.time() - state.get("run_started", time.time())) / 3600
+    if cfg["autopilot_max_hours"] and hours >= cfg["autopilot_max_hours"]:
+        return f"{cfg['autopilot_max_hours']:g} hour(s)"
+    if cfg["autopilot_max_tasks"] \
+            and state["run_tasks"] >= cfg["autopilot_max_tasks"]:
+        return f"{cfg['autopilot_max_tasks']} task(s)"
+    if cfg["autopilot_max_iterations"] \
+            and state["iteration"] - state.get("run_first_iteration", 0) \
+            >= cfg["autopilot_max_iterations"] \
+            and state.get("closed_iteration") == state["iteration"]:
+        return f"{cfg['autopilot_max_iterations']} batch(es)"
+    return ""
+
+
+def _steered(auto, state):
+    """New guidance since the last plan? Returns the marker's timestamp
+    (truthy) so that only the guidance that was planned for is cleared."""
+    try:
+        return (auto / "STEER").stat().st_mtime_ns
+    except OSError:
+        return -1 if state.get("steer_pending") else 0   # -1: an older state
+
+
+def _clear_steer(auto, state, seen):
+    state.pop("steer_pending", None)
+    try:
+        if (auto / "STEER").stat().st_mtime_ns == seen:
+            (auto / "STEER").unlink()
+    except OSError:
+        pass
+
+
 def _step(slug, state, cfg, emit):
     auto = _auto(slug)
+    over = _over_budget(state, cfg)
+    if over:
+        _finalize(slug, emit, "budget", f"the run's budget of {over} was "
+                  "reached")
+        return "finalized"
+    _apply_decisions(slug, state)          # the owner's answers on held tasks
+    steered = _steered(auto, state)
+    if state.get("gate_wait"):
+        waiting_plan = _plan(slug)
+        if _gated(waiting_plan) and not _runnable(waiting_plan) \
+                and not steered:
+            return "waiting"               # nothing to do until they answer
+        state["gate_wait"] = False
     if state.get("waiting") or state["backoff_until"]:
         state["waiting"], state["backoff_until"] = "", 0
         _save_state(slug, state)
-    hours = (time.time() - state.get("run_started", time.time())) / 3600
-    if (cfg["autopilot_max_hours"] and hours >= cfg["autopilot_max_hours"]) \
-            or (cfg["autopilot_max_iterations"]
-                and state["iteration"] - state.get("run_first_iteration", 0)
-                >= cfg["autopilot_max_iterations"]
-                and state.get("closed_iteration") == state["iteration"]):
-        _finalize(slug, emit, "stopped", "the run's budget was reached "
-                  "(aria.autopilot_max_hours / autopilot_max_iterations)")
-        return "finalized"
     if not (auto / "ASSESSMENT.md").is_file():
         state["phase"] = "assessing"
         _save_state(slug, state)
@@ -1505,15 +1855,20 @@ def _step(slug, state, cfg, emit):
         _save_state(slug, state)
         return "assessed"
     plan = _plan(slug)
-    if state.pop("steer_pending", None) and any(
-            t["status"] == "todo" for t in plan["tasks"]):
-        state["phase"] = "planning"
+    if steered:
+        held = _held(plan)
+        replan = any(t["status"] == "todo" and t["id"] not in held
+                     for t in plan["tasks"])
+        if replan:                # work that has not started is planned anew
+            state["phase"] = "planning"
+            _save_state(slug, state)
+            _plan_next(slug, state, emit, cfg, replace_unstarted=True)
+            state["errors"] = 0
+            state["phase"] = "working"
+        _clear_steer(auto, state, steered)
         _save_state(slug, state)
-        _plan_next(slug, state, emit, cfg, replace_unstarted=True)
-        state["errors"] = 0
-        state["phase"] = "working"
-        _save_state(slug, state)
-        return "replanned"
+        if replan:
+            return "replanned"
     ready = _runnable(plan)
     if ready:
         return _run_task(slug, state, plan, ready[0], cfg, emit)
@@ -1528,7 +1883,10 @@ def _step(slug, state, cfg, emit):
               "log": f"{slug}: restarting {len(stranded)} task(s) that a "
                      "restart interrupted"})
         return "recovered"
-    if plan["tasks"] and state.get("closed_iteration") != state["iteration"]:
+    unsettled = state.get("closed_iteration") != state["iteration"] or any(
+        not t.get("reflected") and t["status"] in ("done", "failed", "skipped")
+        for t in plan["tasks"])       # e.g. a held task that finished later
+    if plan["tasks"] and unsettled:
         result = _close_iteration(slug, state, plan, cfg, emit)
         state["errors"] = 0
         return result
@@ -1567,7 +1925,9 @@ def start(slug, via="cli"):
     state.update(status="running", run=state["run"] + 1, started=_stamp(),
                  run_started=time.time(), phase="starting", waiting="",
                  backoff_until=0, errors=0, dry=0, audits=0, stop_reason="",
-                 run_first_iteration=state["iteration"], current=None)
+                 run_first_iteration=state["iteration"], current=None,
+                 run_tasks=0, empty_plans=0, gate_wait=False,
+                 gate_notified=[])
     state.pop("git_off", None)
     if cfg["autopilot_git"] and aria_git.is_repo_root(proj):
         try:
@@ -1606,13 +1966,14 @@ def steer(slug, text, via="chat"):
     if not text:
         raise ValueError("empty guidance")
     eng._project_dir(slug)
-    with (_auto(slug) / "STEERING.md").open("a", encoding="utf-8") as fh:
+    auto = _auto(slug)
+    with (auto / "STEERING.md").open("a", encoding="utf-8") as fh:
         fh.write(f"- [{_stamp()[:16].replace('T', ' ')} via {via}] {text}\n")
-    state = _state(slug)
-    state["steer_pending"] = True
-    _save_state(slug, state)
+    # a signal file, like STOP: her state is only written under her lock,
+    # so guidance that arrives while she is mid-task is never overwritten
+    (auto / "STEER").touch()
     _activity(slug, "info", f"guidance from you: {text}")
-    return state
+    return _state(slug)
 
 
 def run_forever(slug, emit, idle_sleep=10):
@@ -1650,10 +2011,16 @@ def _update_status_file(slug, state):
              "stopped": "Autopilot stopped — see autopilot/FINAL-REPORT.md",
              "complete": "Complete — see autopilot/FINAL-REPORT.md",
              "stalled": "Paused (stalled) — see autopilot/FINAL-REPORT.md",
+             "budget": "Paused (budget reached) — see "
+                       "autopilot/FINAL-REPORT.md",
              }.get(state["status"], "Not started")
     cur = state.get("current") or {}
-    focus = cur.get("title") or (open_tasks[0]["title"] if open_tasks
-                                 else "Nothing queued.")
+    gated = _gated(plan)
+    focus = cur.get("title") or (
+        "Waiting for your decision on: "
+        + "; ".join(t["title"] for t in gated[:3])
+        if state.get("gate_wait") and gated else
+        open_tasks[0]["title"] if open_tasks else "Nothing queued.")
     text = re.sub(r"^\*\*Phase:\*\*.*$", f"**Phase:** {phase}", text, 1, re.M)
     text = re.sub(r"^\*\*Last updated:\*\*.*$",
                   f"**Last updated:** {_stamp()[:10]}", text, 1, re.M)
@@ -1691,7 +2058,14 @@ def build_report(slug, state, reason, detail="", summary=""):
     modified = sum(1 for r in done for f in r["files"]
                    if f["action"] == "modified")
     ending = {"stopped": "stopped by you", "complete": "completed",
-              "stalled": "paused itself (stalled)"}.get(reason, reason)
+              "stalled": "paused itself (stalled)",
+              "budget": "paused at its budget"}.get(reason, reason)
+    plan = _with_decisions(_plan(slug), auto)
+    waiting = _gated(plan)
+    held = _held(plan)
+    declined = [t for t in plan["tasks"]
+                if (t.get("decision") or {}).get("answer") == "declined"
+                and t["decision"].get("run") in (run, 0)]
     out = [f"# Final report — {slug}", "",
            f"Run {run} {ending} at {_stamp()[:16].replace('T', ' ')}"
            + (f" — {detail}" if detail else "") + ".",
@@ -1716,6 +2090,10 @@ def build_report(slug, state, reason, detail="", summary=""):
                                key=lambda kv: -len(kv[1]))[:5]:
         if not any(f"`{path}`" in x for x in look) and len(look) < 5:
             look.append(f"`{path}` — changed by {len(_tasks)} task(s)")
+    if waiting:
+        look.insert(0, f"**{len(waiting)} task(s) waiting for your "
+                       "decision** — listed below; nothing that builds on "
+                       "them can move until you answer")
     if failed:
         look.append(f"the {len(failed)} failed task(s) below — work the "
                     "plan could not land")
@@ -1752,6 +2130,9 @@ def build_report(slug, state, reason, detail="", summary=""):
             out.append("   - **Verified:** "
                        + (r.get("feedback") or "passed")
                        + ("" if r.get("verified") else " (unreviewed)"))
+            if r.get("decision"):
+                out.append(_decision_line(r["decision"], "   - **")
+                           .replace("Your decision:", "Your decision:**", 1))
             refs = [f"`{r['output']}`"]
             if r.get("commit"):
                 refs.append(f"commit `{r['commit']}`")
@@ -1760,12 +2141,29 @@ def build_report(slug, state, reason, detail="", summary=""):
             out.append("   - **References:** " + " · ".join(refs))
         out.append("")
 
-    if failed:
+    if waiting:
+        out += ["## Waiting for your decision", "",
+                "These are yours to decide. Approve one (with your decision, "
+                "if it needs one) or skip it — on the Projects page, or "
+                f"`aria autopilot {slug} approve-task <id> \"…\"`.", ""]
+        for w in waiting:
+            behind = [t["id"] for t in plan["tasks"] if t["id"] in held
+                      and t["id"] != w["id"] and w["id"] in t["depends_on"]]
+            out.append(
+                f"- **{w['title']}** (`{w['id']}`)"
+                + (f" — {w['why'].rstrip('. ')}." if w.get("why") else ".")
+                + (f" Waiting behind it: {', '.join(behind)}." if behind
+                   else ""))
+        out.append("")
+
+    if failed or declined:
         out += ["## Not completed", ""]
         out += [f"- **{r['title']}** (`{r['task']}`) — failed after "
                 f"{r['attempts']} attempt(s): {r.get('feedback') or '?'} "
                 f"(attempts kept in `{r['output']}`; nothing from them was "
                 "left in the project)" for r in failed]
+        out += [f"- **{d['title']}** (`{d['id']}`) — {d.get('feedback')}; "
+                "it was not attempted" for d in declined]
         out.append("")
 
     if touched:
@@ -1804,8 +2202,7 @@ def _finalize(slug, emit, reason, detail=""):
             if r.get("run") == state["run"]]
     summary = ""
     try:
-        memory = (auto / "MEMORY.md").read_text(encoding="utf-8") \
-            if (auto / "MEMORY.md").is_file() else ""
+        memory = _memory(slug)
         facts = (f"Project: {slug}. Run ended because: {reason}"
                  + (f" ({detail})" if detail else "") + ".\n\nTasks:\n"
                  + "\n".join(f"- {r['title']} — {r['status']}"
@@ -1827,8 +2224,9 @@ def _finalize(slug, emit, reason, detail=""):
     (auto / "reports" / f"run-{state['run']:03d}-{stamp}.md").write_text(
         report, encoding="utf-8")
     (auto / "FINAL-REPORT.md").write_text(report, encoding="utf-8")
-    state["status"] = reason if reason in ("stopped", "complete",
-                                           "stalled") else "stopped"
+    state["status"] = reason if reason in ("stopped", "complete", "stalled",
+                                           "budget") else "stopped"
+    state["gate_wait"] = False
     state["stop_reason"] = detail or reason
     state["phase"] = ""
     state["finished"] = _stamp()
@@ -1880,7 +2278,11 @@ def view(slug):
         body = f.read_text(encoding="utf-8", errors="replace")
         return body[-tail:] if tail else body
 
-    plan = _plan(slug) if (auto / "plan.json").is_file() else {"tasks": []}
+    plan = _with_decisions(_plan(slug), auto) \
+        if (auto / "plan.json").is_file() else {"tasks": []}
+    held = _held(plan)
+    for t in plan["tasks"]:
+        t["held"] = t["id"] in held and not t.get("needs_human")
     try:
         rel = str(proj.relative_to(eng.ROOT))
     except ValueError:
@@ -1897,8 +2299,10 @@ def view(slug):
         "pitch": eng.plan_pitch(proj),
         "state": {k: v for k, v in state.items() if k != "run_started"},
         "plan": plan,
+        "needs_you": [{"id": t["id"], "title": t["title"],
+                       "why": t.get("why", "")} for t in _gated(plan)],
         "assessment": text("ASSESSMENT.md"),
-        "memory": text("MEMORY.md"),
+        "memory": text("MEMORY.md") or text("lessons.md"),
         "steering": text("STEERING.md"),
         "changelog": text("CHANGELOG.md", tail=16000),
         "report": text("FINAL-REPORT.md"),

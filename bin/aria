@@ -11,6 +11,8 @@
 #   aria autopilot <slug> start|stop|status|run|steer "guidance"
 #                              autonomous project execution (run = work in
 #                              this terminal, without the always-on server)
+#   aria autopilot <slug> approve-task|skip-task <id> ["note"]
+#                              answer a task that is waiting on you
 #   aria plan <slug>           assess + (re)plan a project now
 #   aria agent <name> "task"   run one agent (role + skills + model tier)
 #   aria mission <name> "task" queue a BACKGROUND agent job
@@ -43,7 +45,8 @@ set -euo pipefail
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ARIA_ROOT/pipeline/00-inbox"
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# the header comment above, however long it grows
+usage() { awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 engine() {
   if [ -n "${ARIA_ENGINE:-}" ]; then

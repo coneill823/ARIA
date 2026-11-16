@@ -28,7 +28,9 @@ assess → plan → [ execute → verify → record ]* → reflect → plan → 
    it should load, the **model** it needs (a tier, or a specific installed
    model — fast for simple drafting, deep for the hardest reasoning), the
    files it must read, what it depends on, *why* it exists, and an
-   observable `done_when`.
+   observable `done_when`. A task that turns on something only you can
+   decide is marked as **yours** — see [When a decision is
+   yours](#when-a-decision-is-yours).
 3. **Execute.** One task at a time, in dependency order. The agent sees
    the goal, the project memory, the files it asked for and its
    dependencies' output, and answers with whole files in `file:` blocks.
@@ -79,6 +81,40 @@ changed in *project*".
 then on; work that has not started is replanned around it, and nothing
 that is running is interrupted.
 
+## When a decision is yours
+
+Some things are not hers to decide: spending money, a choice that cannot
+be undone, an account only you hold. The planner marks such a task
+**needs you**. It stays in To Do — amber, dashed — and so does anything
+that builds on it. Everything else carries on, batch after batch. Only
+when nothing else is left does she stop and wait, and waiting costs
+nothing: no model is called until you answer.
+
+![A task waiting on your decision](ui-gate.png)
+
+Open the task and answer it:
+
+- **Approve** — add your decision if the task needs one ("use the free
+  tier", "call it Larder") and the task is told to follow it exactly.
+- **Skip it** — it is not attempted, what built on it is dropped, and she
+  plans around it.
+
+The same from chat — "approve task t5 in *project*: use the free tier",
+"skip task t5 in *project*" — or from a terminal:
+
+```bash
+aria autopilot <slug> approve-task t5 "use the free tier"
+```
+
+```bash
+aria autopilot <slug> skip-task t5 "no budget for this"
+```
+
+Your answer is recorded with the change it led to, in the changelog and
+in the final report. A voice assistant cannot give it for you. If you
+named a `mission-done` webhook she calls it when a task starts waiting
+on you and again when she has run out of other work.
+
 ## Stopping, and the report
 
 "stop working on *project*", **■ Stop**, or `aria autopilot <slug> stop`:
@@ -90,8 +126,9 @@ recollection, so it is complete however long the run was. For every
 change: the files (created or modified, lines added and removed), why the
 task existed, what was done, how it was verified, and its references —
 the task's full output, the commit, and any web sources. Failed tasks are
-listed with the reason; nothing from them is left in the project. Earlier
-runs' reports are kept in `autopilot/reports/`.
+listed with the reason; nothing from them is left in the project. Tasks
+still waiting on your decision are listed too, with what waits behind
+them. Earlier runs' reports are kept in `autopilot/reports/`.
 
 ![The final report](ui-report.png)
 
@@ -105,9 +142,14 @@ memory.
 | The model server is down or drops the connection | Waits and retries with a growing pause (30 s up to 15 min). The task is not counted as failed and nothing is lost. |
 | A model stays silent | Fast and smart tiers are abandoned after `autopilot_idle_minutes` and retried. The deep tier and hand-picked models are never cut off. |
 | Work is rejected | Rolled back, retried with the reviewer's critique; failed after three attempts. Tasks that depended on it are skipped and the planner is told why. |
-| Two batches in a row complete nothing, or the planner keeps returning nothing | She pauses herself ("stalled"), writes the report and says why. |
+| `autopilot_stall_limit` batches in a row (3 unless you change it) complete nothing, or the planner keeps returning nothing | She pauses herself ("stalled"), writes the report and says why. |
+| The planner proposes work that is already done, that you declined, or that has failed twice | It is left out of the plan, and the log says so. |
 | The server restarts mid-task | The task is picked up again on the next step. |
-| A budget is reached (`autopilot_max_hours`, `autopilot_max_iterations`) | Finishes the step in flight and writes the report. |
+| A budget is reached (`autopilot_max_hours`, `autopilot_max_tasks`, `autopilot_max_iterations`) | Finishes the step in flight, writes the report and pauses as "budget reached". Resuming is a new run with a fresh budget. |
+| A decision is yours to make | The task waits; the rest carries on. See [above](#when-a-decision-is-yours). |
+
+However a run ends — stopped, complete, stalled, budget reached — she
+writes the report and calls the `mission-done` webhook if you named one.
 
 ## Git and GitHub
 
@@ -144,8 +186,9 @@ Under `<project>/autopilot/` (`.aria/` for an adopted codebase):
 |---|---|
 | `ASSESSMENT.md` | the stock-take written before the first plan |
 | `plan.json` | the live task plan — the Board and the Gantt are drawn from it |
-| `MEMORY.md` | the working memory, rewritten after every batch |
+| `MEMORY.md` | the working memory, rewritten after every batch (a project first run under the earlier autopilot has `lessons.md`; it is folded in at the first rewrite) |
 | `STEERING.md` | your guidance |
+| `STOP`, `STEER`, `decision-<id>.json` | your signals — stop, new guidance, an answer on a task that waits for you — picked up before her next step and then removed |
 | `changes.jsonl` | the complete, structured change record |
 | `CHANGELOG.md` | the same, readable |
 | `task-<id>.md` | every attempt at every task, with its verdict |
@@ -167,6 +210,10 @@ never blocks triage, chat or missions; it shares only the hardware.
 - **`context_tokens`** (default 8192) is requested from Ollama for every
   call and prompts are sized to it. Ollama's own default silently cuts
   long prompts — raise this if your model and VRAM allow.
+- **Budgets and the stall limit** (Settings → Autopilot) bound a run you
+  leave for days: hours, batches, tasks, and how many batches may
+  complete nothing before she pauses herself. All off or lenient by
+  default.
 - **Skills and specialists** come from `aria install-skills`. For each
   project the planner is offered only the ones that fit its goal.
 
@@ -183,3 +230,6 @@ never blocks triage, chat or missions; it shares only the hardware.
   runs.
 - Web research reads search results and a couple of pages per task. It
   cites what it used; it is not a deep-research system.
+- What counts as *yours to decide* is the planner's judgment. A weak
+  model may ask too often or not at all — steer it: "decide naming
+  yourself", "ask me before anything that costs money".

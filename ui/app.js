@@ -148,24 +148,33 @@ function renderState(st) {
   }
   const running = st.projects.filter(p => p.autopilot === 'running');
   const asking = st.projects.filter(p => !p.approved && p.has_plan);
+  // tasks that wait for the owner's decision outrank "she is working"
+  const owed = st.projects.reduce((n, p) => n + (p.needs_you || []).length, 0);
   const pp = $('#pip-projects');
-  pp.className = 'pip' + (running.length ? ' live' : asking.length ? ' ask' : '');
-  pp.textContent = running.length ? '' : asking.length ? String(asking.length) : '';
-  pp.title = running.length ? 'autopilot is working'
+  pp.className = 'pip' + (owed ? ' ask' : running.length ? ' live' : asking.length ? ' ask' : '');
+  pp.textContent = owed ? String(owed) : running.length ? '' : asking.length ? String(asking.length) : '';
+  pp.title = owed ? owed + ' task(s) waiting for your decision'
+    : running.length ? 'autopilot is working'
     : asking.length ? asking.length + ' plan(s) waiting for your approval' : '';
   const pa = $('#pip-agents');
   pa.className = 'pip' + (st.missions ? ' count' : '');
   pa.textContent = st.missions ? String(st.missions) : '';
   $('#working-h').hidden = !running.length;
-  clear($('#working'), running.map(p =>
-    h('a', { class: 'work' + (p.waiting ? ' waiting' : ''), href: '/projects?p=' + p.slug,
-             dataset: { view: 'projects', slug: p.slug, tab: 'live' },
+  clear($('#working'), running.map(p => {
+    const owes = (p.needs_you || []).length;
+    const parked = owes && p.phase === 'waiting';       // nothing else is left
+    return h('a', { class: 'work' + (p.waiting ? ' waiting' : ''), href: '/projects?p=' + p.slug,
+             dataset: { view: 'projects', slug: p.slug, tab: parked ? 'kanban' : 'live' },
              title: p.waiting || p.current || p.phase || 'working' },
-      h('div', { class: 'w-name' }, h('span', { text: title(p.slug) })),
-      h('div', { class: 'w-task', text: p.waiting ? 'waiting — ' + p.waiting
+      h('div', { class: 'w-name' }, h('span', { text: title(p.slug) }),
+        owes && !parked ? h('span', { class: 'w-ask', text: 'needs you',
+          title: owes + ' task(s) waiting for your decision' }) : null),
+      h('div', { class: 'w-task', text: parked ? 'waiting on your decision'
+        : p.waiting ? 'waiting — ' + p.waiting
         : (p.current || p.phase || 'working') + ' · iteration ' + p.iteration }),
       h('div', { class: 'w-bar' }, h('i', { style: {
-        width: (p.total ? Math.round(100 * p.done / p.total) : 0) + '%' } })))));
+        width: (p.total ? Math.round(100 * p.done / p.total) : 0) + '%' } })));
+  }));
   bus.emit('state', st);
 }
 

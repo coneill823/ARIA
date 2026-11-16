@@ -13,10 +13,11 @@ only thing a tunnel should ever point at. It accepts exactly one request:
 checks the secret, and passes the text to the local server's /api/say.
 Everything else — every other path, every other method — is a 404.
 
-What it will not do, even with the right secret: approve a plan or push to
-GitHub. Those answer "do that in the app" — the human gate is not something
-a voice in the room (or a leaked URL) gets to open. Set
-ARIA_VOICE_ALLOW=all to lift that if you really want it.
+What it will not do, even with the right secret: approve a plan, answer a
+task that is waiting on your decision, or push to GitHub. Those answer "do
+that in the app" — the human gate is not something a voice in the room (or
+a leaked URL) gets to open. Set ARIA_VOICE_ALLOW=all to lift that if you
+really want it.
 
 Limits: 30 requests a minute; 600 characters of text; five wrong secrets
 lock the door for a minute; Alexa's eight-second patience is respected
@@ -45,7 +46,7 @@ import aria_engine as eng  # noqa: E402
 TOKEN_FILE = eng.ROOT / "system" / "voice-token"
 UPSTREAM = os.environ.get("ARIA_URL", "http://127.0.0.1:8700").rstrip("/")
 GATED = set() if os.environ.get("ARIA_VOICE_ALLOW", "").lower() == "all" \
-    else {"approve", "github-push"}
+    else {"approve", "task-decision", "github-push"}
 MAX_TEXT = 600
 PER_MINUTE = 30
 PATIENCE = 7.0                 # Alexa gives up at about eight seconds
@@ -140,8 +141,9 @@ class Handler(BaseHTTPRequestHandler):
         intent = eng.detect_intent(text)
         if intent and intent["action"] in GATED:
             return self.reply(200, {"reply": (
-                "That one is yours to do in the app — approving a plan and "
-                "pushing to GitHub aren't things I take by voice.")})
+                "That one is yours to do in the app — approving a plan, "
+                "deciding a task that waits on you and pushing to GitHub "
+                "aren't things I take by voice.")})
         print(f"voice: {text[:80]!r}", flush=True)
         self.reply(200, {"reply": ask(text)})
 

@@ -54,10 +54,10 @@ async function pollLive() {
   if (lv.slug !== cur) return;
   const before = JSON.stringify([data.state.status, data.state.phase,
     (data.state.current || {}).id, data.state.waiting,
-    data.plan.tasks.map(t => t.id + t.status + t.attempts)]);
+    data.plan.tasks.map(t => t.id + t.status + t.attempts + (t.needs_human ? '?' : ''))]);
   const after = JSON.stringify([lv.state.status, lv.state.phase,
     (lv.state.current || {}).id, lv.state.waiting,
-    lv.tasks.map(t => t.id + t.status + t.attempts)]);
+    lv.tasks.map(t => t.id + t.status + t.attempts + (t.needs_human ? '?' : ''))]);
   data.state = lv.state;
   data.activity = lv.activity;
   data.live = lv.live;
@@ -73,19 +73,27 @@ function renderPicker() {
   const label = p => title(p.slug) + ' — ' + (
     p.autopilot === 'running' ? 'working' :
     !p.approved ? (p.has_plan ? 'needs your approval' : 'idea only') :
-    p.autopilot === 'idle' ? 'ready' : p.autopilot);
+    p.autopilot === 'idle' ? 'ready' :
+    p.autopilot === 'budget' ? 'budget reached' : p.autopilot) +
+    ((p.needs_you || []).length ? ' · needs your decision' : '');
   for (const p of list)
     sel.append(h('option', { value: p.slug, text: label(p), selected: p.slug === cur }));
   clear($('#proj-picker'), list.length ? sel : null);
 }
 
+// she has done everything that does not need the owner and is parked
+const onYou = () => data.state.status === 'running' && data.state.phase === 'waiting'
+  && (data.needs_you || []).length > 0;
+
 function stateText(st) {
   if (st.status === 'running') {
+    if (onYou()) return ['ask', 'waiting on you'];
     if (st.waiting) return ['waiting', 'waiting'];
     return ['running', 'working · iteration ' + st.iteration];
   }
   return [st.status, { idle: 'idle', stopped: 'stopped', complete: 'complete',
-                       stalled: 'paused — stalled' }[st.status] || st.status];
+                       stalled: 'paused — stalled',
+                       budget: 'paused — budget reached' }[st.status] || st.status];
 }
 
 function renderBar() {
@@ -233,7 +241,7 @@ function render(force = false) {
   }
   const s = JSON.stringify([tab, data.approved, data.state.status, data.state.phase,
     data.state.waiting, data.state.iteration, (data.state.current || {}).id,
-    data.plan.tasks.map(t => [t.id, t.status, t.attempts]),
+    data.plan.tasks.map(t => [t.id, t.status, t.attempts, !!t.needs_human]),
     data.changes.length, data.report.length, data.assessment.length,
     data.memory.length, data.steering.length]);
   if (!force && s === sig) { if (tab === 'live') updateLive(); return; }
@@ -254,8 +262,25 @@ function notices() {
       data.has_plan ? h('button', { class: 'btn', text: 'Read the plan', onclick: () => openDoc('proposed-plan') }) : null,
       data.has_plan ? h('button', { class: 'btn primary', text: '✓ Approve & start', onclick: start }) : null));
   }
-  if (st.status === 'running' && st.waiting)
+  const owed = data.needs_you || [];
+  if (owed.length) {
+    const find = id => data.plan.tasks.find(t => t.id === id);
+    out.push(h('div', { class: 'gatebar' },
+      h('div', { class: 'g-t' },
+        h('b', { text: owed.length === 1 ? 'One task is yours to decide. '
+                                         : owed.length + ' tasks are yours to decide. ' }),
+        onYou() ? 'Everything that does not depend on your answer is done — she is waiting for you.'
+          : st.status === 'running' ? 'She is carrying on with everything that does not depend on your answer.'
+          : 'Nothing that builds on them can move until you answer.'),
+      owed.slice(0, 3).map(g => h('button', { class: 'btn', title: g.why || '',
+        text: g.id + ' — ' + (g.title.length > 34 ? g.title.slice(0, 33) + '…' : g.title),
+        onclick: () => openTask(find(g.id)) })),
+      owed.length > 3 ? h('span', { class: 'hint', text: '+' + (owed.length - 3) + ' more on the board' }) : null));
+  }
+  if (st.status === 'running' && st.waiting && !onYou())
     out.push(h('div', { class: 'notice warn', text: 'Waiting: ' + st.waiting + '. She will pick up where she left off on her own.' }));
+  if (st.status === 'budget')
+    out.push(h('div', { class: 'notice warn', text: 'She paused at the budget you set: ' + (st.stop_reason || 'budget reached') + '. Resume begins a new run with a fresh budget — change the limits in Settings.' }));
   if (st.status === 'stalled')
     out.push(h('div', { class: 'notice bad', text: 'She paused herself: ' + (st.stop_reason || 'no progress') + '. See the Report, give her guidance (Steer), then resume.' }));
   if (st.status === 'complete')
@@ -268,9 +293,11 @@ function notices() {
 // ---- kanban
 
 function taskCard(t) {
+  const gated = t.needs_human && t.status === 'todo';
   const cls = 'task' + (t.status === 'inprogress' ? ' active' : '') +
-    (t.status === 'reviewing' ? ' reviewing' : '') +
+    (t.status === 'reviewing' ? ' reviewing' : '') + (gated ? ' gated' : '') +
     (t.status === 'failed' ? ' failed' : '') + (t.status === 'skipped' ? ' skipped' : '');
+  const said = (t.decision || {}).answer;
   const meta = [t.phase, '~' + t.est_hours + 'h'];
   if (t.attempts > 1) meta.push('attempt ' + t.attempts);
   const model = t.model_used || t.model;
@@ -282,8 +309,11 @@ function taskCard(t) {
     model ? badge(model.replace(/^ollama\//, ''), 'model') : null,
     (t.skills || []).map(sk => badge(sk, 'skill')),
     t.research ? badge('web', 'web') : null,
+    gated ? badge('needs you', 'ask') : null,
+    t.held && t.status === 'todo' ? badge('behind a decision', 'ask') : null,
+    said === 'approved' ? badge('approved by you', 'ok') : null,
     t.status === 'failed' ? badge('failed', 'bad') : null,
-    t.status === 'skipped' ? badge('skipped') : null);
+    t.status === 'skipped' ? badge(said === 'declined' ? 'declined by you' : 'skipped') : null);
 }
 
 function kanban() {
@@ -293,8 +323,9 @@ function kanban() {
   const known = new Set(tasks.map(t => t.id));
   const ready = t => t.depends_on.every(d => done.has(d) || !known.has(d));
   const closed = tasks.filter(t => ['done', 'failed', 'skipped'].includes(t.status)).reverse();
+  const first = (a, b) => (b.needs_human ? 1 : 0) - (a.needs_human ? 1 : 0);
   const cols = [
-    ['To Do', 'ready', tasks.filter(t => t.status === 'todo' && ready(t))],
+    ['To Do', 'ready', tasks.filter(t => t.status === 'todo' && ready(t)).sort(first)],
     ['Planning', 'queued', tasks.filter(t => t.status === 'todo' && !ready(t))],
     ['In Progress', '', tasks.filter(t => t.status === 'inprogress')],
     ['Reviewing', 'verifying', tasks.filter(t => t.status === 'reviewing')],
@@ -420,6 +451,9 @@ function gantt() {
     const bar = { x, y: y + 8, width: w, height: 14, rx: 4 };
     if (t.status === 'done') g.append(el('rect', { ...bar, fill: col }));
     else if (t.status === 'failed') g.append(el('rect', { ...bar, fill: col, opacity: .55 }));
+    else if (t.needs_human)          // waiting on the owner: amber, dashed
+      g.append(el('rect', { ...bar, fill: '#fbbf24', 'fill-opacity': .14,
+                            stroke: '#fbbf24', 'stroke-width': 1.2, 'stroke-dasharray': '4 3' }));
     else {
       g.append(el('rect', { ...bar, fill: col, opacity: t.status === 'todo' ? .22 : .6,
                             stroke: col, 'stroke-width': 1 }));
@@ -427,12 +461,14 @@ function gantt() {
         g.append(el('rect', { ...bar, fill: 'url(#work)' }));
     }
     const mark = { done: '✓', failed: '✗', inprogress: '● working',
-                   reviewing: '◐ reviewing' }[t.status] || '';
+                   reviewing: '◐ reviewing' }[t.status]
+      || (t.needs_human ? '⚑ needs you' : t.held ? 'behind a decision' : '');
     g.append(el('text', { x: x + w + 7, y: y + 19, fill: '#7d8fa5', 'font-size': 10.5 },
       [t.agent, '~' + t.est_hours + 'h', mark].filter(Boolean).join(' · ')));
     g.append(el('title', {}, `${t.id} — ${t.title}\n${t.agent}` +
       (t.model_used || t.model ? ' on ' + (t.model_used || t.model) : '') +
       `\nstatus: ${t.status} · estimate ${t.est_hours}h` +
+      (t.needs_human ? '\nwaiting for your decision' : '') +
       (t.depends_on.length ? '\nafter: ' + t.depends_on.join(', ') : '')));
     g.addEventListener('click', () => openTask(t));
     svg.append(g);
@@ -443,6 +479,7 @@ function gantt() {
     h('span', {}, h('i', { style: { background: '#7d8fa5' } }), 'done'),
     h('span', {}, h('i', { style: { background: 'repeating-linear-gradient(45deg,#7d8fa5 0 3px,#3a4658 3px 6px)' } }), 'in progress'),
     h('span', {}, h('i', { style: { background: 'transparent', border: '1px solid #7d8fa5' } }), 'to do'),
+    tasks.some(t => t.needs_human) ? h('span', {}, h('i', { style: { background: 'rgba(251,191,36,.14)', border: '1px dashed #fbbf24' } }), 'needs you') : null,
     h('span', { text: '→ depends on · estimated ' + Math.round(total * 10) / 10 + 'h of work' }));
   host.append(legend, svg);
   return host;
@@ -464,10 +501,17 @@ function updateLive() {
   if (st.status !== 'running') {
     kids.push(h('div', { class: 'now', text: { idle: 'Autopilot is not running.',
       stopped: 'Stopped at your request.', complete: 'Run complete.',
-      stalled: 'Paused — she stopped making progress.' }[st.status] || st.status }));
+      stalled: 'Paused — she stopped making progress.',
+      budget: 'Paused — the budget you set was reached.' }[st.status] || st.status }));
     kids.push(h('div', { class: 'now-sub', text: st.stop_reason || (data.approved
       ? 'Press Start and this panel shows her thinking as it happens.'
       : 'Approve the plan to begin.') }));
+  } else if (onYou()) {
+    kids.push(h('div', { class: 'now', text: 'Waiting on you' }));
+    kids.push(h('div', { class: 'now-sub', text: 'Everything that does not need your decision is done. Still yours to answer:' }));
+    for (const g of data.needs_you)
+      kids.push(h('div', {}, h('button', { class: 'btn small', text: g.id + ' — ' + g.title,
+        onclick: () => openTask(data.plan.tasks.find(t => t.id === g.id)) })));
   } else if (st.waiting) {
     kids.push(h('div', { class: 'now', text: 'Waiting' }));
     kids.push(h('div', { class: 'now-sub', text: st.waiting }));
@@ -564,8 +608,12 @@ function changeCard(r) {
       row('Why', r.why),
       row('What', r.notes),
       row(r.status === 'failed' ? 'Rejected' : 'Verified', (r.feedback || 'passed') + (r.verified === false && r.status !== 'failed' ? ' (unreviewed)' : '')),
+      row('You decided', r.decision ? decisionText(r.decision) : ''),
       row('References', refs)));
 }
+
+const decisionText = d => d.answer + (d.via ? ' via ' + d.via : '') +
+  (d.note ? ' — “' + d.note + '”' : '');
 
 function changes() {
   const rows = data.changes || [];
@@ -613,9 +661,30 @@ async function openDoc(name) {
   toast('No ' + name.replace('-', ' ') + ' document for this project yet.', 'bad');
 }
 
+async function decideTask(t, approve, note, close) {
+  try {
+    await api.post(approve ? '/api/approve-task' : '/api/skip-task',
+                   { slug: cur, id: t.id, note });
+    toast(approve ? t.id + ' approved — she will run it' + (note ? ' with your decision.' : '.')
+                  : t.id + ' skipped — she will plan around it.', 'good');
+    close();
+  } catch (e) { toast(e.message, 'bad'); }
+  bus.emit('projects:changed', cur);
+  refresh(true);
+}
+
 async function openTask(t) {
+  if (!t) return;
   const model = t.model_used || t.model || 'agent default';
+  const gated = t.needs_human && t.status === 'todo';
+  const note = h('textarea', { rows: 2, placeholder:
+    'Your decision, if the task needs one — e.g. “use the free tier”, “call it Larder”. She will follow it exactly.' });
   const body = h('div', {},
+    gated ? h('div', { class: 'gatebox' },
+      h('b', { text: 'This one is yours to decide.' }),
+      ' She will not run it — or anything that builds on it — until you answer. '
+      + 'Approve it to let her go ahead, or skip it and she plans around it.',
+      note) : null,
     h('dl', { class: 'kv' },
       h('dt', { text: 'status' }), h('dd', { text: t.status + (t.attempts > 1 ? ' · attempt ' + t.attempts : '') }),
       h('dt', { text: 'agent' }), h('dd', { text: t.agent }),
@@ -624,12 +693,17 @@ async function openTask(t) {
       h('dt', { text: 'depends on' }), h('dd', { text: t.depends_on.join(', ') || '—' }),
       h('dt', { text: 'done when' }), h('dd', { text: t.done_when }),
       t.why ? [h('dt', { text: 'why' }), h('dd', { text: t.why })] : null,
+      t.decision ? [h('dt', { text: 'you decided' }), h('dd', { text: decisionText(t.decision) })] : null,
+      t.held && t.status === 'todo' ? [h('dt', { text: 'on hold' }), h('dd', { text: 'it builds on a task that is waiting for your decision' })] : null,
       t.feedback ? [h('dt', { text: 'review' }), h('dd', { text: t.feedback })] : null,
       (t.files || []).length ? [h('dt', { text: 'files' }), h('dd', {}, t.files.map(f => h('div', {}, fileLink(f))))] : null),
     h('div', { class: 'section-h', text: 'What to produce' }),
     h('p', { text: t.detail || '—' }),
     h('div', { id: 'task-out' }));
-  modal(t.id + ' — ' + t.title, body, { wide: true });
+  modal(t.id + ' — ' + t.title, body, { wide: true, actions: gated ? [
+    { label: 'Skip it', run: close => decideTask(t, false, note.value.trim(), close) },
+    { label: '✓ Approve', kind: 'primary', run: close => decideTask(t, true, note.value.trim(), close) },
+  ] : [] });
   if (!t.attempts) return;                       // nothing has been run yet
   try {
     const r = await api.get('/api/file?slug=' + encodeURIComponent(cur) +

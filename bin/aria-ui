@@ -27,6 +27,8 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
   POST /api/export     {"slug"} -> publish project into the Obsidian vault
   POST /api/brain      {"text", "title"?, "sources"?} -> note in the vault
   POST /api/autopilot  {"slug", "action": approve|start|stop|steer, "text"?}
+  POST /api/approve-task  {"slug", "id", "note"?}  a task that waits on you:
+  POST /api/skip-task     {"slug", "id", "note"?}  let it run / decline it
   POST /api/plan       {"slug"} -> streamed (re)plan
   POST /api/github     {"slug", "action": init|publish|push}
   POST /api/agent      {"name", "task"} -> streamed agent run
@@ -56,7 +58,8 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "stt_model", "web_access", "web_search", "web_search_url",
                "web_allowlist", "github_access", "github_base_branch",
                "brain_journal", "autopilot_git", "autopilot_after_goal",
-               "autopilot_max_iterations", "autopilot_max_hours",
+               "autopilot_max_tasks", "autopilot_max_iterations",
+               "autopilot_max_hours", "autopilot_stall_limit",
                "context_tokens")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
@@ -95,8 +98,10 @@ def config_view():
         "gh": bool(eng.aria_git.gh()),
         "autopilot_git": cfg["autopilot_git"],
         "autopilot_after_goal": cfg["autopilot_after_goal"],
+        "autopilot_max_tasks": cfg["autopilot_max_tasks"],
         "autopilot_max_iterations": cfg["autopilot_max_iterations"],
         "autopilot_max_hours": cfg["autopilot_max_hours"],
+        "autopilot_stall_limit": cfg["autopilot_stall_limit"],
         "context_tokens": cfg["context_tokens"],
         "promotion_target": cfg["promotion_target"],
         "webhooks": sorted(cfg["webhooks"]),
@@ -214,12 +219,14 @@ class Handler(BaseHTTPRequestHandler):
             eng._project_dir(slug)
             state = ap._state(slug)
             state.pop("run_started", None)
+            plan = ap._with_decisions(ap._plan(slug), ap._auto(slug))
             self.send_json({"slug": slug, "state": state,
                             "activity": ap.activity(slug, limit=60),
                             "live": ap.live(slug),
                             "tasks": [{k: t.get(k) for k in
-                                       ("id", "status", "attempts")}
-                                      for t in ap._plan(slug)["tasks"]]})
+                                       ("id", "status", "attempts",
+                                        "needs_human")}
+                                      for t in plan["tasks"]]})
         elif path == "/api/file":
             proj = eng._project_dir(arg("slug")).resolve()
             target = (proj / arg("path")).resolve()
@@ -335,6 +342,14 @@ class Handler(BaseHTTPRequestHandler):
             state = dict(state)
             state.pop("run_started", None)
             self.send_json({"ok": True, "state": state})
+        elif path in ("/api/approve-task", "/api/skip-task"):
+            # the owner's answer on a task that waits for them
+            done = eng.autopilot_decide(
+                text("slug").lower(), text("id"),
+                approve=path == "/api/approve-task", note=text("note"),
+                via="ui")
+            self.send_json({"ok": True, done["answer"]: done["task"],
+                            **done})
         elif path == "/api/plan":
             self.plan_project(body)
         elif path == "/api/github":

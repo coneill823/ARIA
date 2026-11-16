@@ -1347,6 +1347,13 @@ INTENT_APPROVE = re.compile(
     r"(?:plan\s+for\s+)?(.+?)"
     r"(\s+and\s+(?:start|begin|go|work on it|get (?:to work|going)))?\s*$",
     re.I)
+# the owner's answer on a task that waits for them: "approve task t5 in
+# larder: call it Larder", "skip t7 in larder because there is no budget"
+INTENT_TASK = re.compile(
+    r"^\s*(approve|allow|green\s?light|go ahead with|skip|decline|reject|"
+    r"refuse)\s+(?:the\s+)?(?:task\s+(?:number\s+)?(t?\d+)|(t\d+))\b"
+    r"(?:\s+(?:in|on|of|for)\s+(?:the\s+)?(.+?))?"
+    r"\s*(?:(?::|,|—|\bwith\b|\bbecause\b)\s*(.+))?$", re.I | re.S)
 INTENT_AUTOPILOT = re.compile(
     r"^\s*(?:work on|start (?:work(?:ing)? on|autopilot(?: on| for)?)|"
     r"autopilot|begin(?: work(?:ing)? on)?|resume(?: work(?:ing)? on)?|"
@@ -1426,6 +1433,8 @@ def command_phrases(cfg=None):
     out = ["capture <idea>", "run triage", "develop the plans",
            "approve <project>", "work on <project>",
            "stop working on <project>", "tell <project> to <guidance>",
+           "approve task <id> in <project>: <your decision>",
+           "skip task <id> in <project>",
            "status of <project>", "what changed in <project>",
            "ask the <agent> to <task>", "mission <agent> to <task>",
            "use skill <name>", "drop skill",
@@ -1503,6 +1512,23 @@ def detect_intent(text):
             return {"action": "github-push", "slug": slug}
     # commands that name a project: an unmatched name gets a straight "no
     # such project" rather than a chat model's improvisation
+    m = INTENT_TASK.match(text)
+    if m:
+        task_id = (m.group(2) or m.group(3)).lower()
+        task_id = task_id if task_id.startswith("t") else "t" + task_id
+        if m.group(4):
+            slug = match_project(m.group(4))
+            if not slug:
+                return {"action": "no-project", "said": m.group(4).strip()}
+        else:                 # no project named: the one where it is waiting
+            holding = [p["slug"] for p in list_projects()
+                       if any(g["id"] == task_id for g in p["needs_you"])]
+            slug = holding[0] if len(holding) == 1 else ""
+        return {"action": "task-decision", "slug": slug, "task": task_id,
+                "among": [] if slug or m.group(4) else holding,
+                "approve": not re.match(r"skip|decline|reject|refuse",
+                                        m.group(1), re.I),
+                "note": (m.group(5) or "").strip()}
     m = INTENT_APPROVE.match(text)
     if m:
         slug = match_project(m.group(1))
@@ -1638,6 +1664,36 @@ def perform(intent, source="chat"):
             out.update(slug=slug, say=say)
         except ValueError as exc:
             out.update(slug=slug, say=str(exc))
+    elif action == "task-decision":
+        slug, task_id = intent["slug"], intent["task"]
+        owed = [f"{g['id']} in {p['slug']} ({g['title']})"
+                for p in list_projects() for g in p["needs_you"]]
+        nothing = (f"No task {task_id} is waiting on you"
+                   + (f" in {slug}" if slug else "") + ". "
+                   + ("Waiting on you: " + "; ".join(owed[:4]) + "."
+                      if owed else "Nothing is waiting on you right now."))
+        if len(intent.get("among") or []) > 1:
+            out["say"] = (f"{task_id} is waiting in more than one project "
+                          f"({', '.join(intent['among'])}) — say which: "
+                          f"'approve task {task_id} in "
+                          f"{intent['among'][0]}'.")
+        elif not slug:
+            out["say"] = nothing
+        else:
+            try:
+                done = autopilot_decide(slug, task_id,
+                                        approve=intent["approve"],
+                                        note=intent.get("note", ""),
+                                        via=source)
+                out.update(slug=slug, task=task_id, say=(
+                    f"Approved — “{done['title']}” can run now"
+                    + (f", following your decision: {done['note']}"
+                       if done["note"] else "") + "."
+                    if intent["approve"] else
+                    f"Skipped — “{done['title']}” won't be done, and I'll "
+                    "plan around it."))
+            except ValueError:
+                out.update(slug=slug, say=nothing)
     elif action == "autopilot-start":
         slug = intent["slug"]
         try:
@@ -2574,6 +2630,7 @@ def list_projects():
                 except ValueError:
                     pass
             done = total = 0
+            gated = []
             if (auto / "plan.json").is_file():
                 try:
                     tasks = json.loads((auto / "plan.json").read_text(
@@ -2582,7 +2639,14 @@ def list_projects():
                                  if t.get("status") != "skipped"])
                     done = len([t for t in tasks
                                 if t.get("status") == "done"])
-                except ValueError:
+                    # waiting on the owner — minus what they have already
+                    # answered (an answer is a file until she folds it in)
+                    gated = [{"id": str(t.get("id")),
+                              "title": str(t.get("title", ""))}
+                             for t in tasks if t.get("status") == "todo"
+                             and t.get("needs_human") and not
+                             (auto / f"decision-{t.get('id')}.json").is_file()]
+                except (ValueError, AttributeError):
                     pass
             try:
                 approved = project_approved(d.name)
@@ -2595,7 +2659,7 @@ def list_projects():
                         "current": (state.get("current") or {}).get("title", ""),
                         "waiting": state.get("waiting", ""),
                         "failed": (state.get("stats") or {}).get("failed", 0),
-                        "done": done, "total": total,
+                        "done": done, "total": total, "needs_you": gated,
                         "has_plan": _project_doc(d, "proposed-plan") is not None})
     return out
 
@@ -2608,26 +2672,37 @@ def project_status_text(slug):
     if p is None:
         return f"I don't have a project called {slug}."
     name = slug.replace("-", " ")
+    gated = p["needs_you"]
+    needs = ""
+    if gated:
+        needs = (f" {len(gated)} task(s) need your decision: "
+                 + "; ".join(f"{g['title']} ({g['id']})" for g in gated[:3])
+                 + f". Say 'approve task {gated[0]['id']} in {slug}' — add "
+                   "your decision after a colon — or 'skip task "
+                   f"{gated[0]['id']} in {slug}'.")
     if p["autopilot"] == "running":
         say = (f"{name} is running, iteration {p['iteration']}: "
                f"{p['done']} of {p['total']} tasks done.")
-        if p["waiting"]:
+        if p["phase"] == "waiting" and gated:
+            say += " Everything that doesn't need you is done."
+        elif p["waiting"]:
             say += f" I'm waiting — {p['waiting']}."
         elif p["current"]:
             say += f" Right now I'm on: {p['current']}."
         elif p["phase"]:
             say += f" Currently {p['phase']}."
-        return say
-    if p["autopilot"] in ("stopped", "complete", "stalled"):
+        return say + needs
+    if p["autopilot"] in ("stopped", "complete", "stalled", "budget"):
         ending = {"stopped": "stopped at your request",
                   "complete": "finished — the goal is met",
                   "stalled": "paused itself because it stopped making "
-                             "progress"}[p["autopilot"]]
+                             "progress",
+                  "budget": "paused at the budget you set"}[p["autopilot"]]
         return (f"{name} {ending} after {p['iteration']} iteration(s) with "
                 f"{p['done']} tasks done"
                 + (f" and {p['failed']} it could not complete"
                    if p["failed"] else "")
-                + ". The final report is on the Projects page.")
+                + ". The final report is on the Projects page." + needs)
     if not p["approved"]:
         return (f"{name} has a proposed plan waiting for your approval — "
                 f"say 'approve {slug}' when you're happy with it."
@@ -2649,6 +2724,11 @@ def workspace_status_text():
         parts.append(f"{len(waiting)} plan(s) are waiting for your approval: "
                      + ", ".join(p["slug"].replace("-", " ") for p in waiting)
                      + ".")
+    for p in projects:              # decisions owed on projects not running
+        if p["needs_you"] and p["autopilot"] != "running":
+            parts.append(f"{p['slug'].replace('-', ' ')} has "
+                         f"{len(p['needs_you'])} task(s) waiting for your "
+                         "decision.")
     b = board()
     if b["inbox"]:
         parts.append(f"{len(b['inbox'])} note(s) are in the inbox.")
@@ -2775,6 +2855,12 @@ def autopilot_steer(slug, text, via="chat"):
     return _autopilot().steer(slug, text, via=via)
 
 
+def autopilot_decide(slug, task_id, approve=True, note="", via="app"):
+    """The owner's answer on a task that waits for them."""
+    return _autopilot().decide(slug, task_id, approve=approve, note=note,
+                               via=via)
+
+
 def autopilot_tick(slug, emit):
     return _autopilot().tick(slug, emit)
 
@@ -2825,6 +2911,12 @@ def config_set(key, value):
             raise ValueError(f"{key} must be a number")
         if number < 0:
             raise ValueError(f"{key} cannot be negative")
+        if key == "autopilot_stall_limit" and number < 1:
+            raise ValueError("autopilot_stall_limit must be at least 1 — "
+                             "one dry batch is the soonest she can notice")
+        if key in ("autopilot_max_tasks", "autopilot_max_iterations",
+                   "autopilot_stall_limit"):
+            number = int(number)                  # whole tasks, whole batches
         value = str(int(number)) if number == int(number) else str(number)
     elif "#" in value:
         raise ValueError(f"{key} cannot contain '#'")

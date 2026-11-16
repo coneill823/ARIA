@@ -19,6 +19,10 @@ Steering the mock from a test: put a marker in a task title —
 Environment:
   MOCK_BATCHES   how many build batches the planner offers (default 2)
   MOCK_DELAY     seconds between streamed chunks (default 0)
+  MOCK_GATE      the first batch also holds a task marked needs_human and
+                 one that depends on it
+  MOCK_REPEAT    the second batch proposes the first batch's work again
+  MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
 """
 
 import json
@@ -267,6 +271,31 @@ def plan_batch(prompt):
     marker = os.environ.get("MOCK_TITLE_MARKER", "")
     if marker and n == 0:
         tasks[1]["title"] += " " + marker
+    if os.environ.get("MOCK_GATE") and n == 0:
+        tasks += [
+            {"id": "h", "title": "Choose the paid data provider",
+             "detail": "Record the chosen provider in docs/provider.md.",
+             "why": "it costs money every month — that is the owner's call",
+             "agent": "planner", "skills": [], "model": "",
+             "phase": "decisions", "est_hours": 1, "depends_on": [],
+             "reads": [], "research": False, "needs_human": True,
+             "done_when": "docs/provider.md names the provider"},
+            {"id": "i", "title": "Describe the provider setup",
+             "detail": "Write docs/provider-setup.md for the chosen "
+                       "provider.",
+             "why": "follows from the owner's choice",
+             "agent": "scribe", "skills": [], "model": "fast",
+             "phase": "docs", "est_hours": 1, "depends_on": ["h"],
+             "reads": [], "research": False,
+             "done_when": "docs/provider-setup.md exists"}]
+    if os.environ.get("MOCK_REPEAT") and n == 1:
+        tasks.insert(0, {
+            "id": "r", "title": "Write the design note",
+            "detail": "Produce docs/design.md again.",
+            "why": "the planner forgot it was done",
+            "agent": "planner", "skills": [], "model": "", "phase": "design",
+            "est_hours": 1, "depends_on": [], "reads": [], "research": False,
+            "done_when": "docs/design.md exists"})
     return {"tasks": tasks, "project_complete": False}
 
 
@@ -282,6 +311,10 @@ def task_output(prompt):
     path = paths[0]
     cited = " It draws on the research provided [1]." \
         if "RESEARCH MATERIAL" in prompt else ""
+    owner = re.search(r"THE OWNER APPROVED THIS TASK WITH THIS DECISION: (.+)",
+                      prompt)
+    if owner:
+        cited += f" Decision followed: {owner.group(1).strip()}."
     if path.endswith(".py"):
         if "[syntaxerror]" in title and attempt == 1:
             body = "def run(:\n    return 1\n"
@@ -331,7 +364,7 @@ def verdict(prompt):
     title = title.group(1).strip() if title else ""
     key = "verify/" + title
     STATE["attempts"][key] = n = STATE["attempts"].get(key, 0) + 1
-    if "[fail]" in title:
+    if "[fail]" in title or os.environ.get("MOCK_FAIL_ALL"):
         return {"pass": False, "feedback": "the work does not meet the "
                                            "criterion (mock: always fails)"}
     if "[flaky]" in title and n == 1:

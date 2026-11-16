@@ -63,6 +63,7 @@ talk to her:
 | `work on <project>` | Autopilot: she takes stock, plans, and works task after task. |
 | `status of <project>` · `what are you working on` | Where things stand, in a sentence. |
 | `tell <project> to <guidance>` | Redirects her without stopping. |
+| `approve task t5 in <project>: <your decision>` · `skip task t5 in <project>` | Answers a task she marked as yours to decide. |
 | `stop working on <project>` | She finishes the step in flight and writes the final report. |
 | `what changed in <project>` | The latest verified changes. |
 | `search for <topic>` · `read <url>` | The live web, answered with sources. |
@@ -98,6 +99,7 @@ bin/aria auto                        # triage + plan everything new
 bin/aria projects                    # every project and what she is doing
 bin/aria approve <slug>              # the human gate
 bin/aria autopilot <slug> start      # ...stop | status | steer "…" | run
+bin/aria autopilot <slug> approve-task t5 "decision"   # ...or skip-task
 bin/aria adopt <repo|folder> "goal"  # put an existing codebase under autopilot
 bin/aria search "query"              # web search      (fetch <url> reads a page)
 bin/aria brain "text"                # a note in your Obsidian vault
@@ -188,7 +190,9 @@ Pick a project, approve its plan, press Start.
 - **Report** — the final report of the last run.
 
 **Steer** gives her guidance without stopping; **Stop** lets her finish
-the step in flight and write the report. The full story:
+the step in flight and write the report. A task that is yours to decide —
+spending money, a choice that cannot be undone — is marked **needs you**
+and waits for your answer while the rest carries on. The full story:
 **[docs/AUTOPILOT.md](docs/AUTOPILOT.md)**.
 
 ### Pipeline — watch an idea become a plan
@@ -260,7 +264,7 @@ says. Details and reasoning: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
 | **Git** | `autopilot_git` (on) | A commit per verified task, on `aria/autopilot`, when a project is its own repository | Commit to your base branch; stage files she did not write |
 | **GitHub** | `github_access` (off) | A private repo per project, the branch pushed, a pull request kept open | Push to the base branch; force anything; merge |
 | **Obsidian** | `obsidian_vault` (unset) | Project hubs, dictated notes, saved research, a daily journal | Write outside `<vault>/ARIA/` |
-| **Alexa** | `aria voice-gateway` | Everything above, by voice, from any Echo | Approve a plan or push to GitHub by voice |
+| **Alexa** | `aria voice-gateway` | Everything above, by voice, from any Echo | Approve a plan, answer a task that waits on you, or push to GitHub by voice |
 | **Webhooks** | `webhooks:` (none) | n8n flows, Home Assistant, deploy hooks — "trigger deploy-site" | Reach any URL you did not name |
 
 With `web_access` on, search queries leave your machine; everything else
@@ -436,7 +440,8 @@ to `pip install` or build.
    `approved: true` is written only by an explicit act of yours (the
    Approve button, saying or typing "approve …", `aria approve`, or
    `/approve` in Claude Code). Autopilot refuses anything else, and a
-   voice assistant cannot approve.
+   voice assistant cannot approve. Inside a run, a task marked as yours
+   to decide waits for your answer in the same way.
 3. **Triage never guesses** — items it can't classify are marked
    `type: unclear` with clarifying questions, and wait for you.
 4. **Only verified work stays** — a rejected attempt is rolled back; the

@@ -11,9 +11,10 @@ capability:
   Obsidian brain, board+ledger, chat persona, agents (core + library),
   skills, missions, the human gate, promotion, the full autopilot loop
   (assess -> plan -> execute -> verify -> reflect -> report, plus stop,
-  steering, rejected work and a model-server outage), git commits, web
-  access (against a local fixture — the self-test never touches the
-  internet), crew + OpenHands generation, the web server and its API.
+  steering, rejected work, a model-server outage, a task that waits on
+  the owner, budgets and the stall limit), git commits, web access
+  (against a local fixture — the self-test never touches the internet),
+  crew + OpenHands generation, the web server and its API.
 
 By default the model calls go to your REAL configured backends (about 25
 calls; a few minutes on a local 8B). With --mock they go to a built-in
@@ -25,6 +26,7 @@ PASS/FAIL per check; non-zero exit if anything required failed.
 --keep leaves the sandbox on disk for inspection.
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -147,7 +149,8 @@ def main():
                promotion_target="./active-projects", web_search="auto",
                web_search_url="", web_allowlist="",
                autopilot_after_goal="stop", autopilot_max_iterations="0",
-               autopilot_max_hours="0")
+               autopilot_max_hours="0", autopilot_max_tasks="0",
+               autopilot_stall_limit="3")
 
     if MOCK:
         port = free_port()
@@ -181,6 +184,36 @@ def main():
             if seq[-1] in until:
                 break
         return seq
+
+    @contextlib.contextmanager
+    def scripted_model(**env):
+        """Point the engine at a second mock whose behaviour `env` scripts
+        (see aria-mock-llm), for the length of the block."""
+        port = free_port()
+        mock = subprocess.Popen(
+            [sys.executable, os.path.join(sandbox, "bin", "aria-mock-llm"),
+             str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, **env))
+        procs.append(mock)
+        wait_http(f"http://127.0.0.1:{port}/api/tags")
+        old = os.environ["ARIA_OLLAMA_URL"]
+        os.environ["ARIA_OLLAMA_URL"] = f"http://127.0.0.1:{port}"
+        try:
+            yield
+        finally:
+            os.environ["ARIA_OLLAMA_URL"] = old
+            mock.terminate()
+
+    def started_project(slug):
+        """A fresh project: planned, approved, autopilot engaged."""
+        note = os.path.join(sandbox, "pipeline/01-processing", slug + ".md")
+        open(note, "w").write(
+            f"---\nslug: {slug}\nstatus: processing\ntype: project\n"
+            f"captured: 2026-11-14\n---\n\n## Raw capture\n\n{TEST_IDEA}\n")
+        eng.develop_run(quiet, slugs=[slug])
+        eng.approve_project(slug, via="selftest")
+        eng.autopilot_start(slug, via="selftest")
+        return eng._project_dir(slug)
 
     # ---- engine-level checks ----------------------------------------
     def c_config():
@@ -257,12 +290,21 @@ def main():
                  ("note to brain: remember the milk", "brain-note"),
                  ("work on a project that does not exist", "no-project"),
                  ("status of nothing at all", "no-project"),
+                 ("approve task t3", "task-decision"),
+                 ("skip task 7 because there is no budget", "task-decision"),
+                 ("approve t2 in a project that does not exist", "no-project"),
                  ("how is your day going", None),
                  ("what is triage, exactly?", None),
                  ("tell me a joke", None)]
         for text, want in cases:
             got = (eng.detect_intent(text) or {}).get("action")
             assert got == want, f"'{text}' -> {got}, wanted {want}"
+        got = eng.detect_intent("approve task 4: use the free tier")
+        assert (got["task"], got["approve"], got["note"]) == \
+            ("t4", True, "use the free tier"), got
+        got = eng.detect_intent("decline t9, too expensive")
+        assert (got["task"], got["approve"], got["note"]) == \
+            ("t9", False, "too expensive"), got
         agents = {a["name"] for a in eng.list_agents()}
         if "critic" in agents:
             got = (eng.detect_intent("ask the critic to review it") or {})
@@ -290,7 +332,7 @@ def main():
         got = eng.detect_intent("read http://127.0.0.1:8700/api/board")
         assert got and got["action"] == "fetch", got
         set_config(sandbox, web_access="false")
-        return f"{len(cases)+5} spoken commands routed correctly"
+        return f"{len(cases)+7} spoken commands routed correctly"
     check("spoken commands (no-LLM)", c_intents)
 
     def c_project_matching():
@@ -317,7 +359,7 @@ def main():
         assert eng.config()["context_tokens"] == 4096
         eng.config_set("context_tokens", "8192")
         for key, bad in (("web_search", "bogus"), ("context_tokens", "-1"),
-                         ("not_a_key", "x")):
+                         ("autopilot_stall_limit", "0"), ("not_a_key", "x")):
             try:
                 eng.config_set(key, bad)
                 raise AssertionError(f"config_set accepted {key}={bad}")
@@ -788,6 +830,133 @@ def main():
                 "parse was rolled back, retried with the error, then kept")
     check("autopilot — failures handled", c_autopilot_rejects)
 
+    def c_owner_gate():
+        """A task the planner marks needs_human waits for the owner while
+        everything else carries on; their answer travels with the work."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script a task that needs you")
+        slug = "selftest-owner-gate"
+        with scripted_model(MOCK_GATE="1", MOCK_REPEAT="1"):
+            proj = started_project(slug)
+            logs, seq = [], []
+            for _ in range(120):
+                seq.append(ap.tick(slug, lambda e: logs.append(e.get("log")
+                                                               or "")))
+                if seq[-1] in ("waiting", "idle", "finalized", "complete"):
+                    break
+            st, plan = ap._state(slug), ap._plan(slug)
+            gate = next(t for t in plan["tasks"] if t.get("needs_human"))
+            behind = next(t for t in plan["tasks"]
+                          if gate["id"] in t["depends_on"])
+            rest = [t for t in plan["tasks"] if t not in (gate, behind)]
+            assert seq[-1] == "waiting" and st["status"] == "running" \
+                and st["phase"] == "waiting", (seq, st["phase"])
+            assert gate["status"] == behind["status"] == "todo"
+            assert rest and all(t["status"] == "done" for t in rest) \
+                and st["iteration"] >= 2, \
+                "she did not carry on around the task that waits"
+            titles = [t["title"] for t in plan["tasks"]]
+            assert titles.count("Write the design note") == 1 \
+                and any("proposed again" in line for line in logs), \
+                "finished work was planned a second time"
+            calls = st["stats"]["calls"]
+            assert [ap.tick(slug, quiet) for _ in range(3)] == ["waiting"] * 3
+            assert ap._state(slug)["stats"]["calls"] == calls, \
+                "waiting on the owner cost model calls"
+            mine = next(p for p in eng.list_projects() if p["slug"] == slug)
+            assert [g["id"] for g in mine["needs_you"]] == [gate["id"]]
+            assert "need your decision" in eng.project_status_text(slug)
+            try:
+                eng.autopilot_decide(slug, behind["id"])
+                raise AssertionError("answered a task that was not waiting")
+            except ValueError:
+                pass
+            intent = eng.detect_intent(
+                f"approve task {gate['id']} in {slug}: use the free tier")
+            assert intent and intent["action"] == "task-decision" \
+                and intent["slug"] == slug, intent
+            out = eng.perform(intent, source="selftest")
+            assert out["say"].startswith("Approved"), out
+            drive(slug)
+            by = {t["id"]: t for t in ap._plan(slug)["tasks"]}
+            assert by[gate["id"]]["status"] == "done" \
+                and by[behind["id"]]["status"] == "done", "still held"
+            assert "Decision followed: use the free tier" in \
+                (proj / "docs" / "provider.md").read_text(), \
+                "the owner's decision never reached the agent"
+            report = (proj / "autopilot" / "FINAL-REPORT.md").read_text()
+            assert "Your decision:** approved via selftest" in report
+            assert ap._state(slug)["status"] == "complete"
+        # declined: it is not attempted, and what built on it goes with it
+        slug = "selftest-owner-decline"
+        with scripted_model(MOCK_GATE="1"):
+            proj = started_project(slug)
+            drive(slug, limit=4, until=("task",))
+            gate = next(t for t in ap._plan(slug)["tasks"]
+                        if t.get("needs_human"))
+            eng.autopilot_decide(slug, gate["id"], approve=False,
+                                 note="no budget", via="selftest")
+            drive(slug)
+            st = ap._state(slug)
+            gate = next(t for t in ap._plan(slug)["tasks"]
+                        if t["id"] == gate["id"])
+            assert gate["status"] == "skipped" \
+                and "declined by you" in gate["feedback"], gate
+            assert st["status"] == "complete" and st["dry"] == 0, st["status"]
+            assert not (proj / "docs" / "provider.md").exists()
+            report = (proj / "autopilot" / "FINAL-REPORT.md").read_text()
+            assert "declined by you — no budget; it was not attempted" in report
+        return ("worked around the task that needed me, waited without "
+                "calling a model, ran it on my decision and recorded it; a "
+                "declined task was dropped; repeats of finished work left out")
+    check("autopilot — a task that waits on you", c_owner_gate)
+
+    def c_guardrails():
+        """A run ends itself at the budget the owner set, and when it has
+        stopped making progress — each time with its report."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script a run that stalls")
+        slug = "selftest-budget"
+        set_config(sandbox, autopilot_max_tasks="2")
+        try:
+            proj = started_project(slug)
+            drive(slug)
+            st = ap._state(slug)
+            assert st["status"] == "budget" and st["run_tasks"] == 2 \
+                and st["stats"]["done"] == 2, (st["status"], st["stats"])
+            report = (proj / "autopilot" / "FINAL-REPORT.md").read_text()
+            assert "paused at its budget" in report \
+                and "2 task(s)" in st["stop_reason"]
+            assert "budget you set" in eng.project_status_text(slug)
+            eng.autopilot_start(slug, via="selftest")   # new run, new budget
+            drive(slug)
+            st = ap._state(slug)
+            assert st["status"] == "budget" and st["stats"]["done"] == 4
+        finally:
+            set_config(sandbox, autopilot_max_tasks="0")
+        slug = "selftest-stall"
+        set_config(sandbox, autopilot_stall_limit="2")
+        try:
+            with scripted_model(MOCK_FAIL_ALL="1", MOCK_BATCHES="6"):
+                proj = started_project(slug)
+                drive(slug, limit=200)
+                st = ap._state(slug)
+                assert st["status"] == "stalled" and st["dry"] == 2 \
+                    and "2 batch(es) in a row" in st["stop_reason"], \
+                    (st["status"], st.get("stop_reason"))
+                assert st["stats"]["done"] == 0 \
+                    and not (proj / "docs" / "design.md").exists(), \
+                    "rejected work was left in the project"
+                report = (proj / "autopilot" / "FINAL-REPORT.md").read_text()
+                assert "paused itself (stalled)" in report \
+                    and "## Not completed" in report
+        finally:
+            set_config(sandbox, autopilot_stall_limit="3")
+        return ("paused at a 2-task budget with its report, and again on "
+                "the next run; paused as stalled after 2 dry batches with "
+                "nothing rejected left behind")
+    check("autopilot — budgets and the stall limit", c_guardrails)
+
     def c_git():
         slug = state.get("rejects") or state.get("active")
         if not slug:
@@ -947,6 +1116,9 @@ def main():
                              body={"text": f"approve {gated}"})
             assert code == 200 and "in the app" in out["reply"], out
             assert not eng.project_approved(gated), "voice opened the gate"
+            code, out = call(token="selftest-secret",
+                             body={"text": f"approve task t1 in {gated}"})
+            assert code == 200 and "in the app" in out["reply"], out
             # the Alexa skill's Lambda, fed simulated Alexa requests
             import importlib.util
             os.environ.update(
@@ -1094,6 +1266,10 @@ def main():
                 with urllib.request.urlopen(
                         f"{base}/api/project/live?slug={slug}", timeout=15) as r:
                     json.load(r)
+                for route in ("/api/approve-task", "/api/skip-task"):
+                    code, body = post(route, {"slug": slug, "id": "t1"})
+                    assert code == 400 and "waiting on you" in body, \
+                        (route, code, body[:120])
                 try:
                     urllib.request.urlopen(
                         f"{base}/api/file?slug={slug}&path=../../system/"
@@ -1108,7 +1284,8 @@ def main():
             except urllib.error.HTTPError as exc:
                 assert exc.code == 404
             return "state, board, health, config, agents, skills, " \
-                   "projects, project view; path traversal refused"
+                   "projects, project view; task answers and path " \
+                   "traversal refused"
         check("api endpoints", c_api)
 
         def c_chat_http():

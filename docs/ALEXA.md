@@ -33,9 +33,10 @@ the right secret — and nothing else.
 | "…to **run triage**" / "…to **develop the plans**" | pipeline stages, in the background |
 | "…**what** / **how** / **why** / **is** …" | plain conversation |
 
-Two things she will not take by voice, even with the right secret:
-**approving a plan** and **pushing to GitHub**. The approval is the one
-decision that is yours; a voice in the room should not be able to make it.
+Three things she will not take by voice, even with the right secret:
+**approving a plan**, **answering a task that waits on your decision**,
+and **pushing to GitHub**. Those decisions are yours; a voice in the room
+should not be able to make them.
 
 ## 1. Start the gateway
 

@@ -11,6 +11,8 @@ itself and hands everything below to this script:
   approve <slug>                 THE HUMAN GATE: approve a proposed plan
   adopt <repo|folder> "goal"     put an existing codebase under autopilot
   autopilot <slug> start|stop|status|run|steer "guidance"
+  autopilot <slug> approve-task <id> ["your decision"]
+  autopilot <slug> skip-task <id> ["why"]      a task that waits on you
   plan <slug>                    assess + (re)plan a project now
   search "query"                 web search
   fetch <url>                    read a web page as text
@@ -87,9 +89,11 @@ def cmd_projects(_args):
         if p["autopilot"] == "running":
             line += (f" · iteration {p['iteration']} · {p['done']}/"
                      f"{p['total']} tasks"
-                     + (f" · {p['waiting']}" if p["waiting"] else
+                     + (f" · waiting {p['waiting']}" if p["waiting"] else
                         (f" · now: {p['current']}" if p["current"] else "")))
         print(line)
+        for g in p["needs_you"]:
+            print(f"{'':34} needs you: {g['id']} — {g['title']}")
 
 
 def cmd_approve(args):
@@ -114,7 +118,8 @@ def cmd_adopt(args):
 
 
 def cmd_autopilot(args):
-    need(args, 1, 'autopilot <slug> start|stop|status|run|steer "guidance"')
+    need(args, 1, 'autopilot <slug> start|stop|status|run|steer "guidance"'
+                  ' | approve-task <id> ["decision"] | skip-task <id> ["why"]')
     slug, action = args[0], (args[1] if len(args) > 1 else "status")
     if action in ("start", "run"):
         state = eng.autopilot_start(slug, via="cli")
@@ -142,6 +147,13 @@ def cmd_autopilot(args):
         need(args, 3, 'autopilot <slug> steer "guidance"')
         eng.autopilot_steer(slug, " ".join(args[2:]), via="cli")
         print("noted — unstarted work is replanned around it")
+    elif action in ("approve-task", "skip-task"):
+        need(args, 3, f'autopilot <slug> {action} <task-id> ["note"]')
+        done = eng.autopilot_decide(slug, args[2],
+                                    approve=action == "approve-task",
+                                    note=" ".join(args[3:]), via="cli")
+        print(f"{done['answer']}: {done['task']} — {done['title']}"
+              + (f" ({done['note']})" if done["note"] else ""))
     else:
         print(eng.project_status_text(slug))
         state = eng._auto_state(slug)
@@ -154,7 +166,8 @@ def cmd_plan(args):
     plan = eng.autopilot_plan(args[0], log)
     for t in plan["tasks"]:
         print(f"{t['status']:10} {t['id']:5} {t['agent']:14} "
-              f"{(t['model'] or '-'):8} {t['title']}")
+              f"{(t['model'] or '-'):8} {t['title']}"
+              + ("  [needs you]" if t.get("needs_human") else ""))
 
 
 def cmd_search(args):

@@ -69,8 +69,10 @@ function render() {
       choice('autopilot_after_goal', 'When the goal is met', [
         ['improve', 'keep improving until I stop her'], ['stop', 'write the report and stop']],
         'Either way the goal is audited against the requirements first.'),
-      text('autopilot_max_hours', 'Stop after (hours)', '0 = no limit. She finishes the step in flight and writes the report.'),
-      text('autopilot_max_iterations', 'Stop after (batches)', '0 = no limit.')),
+      text('autopilot_max_hours', 'Stop after (hours)', '0 = no limit. At a budget she finishes the step in flight, writes the report and pauses; resuming is a new run with a fresh budget.'),
+      text('autopilot_max_tasks', 'Stop after (tasks)', '0 = no limit. Counts tasks finished in one run, verified or failed.'),
+      text('autopilot_max_iterations', 'Stop after (batches)', '0 = no limit.'),
+      text('autopilot_stall_limit', 'Pause when stuck after', 'Batches in a row that complete nothing before she pauses herself as stalled.')),
     section('Pipeline', 'What happens when an idea is captured.',
       toggle('auto_pipeline', 'Auto-pipeline', 'triage and plan every new idea straight away — your approval is still required before any work starts')),
     h('div', { class: 'savebar' },
@@ -87,8 +89,10 @@ async function load() {
 async function save() {
   const body = {};
   for (const [key, read] of Object.entries(fields)) body[key] = read();
-  for (const key of ['context_tokens', 'autopilot_max_hours', 'autopilot_max_iterations'])
+  for (const key of ['context_tokens', 'autopilot_max_hours', 'autopilot_max_tasks',
+                     'autopilot_max_iterations'])
     if (body[key] === '') body[key] = '0';
+  if (body.autopilot_stall_limit === '') delete body.autopilot_stall_limit;
   if (!body.github_base_branch) delete body.github_base_branch;
   try {
     cfg = await api.post('/api/config', body);
