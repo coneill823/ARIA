@@ -120,8 +120,11 @@ def config():
         "autopilot_git": flag("autopilot_git", "true"),
         "autopilot_after_goal": find("autopilot_after_goal", "improve")
             .split(" #")[0].strip().lower(),
+        "autopilot_max_tasks": int(number("autopilot_max_tasks", 0)),
         "autopilot_max_iterations": int(number("autopilot_max_iterations", 0)),
         "autopilot_max_hours": number("autopilot_max_hours", 0),
+        "autopilot_stall_limit": max(
+            1, int(number("autopilot_stall_limit", 3))),
         "autopilot_idle_minutes": number("autopilot_idle_minutes", 30),
     }
 
@@ -2793,8 +2796,9 @@ _CHOICE_KEYS = {
                    "none"},
     "autopilot_after_goal": {"improve", "stop"},
 }
-_NUMBER_KEYS = {"context_tokens", "autopilot_max_iterations",
-                "autopilot_max_hours", "autopilot_idle_minutes"}
+_NUMBER_KEYS = {"context_tokens", "autopilot_max_tasks",
+                "autopilot_max_iterations", "autopilot_max_hours",
+                "autopilot_stall_limit", "autopilot_idle_minutes"}
 _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "web_search_url", "web_allowlist", "github_base_branch",
               "promotion_target"}

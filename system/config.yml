@@ -153,10 +153,18 @@ aria:
   # stop = write the final report and stand down.
   autopilot_after_goal: improve
 
-  # Optional budgets for one run — 0 means no limit. When either is
-  # reached she finishes the step in flight and writes the report.
+  # Optional budgets for one run, 0 = no limit: task attempts, batches,
+  # wall-clock hours. When one is reached she finishes the step in flight,
+  # writes the report and stands down as "budget reached". Starting her
+  # again is a new run with a new budget.
+  autopilot_max_tasks: 0
   autopilot_max_iterations: 0
   autopilot_max_hours: 0
+
+  # She pauses herself as "stalled" — and writes the report — after this
+  # many batches in a row that complete nothing, or this many plans in a
+  # row that add nothing.
+  autopilot_stall_limit: 3
 
   # Minutes a fast/smart model may stay silent before an attempt is
   # abandoned and retried. The deep tier and hand-picked models are never
