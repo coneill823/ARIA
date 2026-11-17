@@ -177,9 +177,14 @@ def main():
     for sub in ("bin", "system", "ui", "integrations"):
         shutil.copytree(os.path.join(REAL_ROOT, sub),
                         os.path.join(sandbox, sub), symlinks=False,
+                        # …minus what belongs to the real, running
+                        # A.R.I.A.: her voice secret, her loaded giants,
+                        # and the record of her server (the sandbox must
+                        # never find — and restart — the real one)
                         ignore=shutil.ignore_patterns("__pycache__",
                                                       "voice-token",
                                                       "garage",
+                                                      "server.json",
                                                       "config.backup-*"))
     for d in ("pipeline/00-inbox", "pipeline/01-processing",
               "pipeline/02-potential-projects", "pipeline/knowledge/lists",
