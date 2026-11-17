@@ -207,7 +207,7 @@ def fetch(url, cfg, limit=6000, timeout=20):
     """Read one public web page as text."""
     if not cfg.get("web_access"):
         raise WebError("web access is off — turn it on in Settings "
-                       "(aria.web_access in system/config.yml)")
+                       "(or: aria settings set web_access true)")
     url, parts = check_url(url, cfg)
     for _hop in range(MAX_REDIRECTS + 1):
         try:
@@ -495,7 +495,7 @@ def search(query, cfg, limit=6):
     raises WebError only when every provider failed."""
     if not cfg.get("web_access"):
         raise WebError("web access is off — turn it on in Settings "
-                       "(aria.web_access in system/config.yml)")
+                       "(or: aria settings set web_access true)")
     query = " ".join(query.split())[:300]
     if not query:
         raise WebError("empty search")

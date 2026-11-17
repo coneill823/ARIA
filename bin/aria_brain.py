@@ -29,7 +29,7 @@ def vault_dir(path):
     """The configured vault as a Path, or BrainError saying what to fix."""
     if not path:
         raise BrainError("no Obsidian vault set — add its path in Settings "
-                         "(aria.obsidian_vault in system/config.yml)")
+                         "(or: aria settings set obsidian_vault <folder>)")
     vault = Path(os.path.expanduser(str(path)))
     if not vault.is_dir():
         raise BrainError(f"Obsidian vault not found: {vault}")

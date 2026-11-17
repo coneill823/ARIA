@@ -14,7 +14,8 @@ plan" stage. For each idea:
 1. Create the project folder `pipeline/02-potential-projects/<slug>/` and
    move the idea note into it as `idea.md` (keep the raw capture verbatim).
 2. Delegate to the `aria-researcher` subagent (check
-   `system/config.yml → research_web_access` first): it investigates prior
+   the `research_web_access` setting first — `system/config.local.yml`
+   wins over `system/config.yml`): it investigates prior
    art ("this already exists"), candidate tools and frameworks ("maybe use
    these tools, try this website"), rough market/audience notes, feasibility,
    and open questions — and writes `research.md` in the project folder, with

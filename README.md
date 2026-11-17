@@ -117,6 +117,8 @@ bin/aria app                         # the app in a window of her own   (ui = ju
 bin/aria voice-gateway               # the authenticated door for Alexa
 bin/aria install-service             # always-on: server at login + hourly pipeline
 bin/aria install-skills              # skills and specialist agents (ECC, Anthropic…)
+bin/aria settings                    # your own settings   (set <key> <value> | unset | import)
+bin/aria update                      # newest version in, your settings kept, server restarted
 bin/aria test --mock                 # self-test in seconds, no GPU needed
 bin/aria doctor                      # sanity-check the setup
 ```
@@ -142,8 +144,14 @@ GitHub push, adopting a repository, the agent library, the voice gateway
 with simulated Alexa requests, and every page and endpoint of the app.
 `--mock` proves the plumbing on any machine; without it you prove your
 models too. The self-test never touches the internet, never loads one of
-your real models, and never puts anything on your screen. Run it after
-every `git pull`.
+your real models, never fires one of your webhooks and never puts
+anything on your screen. Run it after every `aria update`.
+
+On real models the autopilot check stops after the first task or two, so
+a small model may get nothing verified in that time — the check says so
+(`0 verified in 3 attempt(s)`) and still passes: having work sent back is
+the loop doing its job. What it tells you is that the **smart** tier
+deserves a stronger model.
 
 If the only failure is **backends reachable**, the model server is not
 running: `sudo systemctl enable --now ollama` (or `ollama serve`).
@@ -156,6 +164,45 @@ background missions — running from login, and **aria-auto.timer** runs
 the pipeline every hour, so ideas dropped into the inbox (from your phone
 via Obsidian sync, or any file drop) become proposed plans while you're
 away. Pause with `systemctl --user stop aria-auto.timer`.
+
+### Updating — and where your settings live
+
+```bash
+bin/aria update            # the newest version of the branch you are on
+bin/aria update main       # …or move to another branch
+```
+
+It fast-forwards this copy, lists what changed and restarts the always-on
+server — unless autopilot is in the middle of a step, in which case it
+leaves her running and tells you how to restart when it suits you
+(`--restart` to do it anyway). It never merges, never discards a change
+of yours: if a file you edited is also changed upstream it stops and says
+which.
+
+Your settings are not part of what gets updated. `system/config.yml`
+holds the defaults and the explanation of every key; your own values
+live in **`system/config.local.yml`**, which git ignores and which wins
+wherever it sets a key. The Settings page writes there, and so does the
+command line:
+
+```bash
+bin/aria settings                          # what you have changed
+bin/aria settings set smart ollama/qwen3:30b
+bin/aria settings unset smart              # back to the default
+```
+
+If you edited `system/config.yml` by hand — the thing `git pull` trips
+over with *"your local changes would be overwritten"* — `aria update`
+moves those edits into your own file first and keeps a copy of the file
+as you had it (`system/config.backup-….yml`). Coming from a version
+without `aria update`:
+
+```bash
+cp system/config.yml ~/aria-config-backup.yml   # your edited settings
+git checkout -- system/config.yml               # let the new one in
+git pull                                        # or: git checkout <branch>
+bin/aria settings import ~/aria-config-backup.yml
+```
 
 ## The app
 
@@ -298,7 +345,9 @@ speaking.
 ### Settings
 
 Models, internet, the Obsidian brain, Git & GitHub and autopilot's
-behaviour, without touching YAML (it is all `system/config.yml`).
+behaviour, without touching YAML. What you save goes into
+`system/config.local.yml` — your own file, which updates never touch;
+`system/config.yml` keeps the defaults and explains every key.
 
 ## What she can reach
 
@@ -346,7 +395,8 @@ guidance but cannot run the scripts.
 
 ### Models — fast, smart, and deep tiers
 
-Every stage picks a tier from `system/config.yml` (editable in ⚙ Settings):
+Every stage picks a tier from your settings (⚙ Settings, or
+`aria settings set smart …`):
 **fast** (triage, chat), **smart** (plans, agents), **deep** (optional
 heavy thinker; agents opt in with `model: deep`). Each tier is
 `backend/model`, where a backend is Ollama or any OpenAI-compatible server.
@@ -383,8 +433,8 @@ all: **[docs/BIG-MODELS.md](docs/BIG-MODELS.md)**.
 
 ### Engines: local models vs Claude
 
-`bin/aria triage`, `develop` and `auto` run on the engine set in
-`system/config.yml → aria.engine`:
+`bin/aria triage`, `develop` and `auto` run on the `engine` setting
+(`aria settings set engine claude`):
 
 | | `ollama` (default) | `claude` |
 |---|---|---|
@@ -419,7 +469,7 @@ work it, and they share the same files:
   ```
 
 By default projects are promoted to `active-projects/` inside this repo.
-Point `system/config.yml → promotion_target` at e.g. `~/Projects` to give
+Point the `promotion_target` setting at e.g. `~/Projects` to give
 each one its own repository — that is what switches on a commit per task
 and lets `aria github publish` put it on GitHub.
 
@@ -433,7 +483,8 @@ aria/
 ├── CLAUDE.md                  # A.R.I.A.'s operating manual (read by Claude Code)
 ├── .claude/                   # slash commands, the pipeline subagents, settings
 ├── system/
-│   ├── config.yml             # models, reaches, autopilot, paths
+│   ├── config.yml             # every setting, explained — the defaults
+│   ├── config.local.yml       # your own values (ignored by git; they win)
 │   ├── agents/                # her standing team (markdown)
 │   ├── skill-sources.txt      # where skills and library agents come from
 │   └── templates/             # idea note, plan, requirements, PM, subagent, status

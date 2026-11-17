@@ -13,7 +13,8 @@ For each note:
 1. Delegate classification to the `aria-triage` subagent (parallelize across
    notes when there are several). It returns: `type`, `slug`, `confidence`,
    `reasoning`, and for tasks the best-matching list.
-2. Apply the outcome per `system/config.yml`:
+2. Apply the outcome per the settings (`system/config.yml`; where
+   `system/config.local.yml` sets a key, that wins):
    - **project** → set `type: project`, `status: processing`, assign `slug`,
      move the file to `pipeline/01-processing/<slug>.md`.
    - **task** → append a `- [ ]` line (with date) to the matching list in

@@ -1,4 +1,10 @@
-# A.R.I.A. pipeline configuration
+# A.R.I.A. pipeline configuration — the defaults, and what each setting does.
+#
+# Don't keep your own values here: this file is replaced when A.R.I.A. is
+# updated. Yours go in system/config.local.yml (same keys; whatever is set
+# there wins), which updates never touch. The Settings page writes there,
+# and so does:   aria settings set <key> <value>
+# If you did edit this file, `aria update` carries your edits over for you.
 aria:
   # Which engine bin/aria uses for the automated stages (triage, develop).
   #   ollama — fully local & private; great for triage, drafts plans

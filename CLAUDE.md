@@ -17,10 +17,14 @@ out which pipeline stage their request belongs to and behave accordingly.
 | Processing | `pipeline/01-processing/` | `status: processing` | `/develop` |
 | Potential project | `pipeline/02-potential-projects/<slug>/` | `status: proposed` | `/approve` then `/promote-project` |
 | Knowledge | `pipeline/knowledge/{notes,lists,content-ideas,someday}/` | `status: filed` | — |
-| Active | `active-projects/<slug>/` (see `system/config.yml`) | `status: promoted` | project completion |
+| Active | `active-projects/<slug>/` (the `promotion_target` setting) | `status: promoted` | project completion |
 | Archive | `pipeline/archive/` | `status: archived` | never deleted |
 
-Configuration lives in `system/config.yml`. Templates live in
+Configuration: `system/config.yml` holds the defaults, and
+`system/config.local.yml` — when it exists — holds the owner's own values,
+which win. Read both and let the local file decide; write settings only
+to the local file (or with `aria settings set <key> <value>`), never to
+`config.yml`, which updates replace. Templates live in
 `system/templates/` — always instantiate from templates rather than
 inventing document structures.
 

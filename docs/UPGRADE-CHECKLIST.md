@@ -4,11 +4,15 @@ Each stage is independent; stop at whichever rung suits you. Verify lines
 tell you what success looks like before moving on.
 
 ## Stage 0 — sync (2 min)
-- [ ] `cd ~/ARIA && git pull` (pulls the branch you are on; your own
-      `system/config.yml` edits are yours — `git stash` first if git
-      complains, `git stash pop` after)
-- [ ] `systemctl --user restart aria` — the always-on server loads the
-      new code
+- [ ] `cd ~/ARIA && bin/aria update` — the newest version of the branch
+      you are on, your settings kept (hand edits to `system/config.yml`
+      are moved into `system/config.local.yml`, which updates never
+      touch), the server restarted unless autopilot is mid-step.
+      No `aria update` yet? Then once, by hand:
+      `cp system/config.yml ~/aria-config-backup.yml`,
+      `git checkout -- system/config.yml`, `git pull`,
+      `bin/aria settings import ~/aria-config-backup.yml`,
+      `systemctl --user restart aria`
 - [ ] `bin/aria test --mock` → every check PASS or SKIP, in seconds
 - [ ] `bin/aria test` → the same against your models. If the only FAIL is
       `backends reachable`, Ollama is not running:
@@ -76,6 +80,6 @@ tell you what success looks like before moving on.
 ## Stage 5 — finishing touches
 - [ ] `pip install faster-whisper` → voice input in Firefox (last SKIP)
 - [ ] ⚙ Settings → Obsidian vault path → "→ Obsidian" export goes live
-- [ ] n8n flows under `aria.webhooks` in system/config.yml → "trigger
+- [ ] n8n flows: `bin/aria settings set webhooks.<name> <url>` → "trigger
       <name>" in chat does real things
 - [ ] `bin/aria test` one more time — everything you enabled gets verified

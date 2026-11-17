@@ -85,7 +85,7 @@ shows what each role has and what is loaded. What then happens on its own:
   long; 0 keeps the last one in memory.
 
 If a load runs out of VRAM beside your everyday Ollama model, give the
-giants fewer GPU layers: `giants_flags: -ngl 20` in `system/config.yml`.
+giants fewer GPU layers: `bin/aria settings set giants_flags -ngl 20`.
 
 > **Earlier setup?** If you created the per-model services from the
 > previous version of this guide (`aria-llama-deepseek`, `-kimi`, `-coder`
@@ -145,8 +145,9 @@ A.R.I.A.:       Mission queued for the strategist — it runs in the background�
   its output), `aria missions` in a terminal, or just ask A.R.I.A. —
   mission state is in her head.
 - Results persist in `pipeline/missions/<id>.md` under `## Output`.
-- Get pinged when one finishes: add a `mission-done` webhook under
-  `aria.webhooks` (n8n → phone notification).
+- Get pinged when one finishes: add a `mission-done` webhook —
+  `bin/aria settings set webhooks.mission-done <url>` (n8n → phone
+  notification).
 - The pipeline is never blocked: a week-long K3 mission runs beside
   hourly triage/develop without contention for anything but the hardware.
 - No server running? `aria missions run` drains the queue in a terminal.

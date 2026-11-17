@@ -45,33 +45,105 @@ KNOWLEDGE_FOLDERS = {"note": "notes", "content": "content-ideas", "someday": "so
 
 # ---------------------------------------------------------------- config
 
+CONFIG_FILE = ROOT / "system" / "config.yml"
+# The owner's own settings. Whatever is set here wins over config.yml, and
+# git never touches it — so pulling a new version cannot collide with them.
+# The Settings page and `aria models use` write here.
+LOCAL_FILE = ROOT / "system" / "config.local.yml"
+LOCAL_HEADER = """# Your own settings. They override system/config.yml, and `git pull` never
+# touches this file. The Settings page writes here; you can edit it too —
+# same keys as config.yml, two spaces in. Delete a line to go back to the
+# default.
+aria:
+"""
+
+
+# headings whose children are plain settings; headings read as a whole
+CONTAINERS = ("aria", "models", "ollama")
+BLOCKS = ("backends", "backend_keys", "webhooks")
+
+
+def _local_text():
+    try:
+        return LOCAL_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _scalars(text):
+    """The plain `key: value` settings in a config text — top-level ones
+    and those under `models:` — as {key: value}. A key that heads a block
+    (backends, webhooks…) is not one."""
+    out = {}
+    lines = text.splitlines()
+    inside = None                       # indent of the block being skipped
+    for i, ln in enumerate(lines):
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([ \t]*)([\w.-]+):[ \t]*(.*?)[ \t]*$", ln)
+        if not m:
+            continue
+        indent, key = len(m.group(1)), m.group(2)
+        value = m.group(3).split(" #")[0].strip()
+        if value.startswith("#"):
+            value = ""
+        if inside is not None and indent > inside:
+            continue                    # a child of a block
+        inside = None
+        if not value:
+            nxt = next((x for x in lines[i + 1:] if x.strip()
+                        and not x.lstrip().startswith("#")), "")
+            deeper = len(nxt) - len(nxt.lstrip()) > indent
+            if key in CONTAINERS:
+                continue                # its children are plain settings
+            if deeper:
+                inside = indent         # a block heading: skip its children
+                continue
+        out.setdefault(key, value)
+    return out
+
+
+def _block(text, key):
+    """The key: value pairs nested under a `<key>:` heading in a config
+    text — {} for a heading with nothing under it, None when the text has
+    no such heading."""
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        m = re.match(rf"^([ \t]*){re.escape(key)}:[ \t]*(?:#.*)?$", ln)
+        if not m:
+            continue
+        indent, out = len(m.group(1)), {}
+        for sub in lines[i + 1:]:
+            if not sub.strip() or sub.lstrip().startswith("#"):
+                continue
+            sm = re.match(r"^([ \t]*)([\w.-]+):[ \t]*(\S.*?)[ \t]*$", sub)
+            if not sm or len(sm.group(1)) <= indent:
+                break
+            out[sm.group(2)] = sm.group(3).split(" #")[0].strip()
+        return out
+    return None
+
+
 def config():
-    text = (ROOT / "system" / "config.yml").read_text(encoding="utf-8")
+    base = CONFIG_FILE.read_text(encoding="utf-8")
+    local_text = _local_text()
+    mine = _scalars(local_text) if local_text else {}
 
     def find(key, default):
+        if key in mine:                 # set by the owner — also to nothing
+            return mine[key] or default
         # [ \t]* (not \s*) so an empty value can't swallow the newline and
         # match the next line as the value
-        m = re.search(rf"^[ \t]*{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$", text, re.M)
+        m = re.search(rf"^[ \t]*{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$", base,
+                      re.M)
         return m.group(1) if m else default
 
     def block(key):
-        """key: value pairs nested under a `<key>:` heading."""
-        lines = text.splitlines()
-        out = {}
-        for i, ln in enumerate(lines):
-            m = re.match(rf"^([ \t]*){re.escape(key)}:[ \t]*(?:#.*)?$", ln)
-            if not m:
-                continue
-            indent = len(m.group(1))
-            for sub in lines[i + 1:]:
-                if not sub.strip() or sub.lstrip().startswith("#"):
-                    continue
-                sm = re.match(r"^([ \t]*)([\w.-]+):[ \t]*(\S.*?)[ \t]*$", sub)
-                if not sm or len(sm.group(1)) <= indent:
-                    break
-                out[sm.group(2)] = sm.group(3).split(" #")[0].strip()
-            break
-        return out
+        """key: value pairs nested under a `<key>:` heading — the owner's
+        own block if they wrote one (an empty one means none), else the
+        default one."""
+        own = _block(local_text, key)
+        return own if own is not None else (_block(base, key) or {})
 
     def flag(key, default):
         return find(key, default).split(" #")[0].strip().lower() \
@@ -3036,7 +3108,7 @@ def _need_github(slug):
     cfg = config()
     if not cfg["github_access"]:
         raise ValueError("GitHub access is off — turn it on in Settings "
-                         "(aria.github_access in system/config.yml)")
+                         "(or: aria settings set github_access true)")
     proj = _project_dir(slug)
     if not aria_git.is_repo_root(proj):
         raise ValueError(f"{slug} isn't its own git repository yet — run: "
@@ -3354,21 +3426,25 @@ _CHOICE_KEYS = {
     "autopilot_after_goal": {"improve", "stop"},
     "giants_use": {"auto", "always", "never"},
     "autopilot_checks": {"sandbox", "direct", "off"},
+    "engine": {"ollama", "claude"},
 }
 _NUMBER_KEYS = {"context_tokens", "autopilot_max_tasks",
                 "autopilot_max_iterations", "autopilot_max_hours",
                 "autopilot_stall_limit", "autopilot_idle_minutes",
                 "giants_loaded", "giants_idle_minutes", "giants_ctx",
-                "autopilot_check_seconds"}
+                "giants_port", "autopilot_check_seconds",
+                "triage_confidence_threshold"}
 _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "web_search_url", "web_allowlist", "github_base_branch",
               "promotion_target", "giant_general", "giant_research",
-              "giant_coder", "giants_flags", "editor", "terminal"}
+              "giant_coder", "giants_flags", "editor", "terminal",
+              "heartbeat_url"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 
-def config_set(key, value):
-    """Update a single allowed key in system/config.yml in place."""
+def _config_clean(key, value):
+    """`value` as it is stored for `key` — or ValueError saying what is
+    wrong with it."""
     if key not in SETTABLE:
         raise ValueError(f"config key not settable: {key}")
     value = " ".join(str(value).split())          # one line, always
@@ -3392,8 +3468,14 @@ def config_set(key, value):
                              "one dry batch is the soonest she can notice")
         if key == "giants_loaded" and number < 1:
             raise ValueError("giants_loaded must be at least 1")
+        if key == "triage_confidence_threshold" and number > 1:
+            raise ValueError("triage_confidence_threshold is a share: "
+                             "0.7 means 70%")
+        if key == "giants_port" and not 1024 <= number <= 65000:
+            raise ValueError("giants_port must be between 1024 and 65000")
         if key in ("autopilot_max_tasks", "autopilot_max_iterations",
-                   "autopilot_stall_limit", "giants_loaded", "giants_ctx"):
+                   "autopilot_stall_limit", "giants_loaded", "giants_ctx",
+                   "giants_port"):
             number = int(number)                  # whole tasks, whole batches
         value = str(int(number)) if number == int(number) else str(number)
     elif "#" in value:
@@ -3405,15 +3487,189 @@ def config_set(key, value):
         if not path.is_file() or path.suffix.lower() != ".gguf":
             raise ValueError(f"{value} is not a .gguf file — point at the "
                              "first part of the model (…-00001-of-0000N.gguf)")
-    path = ROOT / "system" / "config.yml"
-    text = path.read_text(encoding="utf-8")
-    line = f"{key}: {value}".rstrip()
-    pattern = re.compile(rf"^([ \t]*){re.escape(key)}:.*$", re.M)
+    return value
+
+
+def config_set(key, value):
+    """Set one allowed key — in the owner's own file (config.local.yml),
+    never in the shipped config.yml."""
+    _local_set(key, _config_clean(key, value))
+
+
+def config_update(pairs):
+    """Save a whole form of settings (the Settings page posts every field):
+    all of it is checked first, then only what differs from the value in
+    force is written — so the owner's file holds what they changed, not a
+    copy of every default. Returns the keys that changed."""
+    mine = _scalars(_local_text())
+    shipped = _scalars(CONFIG_FILE.read_text(encoding="utf-8"))
+    changed = {}
+    for key, value in pairs.items():
+        if key not in SETTABLE:
+            raise ValueError(f"config key not settable: {key}")
+        raw = " ".join(str(value).split())
+        current = mine[key] if key in mine else shipped.get(key, "")
+        if raw == current:
+            continue                    # untouched — nothing to check
+        value = _config_clean(key, raw)
+        try:
+            same = value == _config_clean(key, current)
+        except ValueError:
+            same = False                # what is there now is not valid
+        if not same:
+            changed[key] = value
+    for key, value in changed.items():
+        _local_set(key, value)
+    return sorted(changed)
+
+
+def _local_write(text):
+    tmp = LOCAL_FILE.with_name(LOCAL_FILE.name + ".tmp")
+    tmp.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+    os.replace(tmp, LOCAL_FILE)
+
+
+def _local_pad(text):
+    """How far the settings in the owner's file are indented (two spaces
+    under `aria:`, none in a file written flat)."""
+    return "  " if re.search(r"^aria:[ \t]*(?:#.*)?$", text, re.M) else ""
+
+
+def _local_set(key, value):
+    """Write one setting into the owner's own file (created on first use)."""
+    text = _local_text() or LOCAL_HEADER
+    line = f"{_local_pad(text)}{key}: {value}".rstrip()
+    pattern = re.compile(rf"^[ \t]*{re.escape(key)}:.*$", re.M)
     if pattern.search(text):
-        text = pattern.sub(lambda m: m.group(1) + line, text, count=1)
+        text = pattern.sub(lambda m: line, text, count=1)
     else:
-        text = text.rstrip("\n") + f"\n  {line}\n"
-    path.write_text(text, encoding="utf-8")
+        text = text.rstrip("\n") + f"\n{line}\n"
+    _local_write(text)
+
+
+def _local_drop(text, key):
+    """`text` without the setting `key` — a block goes with its children."""
+    out, skip = [], None
+    for ln in text.splitlines():
+        indent = len(ln) - len(ln.lstrip())
+        if skip is not None:
+            if not ln.strip() or indent > skip:
+                continue
+            skip = None
+        if re.match(rf"^[ \t]*{re.escape(key)}:", ln):
+            skip = indent
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def config_unset(key):
+    """Take one setting out of the owner's own file — back to the default.
+    True when it was there."""
+    text = _local_text()
+    if not re.search(rf"^[ \t]*{re.escape(key)}:", text, re.M):
+        return False
+    _local_write(_local_drop(text, key))
+    return True
+
+
+def _local_block(key, pairs):
+    """Write a whole block (backends, webhooks…) into the owner's file."""
+    text = _local_drop(_local_text() or LOCAL_HEADER, key)
+    pad = _local_pad(text)
+    _local_write("\n".join(
+        [text.rstrip("\n"), f"{pad}{key}:"]
+        + [f"{pad}  {k}: {v}" for k, v in pairs.items()]))
+
+
+def config_set_entry(block, name, value):
+    """Set — or with an empty value remove — one entry of a list setting
+    (a webhook, a backend, a backend key) in the owner's own file. The
+    owner's list starts as a copy of the shipped one."""
+    if block not in BLOCKS:
+        raise ValueError(f"{block} is not a list setting — those are: "
+                         + ", ".join(BLOCKS))
+    name = str(name).strip()
+    if not re.fullmatch(r"[\w.-]{1,60}", name):
+        raise ValueError(f"'{name}' is not a usable name (letters, digits, "
+                         "- _ . only)")
+    value = " ".join(str(value).split())
+    if "#" in value:
+        raise ValueError(f"{block}.{name} cannot contain '#'")
+    if value and block != "backend_keys" \
+            and not re.match(r"https?://\S+$", value):
+        raise ValueError(f"{block}.{name} must be an http(s) address")
+    own = _block(_local_text(), block)
+    shipped = _block(CONFIG_FILE.read_text("utf-8"), block) or {}
+    pairs = dict(own if own is not None else shipped)
+    if value:
+        pairs[name] = value
+    elif pairs.pop(name, None) is None:
+        return False
+    if pairs == shipped:
+        config_unset(block)             # nothing of the owner's left in it
+    else:
+        _local_block(block, pairs)
+    return True
+
+
+def config_mine():
+    """The owner's own settings: ({key: value}, {block: {key: value}})."""
+    text = _local_text()
+    blocks = {k: _block(text, k) for k in BLOCKS}
+    return ({k: v for k, v in _scalars(text).items() if k not in BLOCKS},
+            {k: v for k, v in blocks.items() if v is not None})
+
+
+def config_import(path, base=None):
+    """Carry the settings of an edited config.yml over into the owner's own
+    file: everything in it that differs from `base`, the shipped config.yml
+    it was edited from (default: this version's). A setting the owner's
+    file already has is left as it is. Returns (kept keys, [(key, why it
+    was left out)])."""
+    old = Path(os.path.expanduser(str(path))).read_text(encoding="utf-8")
+    shipped = CONFIG_FILE.read_text(encoding="utf-8")
+    base = shipped if base is None else base
+    was, ref, now = _scalars(old), _scalars(base), _scalars(shipped)
+    mine, my_blocks = config_mine()
+    kept, left = [], []
+    for key in sorted(was):
+        value = " ".join(was[key].split())
+        if key in BLOCKS or value == ref.get(key, ""):
+            continue
+        if key in mine:
+            if mine[key] != value:
+                left.append((key, f"your own settings already say "
+                                  f"'{mine[key]}' (the old file: '{value}')"))
+            continue
+        if key not in now and key not in SETTABLE:
+            left.append((key, "this version has no such setting"))
+            continue
+        try:
+            if key in SETTABLE:
+                config_set(key, value)          # validated, like Settings
+            else:
+                _local_set(key, value)
+            kept.append(key)
+        except ValueError as exc:
+            left.append((key, str(exc)))
+    for key in BLOCKS:
+        block = _block(old, key)
+        if not block or block == (_block(base, key) or {}):
+            continue
+        if key in my_blocks:
+            if my_blocks[key] != block:
+                left.append((key, "your own settings already have this "
+                                  "block"))
+            continue
+        _local_block(key, block)
+        kept.append(key)
+    # a block the engine does not read itself (the slash commands do)
+    for key in ("categories", "lists"):
+        if (_block(old, key) or {}) != (_block(base, key) or {}):
+            left.append((key, "only read from system/config.yml — copy it "
+                              "over by hand if you still want your version"))
+    return kept, left
 
 
 def _probe_backend(target):

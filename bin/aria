@@ -40,12 +40,18 @@
 #   aria install-service       always-on: server at login + hourly auto-pipeline
 #   aria uninstall-service     remove the systemd user services
 #   aria install-skills        install skills + agent libraries (ECC, Anthropic…)
+#   aria settings [set <key> <value> | unset <key> | import <old-config.yml>]
+#                              your own settings (kept out of git's way)
+#   aria update [branch]       get the newest version and restart the server
 #   aria test [--mock] [--keep]   self-test: run EVERYTHING in a sandbox copy
 #   aria doctor                sanity-check the setup
 #
-# triage/develop/auto run on the engine set in system/config.yml (aria.engine):
+# triage/develop/auto run on the engine you set (aria settings set engine …):
 # 'ollama' = your local models, 'claude' = headless Claude Code.
 # Override per-run: ARIA_ENGINE=claude bin/aria triage
+#
+# Your settings live in system/config.local.yml (the Settings page writes
+# there); system/config.yml holds the defaults and is replaced by updates.
 set -euo pipefail
 
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,19 +61,25 @@ INBOX="$ARIA_ROOT/pipeline/00-inbox"
 usage() { awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 engine() {
+  local f e
   if [ -n "${ARIA_ENGINE:-}" ]; then
     echo "$ARIA_ENGINE"
-  else
-    sed -n 's/^[[:space:]]*engine:[[:space:]]*\([a-z]*\).*/\1/p' \
-      "$ARIA_ROOT/system/config.yml" | head -1 | grep . || echo claude
+    return
   fi
+  # your own settings (config.local.yml) win over the shipped ones
+  for f in "$ARIA_ROOT/system/config.local.yml" "$ARIA_ROOT/system/config.yml"; do
+    [ -f "$f" ] || continue
+    e="$(sed -n 's/^[[:space:]]*engine:[[:space:]]*\([a-z]*\).*/\1/p' "$f" | head -1)"
+    if [ -n "$e" ]; then echo "$e"; return; fi
+  done
+  echo claude
 }
 
 require_claude() {
   command -v claude >/dev/null 2>&1 || {
     echo "error: claude CLI not found — install Claude Code first" >&2
     echo "       https://code.claude.com/docs" >&2
-    echo "       (or set engine: ollama in system/config.yml)" >&2
+    echo "       (or use your local models: aria settings set engine ollama)" >&2
     exit 1
   }
 }
@@ -185,7 +197,7 @@ DESKTOP
     exec python3 "$ARIA_ROOT/bin/aria-test" "$@"
     ;;
 
-  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger|models|open|run|check)
+  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger|models|open|run|check|settings|update)
     exec python3 "$ARIA_ROOT/bin/aria-do" "$cmd" "$@"
     ;;
 

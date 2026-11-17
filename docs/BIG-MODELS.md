@@ -58,13 +58,11 @@ the whole file into RAM.
 [colibri](https://github.com/JustVugg/colibri) is purpose-built for this
 exact trick: a tiny C engine that keeps per-token layers in RAM, streams
 routed experts from disk, and holds the hottest experts on the GPU. It
-serves an OpenAI-compatible API, so it's one config line away:
+serves an OpenAI-compatible API, so it's two settings away:
 
-```yaml
-backends:
-  colibri: http://localhost:8338
-models:
-  deep: colibri/<model-name>
+```bash
+bin/aria settings set backends.colibri http://localhost:8338
+bin/aria settings set deep colibri/<model-name>
 ```
 
 Its `docs/AI_SETUP.md` is written for an AI to follow — paste it into a

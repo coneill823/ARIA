@@ -1,6 +1,7 @@
 // Settings: everything that is switchable, in one place — her models,
 // her reach (the web, your Obsidian brain, GitHub) and how autopilot
-// behaves. Saved to system/config.yml by the server.
+// behaves. The server saves them to system/config.local.yml — the owner's
+// own file, which updates never touch (config.yml holds the defaults).
 
 import { $, h, clear, api, bus, toast } from './core.js';
 
@@ -186,7 +187,7 @@ function render() {
     section('Pipeline', 'What happens when an idea is captured.',
       toggle('auto_pipeline', 'Auto-pipeline', 'triage and plan every new idea straight away — your approval is still required before any work starts')),
     h('div', { class: 'savebar' },
-      h('span', { class: 'hint', text: 'Saved to system/config.yml' }),
+      h('span', { class: 'hint', text: 'Saved to system/config.local.yml — your own file; updates never touch it' }),
       h('button', { class: 'btn', text: 'Revert', onclick: load }),
       h('button', { class: 'btn primary', text: 'Save settings', onclick: save })));
 }

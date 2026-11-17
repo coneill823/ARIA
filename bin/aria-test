@@ -14,9 +14,14 @@ capability:
   steering, rejected work, a model-server outage, a task that waits on
   the owner, budgets and the stall limit), git commits, web access
   (against a local fixture — the self-test never touches the internet),
-  crew + OpenHands generation, the web server and its API.
+  crew + OpenHands generation, the web server and its API, your settings
+  file and `aria update` (against a local stand-in for GitHub).
 
-By default the model calls go to your REAL configured backends (about 25
+Your own settings come along (so your models are the ones tested), but
+everything that reaches outside is forced off here whatever they say: no
+internet, no GitHub, none of your webhooks, none of your giant models.
+
+By default the model calls go to your REAL configured backends (about 30
 calls; a few minutes on a local 8B). With --mock they go to a built-in
 stand-in model (bin/aria-mock-llm), so the whole plumbing is verified in
 seconds on any machine — no GPU, no Ollama. --mock proves the machinery,
@@ -138,17 +143,24 @@ def wait_http(url, tries=60):
 
 
 def set_config(sandbox, **pairs):
-    """Rewrite single-line keys in the sandbox config."""
+    """Force settings in the sandbox. They go into its config.local.yml —
+    the file that wins — so nothing the owner has set, in either file, can
+    undo them."""
     import re
-    path = os.path.join(sandbox, "system", "config.yml")
-    text = open(path, encoding="utf-8").read()
+    path = os.path.join(sandbox, "system", "config.local.yml")
+    text = "aria:\n"
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    pad = "  " if re.search(r"^aria:[ \t]*(?:#.*)?$", text, re.M) else ""
     for key, value in pairs.items():
-        line = f"  {key}: {value}".rstrip()
+        line = f"{pad}{key}: {value}".rstrip()
         text, n = re.subn(rf"^[ \t]*{re.escape(key)}:.*$", line, text,
                           count=1, flags=re.M)
         if not n:
             text = text.rstrip("\n") + "\n" + line + "\n"
-    open(path, "w", encoding="utf-8").write(text)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 def main():
@@ -167,7 +179,8 @@ def main():
                         os.path.join(sandbox, sub), symlinks=False,
                         ignore=shutil.ignore_patterns("__pycache__",
                                                       "voice-token",
-                                                      "garage"))
+                                                      "garage",
+                                                      "config.backup-*"))
     for d in ("pipeline/00-inbox", "pipeline/01-processing",
               "pipeline/02-potential-projects", "pipeline/knowledge/lists",
               "pipeline/knowledge/notes", "pipeline/knowledge/content-ideas",
@@ -219,6 +232,9 @@ def main():
     import aria_engine as eng
     import aria_autopilot as ap
     assert os.path.samefile(eng.ROOT, sandbox), "engine is not sandboxed"
+    # the owner's webhooks are not reachable from here: an empty block of
+    # the sandbox's own means "none", whatever either settings file lists
+    eng._local_block("webhooks", {})
 
     state = {}
     quiet = lambda e: None  # noqa: E731
@@ -377,12 +393,8 @@ def main():
             assert got.get("action") == "agent" and got.get("name") == "critic"
         # webhook intents obey the allowlist: unknown name -> plain chat
         assert eng.detect_intent("trigger not-a-real-hook") is None
-        set_config(sandbox, webhooks="")
-        cfgp = os.path.join(sandbox, "system", "config.yml")
-        txt = open(cfgp).read()
-        open(cfgp, "w").write(txt.replace(
-            "  webhooks:\n",
-            "  webhooks:\n    selftest-hook: http://127.0.0.1:1/x\n", 1))
+        eng._local_block("webhooks",
+                         {"selftest-hook": "http://127.0.0.1:1/x"})
         got = eng.detect_intent("trigger selftest-hook: hello")
         assert got and got["action"] == "webhook" \
             and got["name"] == "selftest-hook", got
@@ -436,6 +448,47 @@ def main():
                 "validated")
     check("backends/webhooks config", c_backends_cfg)
 
+    def c_settings():
+        """The owner's settings live in a file of their own: the shipped
+        config.yml is never written to, so a new version can replace it."""
+        import re
+        shipped_file = os.path.join(sandbox, "system", "config.yml")
+        local_file = os.path.join(sandbox, "system", "config.local.yml")
+        shipped = open(shipped_file, encoding="utf-8").read()
+        default = eng._scalars(shipped).get("stt_model") or "base"
+        mine = "medium" if default != "medium" else "small"
+        eng.config_set("stt_model", mine)
+        assert eng.config()["stt_model"] == mine
+        assert open(shipped_file, encoding="utf-8").read() == shipped, \
+            "a setting was written into the shipped config.yml"
+        assert f"stt_model: {mine}" in open(local_file).read()
+        assert eng.config_unset("stt_model")
+        assert eng.config()["stt_model"] == default, "unset did not restore"
+        # an edited copy of the shipped file (what a `git pull` trips over)
+        # is carried across: valid edits kept, the rest named
+        old = os.path.join(sandbox, "_edited-config.yml")
+        edited = re.sub(r"(?m)^([ \t]*)stt_model:.*$",
+                        rf"\g<1>stt_model: {mine}", shipped, count=1)
+        edited = re.sub(r"(?m)^([ \t]*)context_tokens:.*$",
+                        r"\g<1>context_tokens: -5", edited, count=1)
+        with open(old, "w", encoding="utf-8") as f:
+            f.write(edited + "\n  retired_setting: 1\n")
+        kept, left = eng.config_import(old)
+        assert kept == ["stt_model"], (kept, left)
+        assert {"context_tokens", "retired_setting"} <= {k for k, _ in left}, left
+        assert eng.config()["stt_model"] == mine
+        assert open(shipped_file, encoding="utf-8").read() == shipped
+        eng.config_unset("stt_model")
+        # a block of the owner's replaces the shipped one; an empty one
+        # means none
+        eng._local_block("backend_keys", {"selftest": "k"})
+        assert eng.config()["backend_keys"] == {"selftest": "k"}
+        eng.config_unset("backend_keys")
+        assert "selftest" not in eng.config()["backend_keys"]
+        return ("Settings write config.local.yml only; an edited config.yml "
+                "is imported (1 kept, 2 refused with reasons)")
+    check("your settings — kept apart", c_settings)
+
     def c_webhook():
         got = {}
 
@@ -453,13 +506,8 @@ def main():
         srv = ThreadingHTTPServer(("127.0.0.1", 0), R)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        cfgp = os.path.join(sandbox, "system", "config.yml")
-        with open(cfgp) as f:
-            txt = f.read()
-        with open(cfgp, "w") as f:
-            f.write(txt.replace(
-                "  webhooks:\n",
-                f"  webhooks:\n    selftest-live: http://127.0.0.1:{port}/hook\n", 1))
+        eng._local_block("webhooks", {
+            "selftest-live": f"http://127.0.0.1:{port}/hook"})
         status = eng.trigger_webhook("selftest-live", "self-test payload")
         srv.shutdown()
         assert status == 200, f"receiver answered {status}"
@@ -871,8 +919,34 @@ def main():
             assert (proj / name).is_file(), f"promotion did not write {name}"
         ledger = open(os.path.join(sandbox, "pipeline/LEDGER.md")).read()
         assert "promoted" in ledger
-        seq = drive(slug, limit=6, until=("task",))
-        assert "assessed" in seq and "replanned" in seq and seq[-1] == "task", seq
+        answered = []
+
+        def answer():
+            """In its own sandbox the self-test is the owner: a task the
+            model marked as needing a decision gets one, so the run can go
+            on. (Real models do this more readily than the mock.)"""
+            for g in ap.view(slug)["needs_you"]:
+                ap.decide(slug, g["id"], approve=True, via="selftest",
+                          note="self-test: your call, go ahead")
+                answered.append(g["id"])
+
+        seq = drive(slug, limit=6, until=("task", "waiting"))
+        if seq[-1] == "waiting":        # the plan put everything behind me
+            answer()
+            seq += drive(slug, limit=4, until=("task",))
+        # (a plan that is all decisions reports "waiting", not "replanned")
+        assert "assessed" in seq and seq[-1] == "task" \
+            and ("replanned" in seq or answered), seq
+        # A small local model often has its first attempt sent back. Give
+        # the loop a few more steps, so the checks below (and the git one)
+        # see a verified task wherever the model can produce one.
+        for _ in range(4):
+            if any(c["status"] == "done" for c in eng.project_changes(slug)) \
+                    or ap._state(slug)["status"] != "running":
+                break
+            seq.append(ap.tick(slug, quiet))
+            if seq[-1] == "waiting":
+                answer()
         auto = proj / "autopilot"
         assert (auto / "ASSESSMENT.md").is_file()
         plan = json.load(open(auto / "plan.json"))
@@ -895,9 +969,14 @@ def main():
         assert (auto / "CHANGELOG.md").is_file() or not done
         assert ap.tick(slug, quiet) == "idle"
         state["active"] = slug
+        tried = seq.count("task")
         return (f"promoted, assessed, planned {len(plan['tasks'])} task(s), "
-                f"{len(done)} executed+verified, steered, stopped; report "
-                "lists every change")
+                f"{len(done)} verified in {tried} attempt(s), "
+                + (f"{len(answered)} decision(s) given, " if answered else "")
+                + "steered, stopped; report lists every change"
+                + ("" if done else " — the work was sent back each time, "
+                   "which the loop handled; a stronger smart tier gets "
+                   "more through"))
     check("autopilot — gate to report", c_autopilot)
 
     def c_autopilot_full():
@@ -1357,7 +1436,15 @@ def test_escape():
         assert aria_git.current_branch(proj) == aria_git.WORK_BRANCH
         log = aria_git.run(["log", "--format=%s"], proj).splitlines()
         tasks = [ln for ln in log if ln.startswith("t")]
-        assert tasks, f"no per-task commits: {log[:5]}"
+        verified = [c for c in eng.project_changes(slug)
+                    if c["status"] == "done"]
+        if verified:
+            assert tasks, f"no per-task commits: {log[:5]}"
+        else:
+            # nothing was verified (a short run on a small model), so
+            # there is nothing a task commit could hold — and none exists
+            assert not tasks, f"a commit without a verified task: {tasks}"
+            assert any("report" in ln for ln in log), log[:5]
         base = ap._state(slug).get("git_base")
         assert base and base != aria_git.WORK_BRANCH
         on_base = aria_git.run(["log", "--format=%s", base], proj).splitlines()
@@ -1370,7 +1457,10 @@ def test_escape():
             pass
         return (f"own repo, {len(tasks)} task commit(s) on "
                 f"{aria_git.WORK_BRANCH}, base '{base}' untouched, push "
-                "refused while GitHub is off")
+                "refused while GitHub is off"
+                + ("" if tasks else " — no task was verified in this short "
+                   "run, so only the report was committed (--mock shows "
+                   "the per-task commits)"))
     check("git — a commit per verified task", c_git)
 
     def c_github():
@@ -1643,6 +1733,32 @@ def test_escape():
                       "/api/projects", "/api/missions"):
                 with urllib.request.urlopen(base + p, timeout=15) as r:
                     json.load(r)
+            # Settings posts its whole form: only a field that changed is
+            # written, and only into the owner's own file
+            with urllib.request.urlopen(base + "/api/config", timeout=15) as r:
+                shown = json.load(r)
+            mine = os.path.join(sandbox, "system", "config.local.yml")
+            shipped = os.path.join(sandbox, "system", "config.yml")
+            was, default = open(mine).read(), open(shipped).read()
+            code, body = post("/api/config", {
+                "stt_model": shown["stt_model"],
+                "web_search": shown["web_search"],
+                "context_tokens": str(shown["context_tokens"]),
+                "obsidian_vault": shown["obsidian_vault"],
+                "auto_pipeline": shown["auto_pipeline"]})
+            assert code == 200 and open(mine).read() == was, \
+                "an untouched settings form was written to disk"
+            other = "tiny" if shown["stt_model"] != "tiny" else "base"
+            code, body = post("/api/config", {"stt_model": other,
+                                              "context_tokens": "-1"})
+            assert code == 400 and open(mine).read() == was, \
+                "a refused settings form was half-saved"
+            code, body = post("/api/config", {"stt_model": other})
+            assert code == 200 and json.loads(body)["stt_model"] == other
+            assert f"stt_model: {other}" in open(mine).read()
+            assert open(shipped).read() == default, \
+                "Settings wrote into the shipped config.yml"
+            eng.config_unset("stt_model")
             slug = state.get("active")
             if slug:
                 with urllib.request.urlopen(
@@ -1654,18 +1770,26 @@ def test_escape():
                 with urllib.request.urlopen(
                         f"{base}/api/project/live?slug={slug}", timeout=15) as r:
                     json.load(r)
+                # a task that is NOT waiting on the owner cannot be answered
+                # (whatever the model planned: never one that is waiting)
+                settled = next(
+                    (t["id"] for t in view["plan"].get("tasks", [])
+                     if not (t.get("needs_human") and t["status"] == "todo")),
+                    "t999")
                 for route in ("/api/approve-task", "/api/skip-task"):
-                    code, body = post(route, {"slug": slug, "id": "t1"})
+                    code, body = post(route, {"slug": slug, "id": settled})
                     assert code == 400 and "waiting on you" in body, \
                         (route, code, body[:120])
+                # promotion wrote STATUS.md, whatever the model got done
                 with urllib.request.urlopen(
                         f"{base}/api/files?slug={slug}", timeout=15) as r:
                     listing = json.load(r)
                 assert listing["path"] and any(
-                    f["path"] == "README.md" for f in listing["files"])
+                    f["path"] == "STATUS.md" for f in listing["files"]), \
+                    "the project's files are not listed"
                 with urllib.request.urlopen(
                         f"{base}/api/changes?slug={slug}", timeout=15) as r:
-                    assert json.load(r)["changes"]
+                    assert isinstance(json.load(r)["changes"], list)
                 code, body = post("/api/open", {"slug": slug, "how": "folder",
                                                 "path": "../../system"})
                 assert code == 400 and "outside the project" in body, body
@@ -1697,7 +1821,7 @@ def test_escape():
                 assert "selftest-ran-it" in ran["text"] and ran["exit"] == 0
                 try:
                     urllib.request.urlopen(
-                        f"{base}/api/file/raw?slug={slug}&path=README.md",
+                        f"{base}/api/file/raw?slug={slug}&path=STATUS.md",
                         timeout=10)
                     raise AssertionError("a non-image was served raw")
                 except urllib.error.HTTPError as exc:
@@ -1739,9 +1863,9 @@ def test_escape():
             with urllib.request.urlopen(req, timeout=10) as r:
                 assert r.status == 200
             return "state, board, health, config, agents, skills, " \
-                   "projects, project view, files, runner; task " \
-                   "answers, path traversal and requests from other " \
-                   "sites refused"
+                   "projects, project view, files, runner; settings " \
+                   "saved to your own file; task answers, path " \
+                   "traversal and requests from other sites refused"
         check("api endpoints", c_api)
 
         def c_chat_http():
@@ -1808,6 +1932,121 @@ def test_escape():
             raise SkipTest("not installed — run ./install.sh")
         return ", ".join(found)
     check("desktop/service install", c_install, required=False)
+
+    def c_update():
+        """`aria update` against a local stand-in for GitHub: the new
+        version comes in, hand edits to config.yml move to the owner's own
+        file, and the running server is not restarted under autopilot."""
+        if not shutil.which("git"):
+            raise SkipTest("git not installed")
+        import re
+        top = os.path.join(sandbox, "_update")
+        dev, user = os.path.join(top, "dev"), os.path.join(top, "user")
+        origin = os.path.join(top, "origin.git")
+        shim = os.path.join(top, "shim")
+        asked = os.path.join(top, "systemctl.log")
+        os.makedirs(shim)
+        # your real server must not be restarted by a self-test: this
+        # stand-in answers "active" and only records what it is asked
+        with open(os.path.join(shim, "systemctl"), "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" >> "{asked}"\nexit 0\n')
+        os.chmod(os.path.join(shim, "systemctl"), 0o755)
+        env = dict(os.environ, GIT_AUTHOR_NAME="selftest",
+                   GIT_AUTHOR_EMAIL="selftest@localhost",
+                   GIT_COMMITTER_NAME="selftest",
+                   GIT_COMMITTER_EMAIL="selftest@localhost",
+                   GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   PATH=shim + os.pathsep + os.environ["PATH"])
+
+        def run(*argv, cwd, ok=True):
+            r = subprocess.run(list(argv), cwd=cwd, env=env,
+                               capture_output=True, text=True, timeout=120)
+            assert not ok or r.returncode == 0, \
+                f"{' '.join(argv)}: {r.stdout} {r.stderr}"
+            return r
+
+        def text(*parts):
+            with open(os.path.join(*parts), encoding="utf-8") as f:
+                return f.read()
+
+        def put(body, *parts):
+            with open(os.path.join(*parts), "w", encoding="utf-8") as f:
+                f.write(body)
+
+        shutil.copytree(os.path.join(REAL_ROOT, "bin"),
+                        os.path.join(dev, "bin"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        os.makedirs(os.path.join(dev, "system"))
+        shutil.copy2(os.path.join(REAL_ROOT, "system", "config.yml"),
+                     os.path.join(dev, "system", "config.yml"))
+        shutil.copy2(os.path.join(REAL_ROOT, ".gitignore"),
+                     os.path.join(dev, ".gitignore"))
+        run("git", "init", "-q", cwd=dev)
+        run("git", "symbolic-ref", "HEAD", "refs/heads/main", cwd=dev)
+        run("git", "add", "-A", cwd=dev)
+        run("git", "commit", "-qm", "version one", cwd=dev)
+        run("git", "clone", "-q", "--bare", dev, origin, cwd=top)
+        run("git", "remote", "add", "origin", origin, cwd=dev)
+        run("git", "clone", "-q", origin, user, cwd=top)
+
+        # the owner edits the shipped settings by hand; upstream moves on
+        shipped = text(user, "system/config.yml")
+        default = eng._scalars(shipped).get("stt_model") or "base"
+        mine = "medium" if default != "medium" else "small"
+        put(re.sub(r"(?m)^([ \t]*)stt_model:.*$",
+                   rf"\g<1>stt_model: {mine}", shipped, count=1),
+            user, "system/config.yml")
+        put(shipped + "\n  # new in version two\n  brand_new: 1\n",
+            dev, "system/config.yml")
+        put("version two\n", dev, "NEWS")
+        run("git", "add", "-A", cwd=dev)
+        run("git", "commit", "-qm", "version two", cwd=dev)
+        run("git", "push", "-q", "origin", "main", cwd=dev)
+
+        # autopilot is mid-task in the owner's copy
+        busy = os.path.join(user, "active-projects", "busy-project")
+        os.makedirs(os.path.join(busy, "autopilot"))
+        put("---\napproved: true\n---\n", busy, "requirements.md")
+        put(json.dumps({"status": "running", "iteration": 1}),
+            busy, "autopilot", "state.json")
+
+        r = run(os.path.join(user, "bin", "aria"), "update", cwd=user)
+        assert "version two" in r.stdout, r.stdout
+        assert text(user, "system/config.yml") == text(dev, "system/config.yml"), \
+            "config.yml is not the new version's"
+        assert f"stt_model: {mine}" in text(user, "system/config.local.yml"), \
+            "the hand edit was not carried into config.local.yml"
+        kept = [f for f in os.listdir(os.path.join(user, "system"))
+                if f.startswith("config.backup-")]
+        assert len(kept) == 1 and f"stt_model: {mine}" in \
+            text(user, "system", kept[0]), "no backup of the edited file"
+        assert os.path.isfile(os.path.join(user, "NEWS"))
+        assert run("git", "status", "--porcelain", "--", "system",
+                   cwd=user).stdout == "", "her own files show up in git"
+        assert "OLD version" in r.stdout and "busy-project" in r.stdout, r.stdout
+        assert "restart" not in text(asked), \
+            "restarted the server under a running autopilot"
+        r = run(os.path.join(user, "bin", "aria"), "update", cwd=user)
+        assert "already up to date" in r.stdout, r.stdout
+
+        # a hand-edited file the new version also changes: stop, touch nothing
+        put("version three\n", dev, "NEWS")
+        run("git", "commit", "-qam", "version three", cwd=dev)
+        run("git", "push", "-q", "origin", "main", cwd=dev)
+        put("my notes\n", user, "NEWS")
+        r = run(os.path.join(user, "bin", "aria"), "update", cwd=user, ok=False)
+        assert r.returncode == 1 and "git stash" in r.stderr, (r.stdout, r.stderr)
+        assert text(user, "NEWS") == "my notes\n", "a hand edit was overwritten"
+        # with nothing in flight, the new version is restarted into
+        put("version two\n", user, "NEWS")
+        put(json.dumps({"status": "stopped"}), busy, "autopilot", "state.json")
+        r = run(os.path.join(user, "bin", "aria"), "update", cwd=user)
+        assert "restart aria.service" in text(asked) \
+            and "restarted the server" in r.stdout, r.stdout
+        return ("new version in, hand-edited settings carried over with a "
+                "backup, a clash stops it untouched, no restart under a "
+                "running autopilot")
+    check("update — new version, your settings kept", c_update)
 
     # ---- summary -----------------------------------------------------
     fails = [r for r in results if r[1] == "FAIL"]

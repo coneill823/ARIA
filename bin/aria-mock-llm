@@ -20,7 +20,8 @@ Environment:
   MOCK_BATCHES   how many build batches the planner offers (default 2)
   MOCK_DELAY     seconds between streamed chunks (default 0)
   MOCK_GATE      the first batch also holds a task marked needs_human and
-                 one that depends on it
+                 one that depends on it ("all": every task of that batch
+                 is marked, the way an over-cautious model plans)
   MOCK_REPEAT    the second batch proposes the first batch's work again
   MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
   MOCK_LOAD_SECONDS  /health answers 503 "Loading model" this long after
@@ -294,6 +295,9 @@ def plan_batch(prompt):
              "phase": "docs", "est_hours": 1, "depends_on": ["h"],
              "reads": [], "research": False,
              "done_when": "docs/provider-setup.md exists"}]
+    if os.environ.get("MOCK_GATE") == "all" and n == 0:
+        for t in tasks:
+            t["needs_human"] = True
     if os.environ.get("MOCK_REPEAT") and n == 1:
         tasks.insert(0, {
             "id": "r", "title": "Write the design note",

@@ -125,6 +125,15 @@ def load_giant(role):
         print("garage:", exc, flush=True)
 
 
+def _field_text(value):
+    """A setting the way a form field holds it."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    return str(value).strip()
+
+
 def config_view():
     cfg = eng.config()
     tiers = {t: eng.resolve_tier(t, cfg) for t in ("fast", "smart", "deep")}
@@ -461,12 +470,20 @@ class Handler(BaseHTTPRequestHandler):
                                    source="ui")
             self.send_json({"ok": True, "path": str(p), "name": p.stem})
         elif path == "/api/config":
+            # The page posts every field. Only a field that no longer says
+            # what the page was showing is a change of the owner's — a
+            # value that came from a default or an environment variable
+            # is not written into their file as if they had typed it.
+            shown = config_view()
+            shown.update(shown["tiers_set"])
+            shown.update({f"giant_{r}": v for r, v in shown["giants"].items()})
+            pairs = {}
             for key in CONFIG_KEYS:
                 if key in body:
-                    value = body[key]
-                    if isinstance(value, bool):
-                        value = "true" if value else "false"
-                    eng.config_set(key, str(value).strip())
+                    value = _field_text(body[key])
+                    if key not in shown or value != _field_text(shown[key]):
+                        pairs[key] = value
+            eng.config_update(pairs)
             with _HEALTH_LOCK:
                 _HEALTH["value"] = None
             self.send_json({"ok": True, **config_view()})
