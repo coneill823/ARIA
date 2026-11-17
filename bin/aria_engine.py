@@ -26,6 +26,7 @@ import urllib.request
 from pathlib import Path
 
 import aria_brain
+import aria_garage
 import aria_git
 import aria_web
 
@@ -126,6 +127,16 @@ def config():
         "autopilot_stall_limit": max(
             1, int(number("autopilot_stall_limit", 3))),
         "autopilot_idle_minutes": number("autopilot_idle_minutes", 30),
+        # the giants: one role each, started and swapped by aria_garage
+        "giants": {r: find(f"giant_{r}", "").split(" #")[0].strip()
+                   for r in aria_garage.ROLES},
+        "giants_use": find("giants_use", "auto").split(" #")[0].strip()
+            .lower(),
+        "giants_loaded": max(1, int(number("giants_loaded", 1))),
+        "giants_idle_minutes": number("giants_idle_minutes", 0),
+        "giants_port": int(number("giants_port", 8090)),
+        "giants_ctx": int(number("giants_ctx", 8192)),
+        "giants_flags": find("giants_flags", "").split(" #")[0].strip(),
     }
 
 
@@ -165,6 +176,10 @@ def resolve_tier(tier, cfg=None):
     spec = next((cfg["tiers"][t] for t in order if cfg["tiers"].get(t)), "")
     if not spec:  # legacy single-model config
         return _legacy_target(cfg, tier)
+    if giant_role(spec):                 # a tier may name a giant's role
+        target = _giant_target(giant_role(spec), cfg)
+        target["tier"] = tier
+        return target
     target = _parse_spec(spec, cfg)
     if target is None:  # unknown backend name — fail soft to legacy ollama
         return _legacy_target(cfg, tier)
@@ -173,13 +188,71 @@ def resolve_tier(tier, cfg=None):
 
 
 def resolve_model(spec, cfg=None, default="smart"):
-    """A target from a tier name OR a direct backend/model spec; None when
-    the spec names a backend that is not configured."""
+    """A target from a tier name, a giant's role (general/research/coder)
+    or a direct backend/model spec; None when the spec names a backend
+    that is not configured."""
     cfg = cfg or config()
     spec = (spec or default).strip()
     if spec in ("fast", "smart", "deep"):
         return resolve_tier(spec, cfg)
+    if giant_role(spec):
+        return _giant_target(giant_role(spec), cfg)
     return _parse_spec(spec, cfg)
+
+
+def giant_role(spec):
+    """'coder' or 'giant/coder' -> 'coder'; anything else -> ''."""
+    spec = (spec or "").strip().lower()
+    if spec.startswith("giant/"):
+        spec = spec[6:]
+    return spec if spec in aria_garage.ROLES else ""
+
+
+def _giant_target(role, cfg):
+    """The target for a giant's role — or, when that giant cannot be used
+    (not set, still downloading, failed to load), the next best thing with
+    a note saying why: the smart tier, then the fast one. A tier that is
+    itself pointed at an unusable giant is passed over, so this never
+    loops."""
+    ok, why = aria_garage.available(role, cfg)
+    if ok:
+        info = aria_garage.configured(cfg)[role]
+        return {"kind": "openai", "url": f"http://127.0.0.1:{info['port']}",
+                "model": info["label"], "backend": "giant", "key": "local",
+                "spec": f"giant/{role}", "giant": role, "tier": role,
+                "num_ctx": 0}
+    target = None
+    for tier in ("smart", "fast"):
+        spec = cfg["tiers"].get(tier, "")
+        other = giant_role(spec)
+        if other:
+            if other != role and aria_garage.available(other, cfg)[0]:
+                target = _giant_target(other, cfg)
+        elif spec:
+            target = _parse_spec(spec, cfg)
+        if target is not None:
+            target["tier"] = tier
+            break
+    if target is None:
+        target = _legacy_target(cfg, "smart")
+    target["fallback"] = f"the {role} giant is unavailable — {why}"
+    return target
+
+
+def task_role(spec, cfg=None):
+    """The giant a model spec ends up on ('' when it is not a giant) — the
+    spec may be a role, or a tier pointed at one."""
+    cfg = cfg or config()
+    role = giant_role(spec)
+    if role:
+        return role
+    if spec in ("fast", "smart", "deep"):
+        order = {"deep": ("deep", "smart", "fast"), "smart": ("smart", "fast"),
+                 "fast": ("fast",)}[spec]
+        tier = next((cfg["tiers"][t] for t in order if cfg["tiers"].get(t)),
+                    "")
+        return giant_role(tier)
+    return ""
 
 
 class BackendDown(RuntimeError):
@@ -264,6 +337,36 @@ def chat_messages(target, messages, force_json=False, on_token=None,
     server may stay silent; `max_seconds` (0 = no limit) caps the whole
     generation."""
     deadline = time.time() + max_seconds if max_seconds else 0
+    if target.get("giant"):
+        # a giant: started (and others unloaded) on demand, and held so it
+        # cannot be swapped out mid-answer
+        cfg = config()
+        try:
+            with aria_garage.serving(target["giant"], cfg,
+                                     notify=_garage_note):
+                return _chat_call(target, messages, force_json, on_token,
+                                  timeout, deadline)
+        except aria_garage.GarageBusy as exc:
+            raise BackendDown(str(exc))
+        except aria_garage.GarageError as exc:
+            _garage_note(f"{exc} — using the smart tier instead")
+            target = resolve_tier("smart", cfg)
+    return _chat_call(target, messages, force_json, on_token, timeout,
+                      deadline)
+
+
+GARAGE_LISTENERS = []           # callables that want giant load notices
+
+
+def _garage_note(text):
+    for fn in list(GARAGE_LISTENERS):
+        try:
+            fn(text)
+        except Exception:
+            pass
+
+
+def _chat_call(target, messages, force_json, on_token, timeout, deadline):
     try:
         if target.get("kind", "ollama") == "openai":
             return _openai_stream(target, messages, force_json, on_token,
@@ -276,7 +379,7 @@ def chat_messages(target, messages, force_json=False, on_token=None,
             detail = exc.read().decode("utf-8", "replace")[:200]
         except Exception:
             pass
-        if exc.code >= 500:
+        if exc.code >= 500 or (exc.code == 503 and target.get("giant")):
             raise BackendDown(f"{target['model']}: HTTP {exc.code} {detail}")
         raise RuntimeError(f"{target['model']}: HTTP {exc.code} {detail}")
     except (urllib.error.URLError, ConnectionError, TimeoutError,
@@ -388,11 +491,15 @@ def clip(text, limit, marker="\n[… trimmed …]\n"):
     return text[:head] + marker + text[-(limit - head - len(marker)):]
 
 
-def prompt_budget(cfg=None):
+def prompt_budget(cfg=None, spec=""):
     """Characters a prompt may use: about half the context window, leaving
-    the rest for the model's answer."""
+    the rest for the model's answer. With `spec` (a task's model) the
+    window is that model's own — a giant is started with giants_ctx, which
+    is usually smaller than what the everyday models are given."""
     cfg = cfg or config()
     tokens = cfg.get("context_tokens") or 8192
+    if spec and task_role(spec, cfg):
+        tokens = min(tokens, cfg.get("giants_ctx") or 8192)
     return max(6000, int(tokens * 3.2 * 0.5))
 
 
@@ -2137,6 +2244,9 @@ def run_agent(name, task, emit, timeout=3600, model="", skills=None,
               "log": f"model '{mspec}' has no configured backend — falling "
                      "back to smart"})
         target = resolve_tier("smart", cfg)
+    elif target.get("fallback"):
+        emit({"event": "error",
+              "log": f"{target['fallback']} — using smart instead"})
     sources = []
     if (agent["web"] if web is None else web) and web_ready(cfg):
         found = research(task, emit=emit)
@@ -2145,7 +2255,7 @@ def run_agent(name, task, emit, timeout=3600, model="", skills=None,
             sources = found["sources"]
     system, loaded, missing = agent_system(
         agent, skills, researched=bool(sources),
-        budget=int(prompt_budget(cfg) * 0.5))
+        budget=int(prompt_budget(cfg, mspec) * 0.5))
     for sk in missing:
         emit({"event": "error",
               "log": f"skill '{sk}' not installed — continuing without it"})
@@ -2836,6 +2946,34 @@ def project_push(slug, body=""):
             "say": f"Pushed {slug}'s autopilot branch. Pull request: {pr}"}
 
 
+# ---- the giants (the garage lives in aria_garage) ------------------------
+
+def garage_status(probe=True):
+    return aria_garage.status(config(), probe=probe)
+
+
+def garage_scan(folder=""):
+    folders = [folder] if folder else aria_garage.default_folders()
+    return aria_garage.scan(folders)
+
+
+def garage_load(role, notify=None, retry=True):
+    if role not in aria_garage.ROLES:
+        raise ValueError(f"no such role: {role} (general, research, coder)")
+    return aria_garage.load(role, config(), notify=notify, retry=retry)
+
+
+def garage_unload(role=""):
+    if role and role not in aria_garage.ROLES:
+        raise ValueError(f"no such role: {role} (general, research, coder)")
+    return [role] if role and aria_garage.stop(role) else (
+        [] if role else aria_garage.stop_all())
+
+
+def garage_reap():
+    return aria_garage.reap(config())
+
+
 # ---- autopilot (the loop lives in aria_autopilot) ------------------------
 
 def _autopilot():
@@ -2881,13 +3019,16 @@ _CHOICE_KEYS = {
     "web_search": {"auto", "duckduckgo", "brave", "searxng", "wikipedia",
                    "none"},
     "autopilot_after_goal": {"improve", "stop"},
+    "giants_use": {"auto", "always", "never"},
 }
 _NUMBER_KEYS = {"context_tokens", "autopilot_max_tasks",
                 "autopilot_max_iterations", "autopilot_max_hours",
-                "autopilot_stall_limit", "autopilot_idle_minutes"}
+                "autopilot_stall_limit", "autopilot_idle_minutes",
+                "giants_loaded", "giants_idle_minutes", "giants_ctx"}
 _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "web_search_url", "web_allowlist", "github_base_branch",
-              "promotion_target"}
+              "promotion_target", "giant_general", "giant_research",
+              "giant_coder", "giants_flags"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 
@@ -2914,12 +3055,21 @@ def config_set(key, value):
         if key == "autopilot_stall_limit" and number < 1:
             raise ValueError("autopilot_stall_limit must be at least 1 — "
                              "one dry batch is the soonest she can notice")
+        if key == "giants_loaded" and number < 1:
+            raise ValueError("giants_loaded must be at least 1")
         if key in ("autopilot_max_tasks", "autopilot_max_iterations",
-                   "autopilot_stall_limit"):
+                   "autopilot_stall_limit", "giants_loaded", "giants_ctx"):
             number = int(number)                  # whole tasks, whole batches
         value = str(int(number)) if number == int(number) else str(number)
     elif "#" in value:
         raise ValueError(f"{key} cannot contain '#'")
+    elif key.startswith("giant_") and value:
+        path = Path(os.path.expanduser(value))
+        if not path.is_absolute():
+            path = ROOT / path
+        if not path.is_file() or path.suffix.lower() != ".gguf":
+            raise ValueError(f"{value} is not a .gguf file — point at the "
+                             "first part of the model (…-00001-of-0000N.gguf)")
     path = ROOT / "system" / "config.yml"
     text = path.read_text(encoding="utf-8")
     line = f"{key}: {value}".rstrip()
@@ -2932,7 +3082,10 @@ def config_set(key, value):
 
 
 def _probe_backend(target):
-    """Is this tier's backend up, and does it have the model (ollama only)?"""
+    """Is this tier's backend up, and does it have the model (ollama only)?
+    A giant counts as up when its files are complete: it loads on demand."""
+    if target.get("giant"):
+        return {"server": True, "ok": True, "models": [], "on_demand": True}
     try:
         if target["kind"] == "ollama":
             with urllib.request.urlopen(target["url"] + "/api/tags",

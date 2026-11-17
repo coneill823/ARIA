@@ -27,6 +27,36 @@ aria:
     fast: ollama/llama3.1:8b
     smart: ollama/llama3.1:8b
     deep:
+  # ---- the giants: one model per role, loaded when work needs it ----
+  # Very large GGUF models (bigger than RAM — llama.cpp streams them from
+  # NVMe; see docs/BIG-MODELS.md). Give each role the FIRST part of its
+  # model (…-00001-of-0000N.gguf). A.R.I.A. starts a role's llama-server
+  # when a task needs it and unloads the others first; a model that is
+  # still downloading is skipped until every part is complete.
+  # Easiest: Settings → Giant models → Find models.
+  giant_general:
+  giant_research:
+  giant_coder:
+  # auto   = the planner gives a task a giant when the work is worth the
+  #          wait (they answer at ~0.5–2 words a second)
+  # always = every coding task to coder, research to research, the rest
+  #          to general — strongest, slowest
+  # never  = giants only where you name them yourself
+  giants_use: auto
+  # How many giants may be loaded at once; unload one after this many
+  # minutes unused (0 = keep it loaded); the first port (general uses it,
+  # research the next, coder the one after).
+  giants_loaded: 1
+  giants_idle_minutes: 0
+  giants_port: 8090
+  # Each giant's context window, in tokens. Prompts for a giant are sized
+  # to it. Bigger costs real RAM for the whole time the giant is loaded —
+  # raise it only if `free -h` shows room to spare.
+  giants_ctx: 8192
+  # Extra llama-server flags for every giant, appended after the preset's
+  # own so they win — e.g. "-ngl 20" if loading runs out of VRAM beside
+  # your everyday model, or "--threads 16".
+  giants_flags:
   # Backends: any name -> base URL. "ollama" speaks Ollama's native API;
   # every other name is treated as OpenAI-compatible (/v1/chat/completions):
   # llama.cpp llama-server, LM Studio, vLLM, OmniRoute, colibri (coli serve),

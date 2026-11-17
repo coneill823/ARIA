@@ -14,6 +14,8 @@
 #   aria autopilot <slug> approve-task|skip-task <id> ["note"]
 #                              answer a task that is waiting on you
 #   aria plan <slug>           assess + (re)plan a project now
+#   aria models [status|scan|use|load|unload]   the giant models, one per
+#                              role (general, research, coder)
 #   aria agent <name> "task"   run one agent (role + skills + model tier)
 #   aria mission <name> "task" queue a BACKGROUND agent job
 #   aria missions [run]        list missions / drain the queue headless
@@ -170,7 +172,7 @@ DESKTOP
     exec python3 "$ARIA_ROOT/bin/aria-test" "$@"
     ;;
 
-  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger)
+  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger|models)
     exec python3 "$ARIA_ROOT/bin/aria-do" "$cmd" "$@"
     ;;
 

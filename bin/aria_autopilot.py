@@ -59,6 +59,7 @@ import time
 from pathlib import Path
 
 import aria_engine as eng
+import aria_garage
 import aria_git
 
 MAX_ATTEMPTS = 3            # generations a task gets before it is failed
@@ -530,6 +531,12 @@ def capabilities(goal_text, cfg=None):
              for t in ("fast", "smart", "deep")}
     extra = [m for m in eng.installed_models(cfg)
              if m["spec"] not in tiers.values()][:12]
+    giants = []
+    if cfg["giants_use"] != "never":
+        for role, info in aria_garage.configured(cfg).items():
+            ok, why = aria_garage.available(role, cfg)
+            giants.append({"role": role, "label": info["label"],
+                           "ok": ok, "why": why})
     tools = ["write and rewrite project files (whole files, verified "
              "before they are kept)",
              "check code for syntax errors (Python, JSON, shell, "
@@ -549,7 +556,8 @@ def capabilities(goal_text, cfg=None):
     if eng.brain_ready(cfg):
         tools.append("notes mirrored into the owner's Obsidian vault")
     return {"agents": agents, "skills": skills, "tiers": tiers,
-            "models": extra, "tools": tools, "limits": limits}
+            "models": extra, "giants": giants, "use": cfg["giants_use"],
+            "tools": tools, "limits": limits}
 
 
 def capabilities_text(cap, budget=3200):
@@ -569,6 +577,16 @@ def capabilities_text(cap, budget=3200):
     lines += [f"- {m['spec']}"
               + (f"  ({m['size_gb']} GB)" if m.get("size_gb") else "")
               for m in cap["models"]]
+    usable = [g for g in cap.get("giants", []) if g["ok"]]
+    if usable:
+        lines.append("GIANTS — the strongest models here and by far the "
+                     "slowest (about 0.5–2 words a second: one task can "
+                     "take an hour). Assign one by its role name only when "
+                     "the work is worth that wait"
+                     + (" — they are assigned automatically to matching "
+                        "work" if cap.get("use") == "always" else "") + ":")
+        lines += [f"- {g['role']} = {g['label']}  (best for "
+                  f"{aria_garage.ROLE_SAYS[g['role']]})" for g in usable]
     lines.append("\nTOOLS:")
     lines += [f"- {t}" for t in cap["tools"]]
     lines.append("\nLIMITS:")
@@ -618,8 +636,9 @@ Rules:
 - "agent": pick the specialist that fits the task from AGENTS.
 - "skills": up to 3 names from SKILLS that genuinely help; otherwise [].
 - "model": "" uses the agent's default. Set "fast", "smart" or "deep" (or a
-  listed backend/model) only when the task clearly needs less or more than
-  the default — fast for simple drafting, deep for the hardest reasoning.
+  listed backend/model, or a GIANT's role name) only when the task clearly
+  needs less or more than the default — fast for simple drafting, deep or
+  a giant for the hardest work.
 - "depends_on": ids from THIS list whose output the task builds on.
 - "reads": files from FILES that the task must see to do its work.
 - "research": true only for tasks that need facts from the live web%s
@@ -918,6 +937,10 @@ def _valid_model(spec, cfg, installed):
     spec = (spec or "").strip()
     if spec in ("", "fast", "smart", "deep"):
         return spec
+    role = eng.giant_role(spec)
+    if role:                 # only the giants the owner set up and allows
+        return role if cfg["giants_use"] != "never" \
+            and role in aria_garage.configured(cfg) else ""
     target = eng._parse_spec(spec, cfg)
     if target is None:
         return ""
@@ -960,6 +983,26 @@ def _truthy(value):
     if isinstance(value, str):
         return value.strip().lower() in ("true", "yes", "1")
     return value is True or value == 1
+
+
+_CODE_WORDS = re.compile(
+    r"\.(py|js|ts|tsx|jsx|rs|go|java|kt|c|cpp|h|cs|rb|php|swift|sh|sql|"
+    r"html|css|vue|svelte|dart|lua)\b|\b(code|implement|function|class|"
+    r"refactor|bug|test|script|api|endpoint|module)\b", re.I)
+
+
+def _matching_giant(task, cfg):
+    """With giants_use: always — the giant whose role fits the work."""
+    have = aria_garage.configured(cfg)
+    if task.get("research") or task["agent"] == "researcher":
+        role = "research"
+    elif task["agent"] == "coder" or _CODE_WORDS.search(
+            task["title"] + " " + task["detail"]):
+        role = "coder"
+    else:
+        role = "general"
+    return role if role in have and aria_garage.available(role, cfg)[0] \
+        else ""
 
 
 def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
@@ -1130,6 +1173,10 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
                              "exists and is complete").strip()[:400],
             "status": "todo", "attempts": 0, "iteration": iteration,
         })
+    if cfg["giants_use"] == "always":
+        for t in fresh:
+            if not t["model"]:
+                t["model"] = _matching_giant(t, cfg)
     for t in fresh:
         t["depends_on"] = list(dict.fromkeys(
             idmap[d] for d in t["depends_on"]
@@ -1203,6 +1250,14 @@ def plan(slug, emit):
 
 # ------------------------------------------------------------ execute
 
+def _task_model(task):
+    """The model spec a task runs on: its own, else its agent's."""
+    if task.get("model"):
+        return task["model"]
+    agent = eng.get_agent(task["agent"])
+    return (agent or {}).get("model") or "smart"
+
+
 def _runnable(plan):
     done = {t["id"] for t in plan["tasks"] if t["status"] == "done"}
     known = {t["id"] for t in plan["tasks"]}
@@ -1217,7 +1272,9 @@ def _runnable(plan):
 def _task_prompt(slug, task, plan, cfg):
     auto = _auto(slug)
     rows = inventory(_proj(slug))
-    budget = int(eng.prompt_budget(cfg) * 0.55)      # the rest: system prompt
+    # sized to the window of the model this task runs on; the rest of
+    # that window is the system prompt and the answer
+    budget = int(eng.prompt_budget(cfg, _task_model(task)) * 0.55)
     parts = []
     decision = task.get("decision") or {}
     if decision.get("answer") == "approved":
@@ -1416,6 +1473,7 @@ def _run_task(slug, state, plan, task, cfg, emit):
     task["status"] = "inprogress"
     task["attempts"] += 1
     task["started"] = _stamp()
+    task.setdefault("first_started", task["started"])
     _save_plan(slug, plan)
     picked = eng.get_agent(task["agent"])
     target = eng.resolve_model(
@@ -1439,6 +1497,15 @@ def _run_task(slug, state, plan, task, cfg, emit):
             {a["name"] for a in eng.list_agents()})
         agent = eng.get_agent(task["agent"])
     model_spec = task["model"] or (agent["model"] if agent else "smart")
+    role = eng.task_role(model_spec, cfg)
+    if role and role not in aria_garage.loaded_roles(cfg) \
+            and aria_garage.available(role, cfg)[0]:
+        emit({"event": "thinking",
+              "label": f"loading the {role} giant for {task['id']}"})
+        emit({"event": "stage_done", "stage": "garage",
+              "log": f"{slug}: {task['id']} needs the {role} giant — "
+                     "loading it (others are unloaded first; this can take "
+                     "several minutes)"})
     try:
         output = eng.run_agent(
             task["agent"], _task_prompt(slug, task, plan, cfg), emit,
@@ -1870,6 +1937,15 @@ def _step(slug, state, cfg, emit):
         if replan:
             return "replanned"
     ready = _runnable(plan)
+    if len(ready) > 1 and aria_garage.configured(cfg):
+        # swapping a giant in costs minutes and a cold page cache: run what
+        # the loaded giant (or no giant) can do before what needs a swap
+        loaded = aria_garage.loaded_roles(cfg)
+
+        def swap(t):
+            role = eng.task_role(_task_model(t), cfg)
+            return 1 if role and role not in loaded else 0
+        ready.sort(key=lambda t: (t["attempts"] > 0, swap(t)))
     if ready:
         return _run_task(slug, state, plan, ready[0], cfg, emit)
     stranded = [t for t in plan["tasks"]
@@ -2264,6 +2340,94 @@ def _finalize(slug, emit, reason, detail=""):
 
 # ------------------------------------------------------------ for the UI
 
+def _archived(auto):
+    """Finished tasks moved off the board (they stay in the history)."""
+    rows = []
+    path = auto / "plan-archive.jsonl"
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
+
+
+def _count_lines(path):
+    try:
+        with open(path, "rb") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
+def _brief_task(t):
+    keep = ("id", "title", "status", "iteration", "agent", "model",
+            "model_used", "phase", "est_hours", "seconds", "started",
+            "first_started", "finished", "depends_on", "attempts", "took",
+            "files")
+    return {k: t[k] for k in keep if k in t}
+
+
+def _ts(stamp):
+    try:
+        return datetime.datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _timings(tasks, archived, state):
+    """Real time on the board and the Gantt: how long each finished task
+    took, and — for work not done yet — a prediction calibrated on how
+    long this project's tasks have actually taken (per model where there
+    is enough history), rather than the planner's guess."""
+    finished = [t for t in archived + tasks if t.get("seconds")
+                and t.get("status") in ("done", "failed")]
+    ratios, by_model = [], {}
+    for t in finished:
+        size = max(0.25, float(t.get("est_hours") or 1))
+        r = t["seconds"] / size
+        ratios.append(r)
+        by_model.setdefault(t.get("model_used") or t.get("model") or "",
+                            []).append(r)
+
+    def median(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if xs else 0
+
+    overall = median(ratios)
+    for t in tasks:
+        size = max(0.25, float(t.get("est_hours") or 1))
+        if t.get("seconds") and t["status"] in ("done", "failed", "skipped"):
+            t["took"] = t["seconds"]
+            continue
+        model_r = median(by_model.get(t.get("model") or "", []))
+        rate = model_r if len(by_model.get(t.get("model") or "", [])) >= 3 \
+            else overall
+        t["predict"] = int(size * rate) if rate else 0
+        if t["status"] in ("inprogress", "reviewing") and t.get("started"):
+            t["elapsed"] = int(time.time() - _ts(t["started"]))
+    return overall
+
+
+def reports(slug):
+    """Every run's final report, newest first: {name, run, title}."""
+    folder = eng._auto_dir(slug, create=False) / "reports"
+    out = []
+    if folder.is_dir():
+        for f in sorted(folder.glob("run-*.md"), reverse=True):
+            m = re.match(r"run-(\d+)-(\d{8})-(\d{6})", f.stem)
+            try:
+                head = f.read_text(encoding="utf-8", errors="replace")[:600]
+            except OSError:
+                continue
+            line = next((ln for ln in head.splitlines()
+                         if ln.startswith("Run ")), "")
+            out.append({"name": f.name, "run": int(m.group(1)) if m else 0,
+                        "title": line.rstrip(".")})
+    return out
+
+
 def view(slug):
     """Everything the Projects page shows for one project."""
     proj = eng._project_dir(slug)
@@ -2280,6 +2444,7 @@ def view(slug):
 
     plan = _with_decisions(_plan(slug), auto) \
         if (auto / "plan.json").is_file() else {"tasks": []}
+    _timings(plan["tasks"], _archived(auto), state)
     held = _held(plan)
     for t in plan["tasks"]:
         t["held"] = t["id"] in held and not t.get("needs_human")
@@ -2306,7 +2471,10 @@ def view(slug):
         "steering": text("STEERING.md"),
         "changelog": text("CHANGELOG.md", tail=16000),
         "report": text("FINAL-REPORT.md"),
+        "reports": reports(slug),
+        "history": [_brief_task(t) for t in _archived(auto)],
         "changes": eng.project_changes(slug, limit=300),
+        "changes_total": _count_lines(auto / "changes.jsonl"),
         "activity": activity(slug) if auto.is_dir() else [],
         "live": live(slug),
         "git": git,

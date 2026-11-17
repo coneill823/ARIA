@@ -142,6 +142,13 @@ function renderState(st) {
     ? hl.model + (hl.smart && hl.smart !== hl.model ? ' · ' + hl.smart : '')
     : (hl.server ? 'model missing — ' + hl.model : 'model server offline');
   $('#health').title = hl.ok ? 'fast · smart tiers reachable' : (hl.error || '');
+  const gz = st.garage || {}, gl = gz.loaded || [];
+  let gnow = $('#garage-now');
+  if (!gnow) { gnow = h('span', { id: 'garage-now' }); $('#health').after(gnow); }
+  gnow.textContent = (gz.now && gz.now.message) ? '⏳ ' + gz.now.message
+    : gl.length ? '◆ giant: ' + gl.map(r => r + (gz.labels[r] ? ' (' + gz.labels[r].split('-').slice(0, 2).join('-') + ')' : '')).join(', ')
+    : '';
+  gnow.hidden = !gnow.textContent;
   for (const [key, on] of Object.entries(st.switches)) {
     const el = $('#sw-' + key);
     if (el) el.classList.toggle('on', !!on);

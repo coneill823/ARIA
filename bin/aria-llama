@@ -44,7 +44,7 @@ MODELS="$ARIA_ROOT/vendor/models"
 PORT="${ARIA_LLAMACPP_PORT:-8080}"
 CTX="${ARIA_LLAMACPP_CTX:-16384}"
 
-usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 server_bin() {
   for b in "$VENDOR/bin/llama-server" "$VENDOR/llama-server" \
@@ -168,9 +168,13 @@ case "$cmd" in
       ctx="${ARIA_LLAMACPP_CTX:-8192}"
       echo "serving GIANT $(basename "$gguf") on http://127.0.0.1:$PORT"
       echo "weights stream from disk — expect ~0.5-2 tok/s; first reply is slowest"
+      # ARIA_LLAMA_EXTRA: extra llama-server flags, appended last so they
+      # override the preset (aria.giants_flags, e.g. "-ngl 20 --threads 16")
+      # shellcheck disable=SC2086
       exec "$bin" -m "$gguf" --host 127.0.0.1 --port "$PORT" \
         -ngl 999 --n-cpu-moe 999 --ctx-size "$ctx" \
-        --cache-type-k q8_0 --cache-type-v q8_0 --jinja
+        --cache-type-k q8_0 --cache-type-v q8_0 --jinja \
+        ${ARIA_LLAMA_EXTRA:-}
     fi
     echo "serving $(basename "$gguf") on http://127.0.0.1:$PORT (OpenAI API)"
     echo "flags: -ngl 999 $moe_flags --ctx-size $CTX"

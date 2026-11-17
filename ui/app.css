@@ -583,3 +583,20 @@ pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mon
   .field { grid-template-columns: 1fr; }
   .field .hint { grid-column: 1; }
 }
+
+/* ------------------------------------------------------------ giants */
+.giant-state { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+               margin-top: 6px; }
+.spin { width: 12px; height: 12px; border-radius: 50%;
+        border: 2px solid var(--line); border-top-color: var(--warn);
+        animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+table.found { width: 100%; border-collapse: collapse; margin-top: 10px;
+              font-size: 12.5px; }
+table.found td { border-top: 1px solid var(--line); padding: 7px 6px;
+                 vertical-align: top; }
+table.found td.warn { color: var(--warn); }
+table.found .hint { overflow-wrap: anywhere; }
+#garage-now { display: block; font-size: 11px; color: var(--warn);
+              margin-top: 4px; overflow: hidden; text-overflow: ellipsis;
+              white-space: nowrap; }

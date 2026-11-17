@@ -23,6 +23,8 @@ Environment:
                  one that depends on it
   MOCK_REPEAT    the second batch proposes the first batch's work again
   MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
+  MOCK_LOAD_SECONDS  /health answers 503 "Loading model" this long after
+                 start, like llama-server loading a giant
 """
 
 import json
@@ -37,6 +39,8 @@ MODELS = [("llama3.1:8b", 4_900_000_000), ("qwen3:30b", 18_000_000_000),
 STATE = {"plans": {}, "attempts": {}, "audits": {}, "calls": []}
 DELAY = float(os.environ.get("MOCK_DELAY", "0") or 0)
 BATCHES = int(os.environ.get("MOCK_BATCHES", "2") or 2)
+LOAD_SECONDS = float(os.environ.get("MOCK_LOAD_SECONDS", "0") or 0)
+STARTED = time.time()
 
 
 def _slug(text, default="project"):
@@ -452,7 +456,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/api/tags":
+        if self.path == "/health":       # llama-server's readiness probe
+            if time.time() - STARTED < LOAD_SECONDS:
+                self._json({"error": {"code": 503,
+                                      "message": "Loading model"}}, 503)
+            else:
+                self._json({"status": "ok"})
+        elif self.path == "/api/tags":
             self._json({"models": [{"name": n, "size": s}
                                    for n, s in MODELS]})
         elif self.path == "/v1/models":

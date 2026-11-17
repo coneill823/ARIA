@@ -31,10 +31,18 @@ bin/aria llama get <url-of-part-00002>   # ... repeat per part
 bin/aria llama serve giant vendor/models/<first-part-00001-of-000NN>.gguf
 ```
 
-Then point the deep tier at it (⚙ Settings or config):
-`deep: llamacpp/giant`. The preset keeps **mmap on** (that's the disk
-streaming), puts every expert on CPU (`--n-cpu-moe 999`), attention on the
-GPU, and shrinks/quantizes the KV cache to protect your 62GB of RAM.
+That serves one giant by hand on :8080 (`deep: llamacpp/giant`). You
+rarely need to: give the model a **role** instead and A.R.I.A. starts and
+swaps the giants herself —
+
+```bash
+bin/aria models scan
+```
+
+— see **[MODEL-GARAGE.md](MODEL-GARAGE.md)**. Either way the preset keeps
+**mmap on** (that's the disk streaming), puts every expert on CPU
+(`--n-cpu-moe 999`), attention on the GPU, and shrinks/quantizes the KV
+cache to protect your 62GB of RAM.
 
 Where to get the quants: look for **Unsloth "UD" dynamic quants** on
 HuggingFace (`unsloth/DeepSeek-R1-GGUF`, `unsloth/Kimi-K2-Instruct-GGUF` —

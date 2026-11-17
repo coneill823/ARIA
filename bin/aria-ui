@@ -29,6 +29,8 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
   POST /api/autopilot  {"slug", "action": approve|start|stop|steer, "text"?}
   POST /api/approve-task  {"slug", "id", "note"?}  a task that waits on you:
   POST /api/skip-task     {"slug", "id", "note"?}  let it run / decline it
+  GET  /api/garage     the giant models: one per role, what is loaded
+  POST /api/garage     {"action": scan|load|unload, "folder"?, "role"?}
   POST /api/plan       {"slug"} -> streamed (re)plan
   POST /api/github     {"slug", "action": init|publish|push}
   POST /api/agent      {"name", "task"} -> streamed agent run
@@ -60,7 +62,9 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "brain_journal", "autopilot_git", "autopilot_after_goal",
                "autopilot_max_tasks", "autopilot_max_iterations",
                "autopilot_max_hours", "autopilot_stall_limit",
-               "context_tokens")
+               "context_tokens", "giant_general", "giant_research",
+               "giant_coder", "giants_use", "giants_loaded",
+               "giants_idle_minutes")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
 
@@ -73,6 +77,27 @@ def health_cached(max_age=10):
             _HEALTH["value"] = eng.health()
             _HEALTH["at"] = time.time()
         return _HEALTH["value"]
+
+
+def garage_brief():
+    """What the sidebar shows about the giants: which is loaded, and what
+    is loading. Cheap: no network probes."""
+    try:
+        st = eng.garage_status(probe=False)
+    except Exception:
+        return {}
+    return {"loaded": [r for r, v in st["roles"].items()
+                       if v["state"] in ("ready", "loading")],
+            "labels": {r: v["label"] for r, v in st["roles"].items()},
+            "now": st["now"]}
+
+
+def load_giant(role):
+    try:
+        eng.garage_load(role, notify=lambda t: print("garage:", t,
+                                                     flush=True))
+    except Exception as exc:
+        print("garage:", exc, flush=True)
 
 
 def config_view():
@@ -103,6 +128,11 @@ def config_view():
         "autopilot_max_hours": cfg["autopilot_max_hours"],
         "autopilot_stall_limit": cfg["autopilot_stall_limit"],
         "context_tokens": cfg["context_tokens"],
+        "giants": cfg["giants"],
+        "giants_use": cfg["giants_use"],
+        "giants_loaded": cfg["giants_loaded"],
+        "giants_idle_minutes": cfg["giants_idle_minutes"],
+        "garage": eng.garage_status(probe=False),
         "promotion_target": cfg["promotion_target"],
         "webhooks": sorted(cfg["webhooks"]),
     }
@@ -200,6 +230,7 @@ class Handler(BaseHTTPRequestHandler):
                              "auto_pipeline": cfg["auto_pipeline"]},
                 "missions": len([m for m in eng.mission_list()
                                  if m["status"] in ("queued", "running")]),
+                "garage": garage_brief(),
             })
         elif path == "/api/board":
             self.send_json(eng.board())
@@ -207,6 +238,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(health_cached(max_age=3))
         elif path == "/api/config":
             self.send_json(config_view())
+        elif path == "/api/garage":
+            self.send_json(eng.garage_status())
         elif path == "/api/missions":
             self.send_json({"missions": eng.mission_list()})
         elif path == "/api/projects":
@@ -350,6 +383,24 @@ class Handler(BaseHTTPRequestHandler):
                 via="ui")
             self.send_json({"ok": True, done["answer"]: done["task"],
                             **done})
+        elif path == "/api/garage":
+            action, role = text("action"), text("role")
+            if action == "scan":
+                self.send_json({"found": eng.garage_scan(text("folder"))})
+            elif action == "load":
+                if role not in eng.aria_garage.ROLES:
+                    raise ValueError("role must be general, research or coder")
+                ok, why = eng.aria_garage.available(role, eng.config())
+                if not ok and "failed to load" not in why:
+                    raise ValueError(why)
+                threading.Thread(target=load_giant, args=(role,),
+                                 daemon=True).start()
+                self.send_json({"ok": True, "loading": role})
+            elif action == "unload":
+                self.send_json({"ok": True, "unloaded":
+                                eng.garage_unload(role)})
+            else:
+                raise ValueError("action must be scan, load or unload")
         elif path == "/api/plan":
             self.plan_project(body)
         elif path == "/api/github":
@@ -570,8 +621,17 @@ def autopilot_worker():
         if ev.get("log"):
             print("autopilot:", ev["log"], flush=True)
 
+    last_reap = 0.0
     while True:
         busy = False
+        if time.time() - last_reap > 60:      # unload idle giants
+            last_reap = time.time()
+            try:
+                for role in eng.garage_reap():
+                    print(f"garage: unloaded the idle {role} giant",
+                          flush=True)
+            except Exception as exc:
+                print("garage error:", exc, flush=True)
         try:
             running = [p["slug"] for p in eng.list_projects()
                        if p["autopilot"] == "running"]
@@ -609,6 +669,7 @@ def mission_worker():
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8700
+    eng.GARAGE_LISTENERS.append(lambda t: print("garage:", t, flush=True))
     threading.Thread(target=mission_worker, daemon=True).start()
     threading.Thread(target=autopilot_worker, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

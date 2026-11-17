@@ -92,6 +92,41 @@ def free_port():
         return s.getsockname()[1]
 
 
+def free_ports(n):
+    """The first of `n` consecutive free ports."""
+    for _ in range(50):
+        base = free_port()
+        socks = []
+        try:
+            for i in range(n):
+                s = socket.socket()
+                s.bind(("127.0.0.1", base + i))
+                socks.append(s)
+            return base
+        except OSError:
+            continue
+        finally:
+            for s in socks:
+                s.close()
+    raise RuntimeError("no run of free ports")
+
+
+def write_gguf(path, data_offset=0):
+    """A minimal valid GGUF file (one key, one tensor) — a stand-in for a
+    model part, old enough not to look like a download in progress."""
+    import struct
+
+    def s(b):
+        return struct.pack("<Q", len(b)) + b
+    head = b"GGUF" + struct.pack("<IQQ", 3, 1, 1)
+    head += s(b"general.architecture") + struct.pack("<I", 8) + s(b"llama")
+    head += s(b"t") + struct.pack("<IQIQ", 1, 32, 0, data_offset)
+    with open(path, "wb") as f:
+        f.write(head + b"\0" * ((-len(head)) % 32) + b"\1" * 128)
+    old = time.time() - 600
+    os.utime(path, (old, old))
+
+
 def wait_http(url, tries=60):
     for _ in range(tries):
         try:
@@ -131,7 +166,8 @@ def main():
         shutil.copytree(os.path.join(REAL_ROOT, sub),
                         os.path.join(sandbox, sub), symlinks=False,
                         ignore=shutil.ignore_patterns("__pycache__",
-                                                      "voice-token"))
+                                                      "voice-token",
+                                                      "garage"))
     for d in ("pipeline/00-inbox", "pipeline/01-processing",
               "pipeline/02-potential-projects", "pipeline/knowledge/lists",
               "pipeline/knowledge/notes", "pipeline/knowledge/content-ideas",
@@ -150,7 +186,12 @@ def main():
                web_search_url="", web_allowlist="",
                autopilot_after_goal="stop", autopilot_max_iterations="0",
                autopilot_max_hours="0", autopilot_max_tasks="0",
-               autopilot_stall_limit="3")
+               autopilot_stall_limit="3",
+               # …and never loads (or unloads) the owner's real giants:
+               # the garage is exercised with stand-in servers
+               giant_general="", giant_research="", giant_coder="",
+               giants_use="auto", giants_loaded="1",
+               giants_idle_minutes="0")
 
     if MOCK:
         port = free_port()
@@ -203,6 +244,25 @@ def main():
         finally:
             os.environ["ARIA_OLLAMA_URL"] = old
             mock.terminate()
+
+    def fixture_project(slug):
+        """A proposed project written by hand — no model involved — so the
+        gate checks still run when the model server is down."""
+        d = os.path.join(sandbox, "pipeline/02-potential-projects", slug)
+        if not os.path.isdir(d):
+            os.makedirs(d)
+            with open(os.path.join(d, "idea.md"), "w") as f:
+                f.write(f"---\nslug: {slug}\nstatus: proposed\n"
+                        "type: project\n---\n\n## Raw capture\n\n"
+                        "a tiny script that sorts my downloads folder\n")
+            with open(os.path.join(d, "proposed-plan.md"), "w") as f:
+                f.write(f"---\nslug: {slug}\nstatus: proposed\n---\n\n"
+                        "# Proposed plan: Downloads sorter\n\n> **Pitch:** "
+                        "sort the downloads folder by file type.\n\n"
+                        "## What we're building\n\nA small script.\n\n"
+                        "## Scope\n\n**In:** sorting by type.\n"
+                        "**Out:** anything else.\n")
+        return slug
 
     def started_project(slug):
         """A fresh project: planned, approved, autopilot engaged."""
@@ -674,10 +734,101 @@ def main():
         return "queued -> ran -> done, output persisted"
     check("background mission — model", c_missions)
 
+    def c_garage():
+        """The giants: found on disk, one role each, swapped in on demand,
+        never unloaded mid-answer, skipped while still downloading. Runs
+        against stand-in servers — no real model is loaded."""
+        import aria_garage as garage
+        models = os.path.join(sandbox, "_models")
+        os.makedirs(models)
+        for i in (1, 2, 3):
+            write_gguf(os.path.join(
+                models, f"DeepSeek-R1-UD-Q2_K_XL-{i:05d}-of-00003.gguf"))
+        for i in (1, 2):
+            write_gguf(os.path.join(
+                models, f"Kimi-K2-Instruct-UD-IQ1_M-{i:05d}-of-00002.gguf"))
+        for i in (1, 2, 3):                      # half-downloaded
+            write_gguf(os.path.join(
+                models, f"Qwen3-Coder-480B-UD-Q2_K_XL-{i:05d}-of-00006.gguf"))
+        write_gguf(os.path.join(models, "cut-short.gguf"),
+                   data_offset=50_000_000)
+        found = {m["name"]: m for m in eng.garage_scan(models)}
+        assert len(found) == 4, sorted(found)
+        assert found["DeepSeek-R1-UD-Q2_K_XL"]["guess"] == "general" \
+            and found["Kimi-K2-Instruct-UD-IQ1_M"]["guess"] == "research" \
+            and found["Qwen3-Coder-480B-UD-Q2_K_XL"]["guess"] == "coder"
+        assert "3 of 6 parts" in found["Qwen3-Coder-480B-UD-Q2_K_XL"]["why"]
+        assert "incomplete" in found["cut-short"]["why"], found["cut-short"]
+        for role, name in (("general", "DeepSeek-R1-UD-Q2_K_XL"),
+                           ("research", "Kimi-K2-Instruct-UD-IQ1_M"),
+                           ("coder", "Qwen3-Coder-480B-UD-Q2_K_XL")):
+            eng.config_set(f"giant_{role}", found[name]["path"])
+        set_config(sandbox, giants_port=str(free_ports(3)))
+        try:
+            eng.config_set("giant_coder", os.path.join(models, "nope.gguf"))
+            raise AssertionError("a model file that does not exist was set")
+        except ValueError:
+            pass
+        os.environ["ARIA_GARAGE_COMMAND"] = (
+            f"{sys.executable} "
+            f"{os.path.join(sandbox, 'bin', 'aria-mock-llm')} {{port}}")
+        os.environ["MOCK_LOAD_SECONDS"] = "1"
+        try:
+            # still downloading -> not offered, falls back, says why
+            target = eng.resolve_model("coder")
+            assert not target.get("giant") and "3 of 6 parts" in \
+                target.get("fallback", ""), target
+            persona = "You are A.R.I.A. (Autonomous Reasoning"
+            said = eng.chat_stream(eng.resolve_model("general"), "hello",
+                                   persona)
+            assert said and garage.loaded_roles(eng.config()) == {"general"}
+            eng.chat_stream(eng.resolve_model("research"), "hello", persona)
+            assert garage.loaded_roles(eng.config()) == {"research"}, \
+                "two giants were loaded at once"
+            # one that is answering is never pulled out from under itself
+            held, release = threading.Event(), threading.Event()
+
+            def answering():
+                with garage.serving("research", eng.config()):
+                    held.set()
+                    release.wait(15)
+            worker = threading.Thread(target=answering)
+            worker.start()
+            held.wait(10)
+            try:
+                garage.stop("research", wait=1)
+                raise AssertionError("a giant was unloaded mid-answer")
+            except garage.GarageBusy:
+                pass
+            finally:
+                release.set()
+                worker.join()
+            # a load that fails is reported once, then stepped around
+            os.environ["ARIA_GARAGE_COMMAND"] = (
+                f"{sys.executable} -c \"import sys; "
+                "print('error: failed to load model'); sys.exit(1)\"")
+            eng.garage_unload()
+            try:
+                garage.ensure("general", eng.config())
+                raise AssertionError("a failed load went unnoticed")
+            except garage.GarageError as exc:
+                assert "failed to load model" in str(exc), exc
+            assert eng.garage_status()["roles"]["general"]["state"] == "failed"
+            assert eng.resolve_model("general").get("fallback")
+        finally:
+            eng.garage_unload()
+            os.environ.pop("ARIA_GARAGE_COMMAND", None)
+            os.environ.pop("MOCK_LOAD_SECONDS", None)
+            set_config(sandbox, giant_general="", giant_research="",
+                       giant_coder="")
+        assert not garage.loaded_roles(eng.config())
+        return ("3 models found (a half-downloaded one flagged), swapped "
+                "one at a time on demand, held while answering, a failed "
+                "load reported and stepped around")
+    check("giant models — one per role, on demand", c_garage)
+
     def c_gate():
-        if "slug" not in state:
-            raise SkipTest("develop failed earlier")
-        slug = state["slug"]
+        slug = state.get("slug") or fixture_project("selftest-gate-approve")
         assert not eng.project_approved(slug)
         try:
             eng.autopilot_start(slug)
@@ -1111,7 +1262,7 @@ def main():
             code, out = call(token="selftest-secret",
                              body={"text": "what are you working on"})
             assert code == 200 and out["reply"], (code, out)
-            gated = "selftest-offline-idea"
+            gated = fixture_project("selftest-gate-fixture")
             code, out = call(token="selftest-secret",
                              body={"text": f"approve {gated}"})
             assert code == 200 and "in the app" in out["reply"], out
@@ -1301,7 +1452,7 @@ def main():
             code, body = post("/api/say", {"text": "what are you working on"})
             assert code == 200 and json.loads(body)["reply"], body[:200]
             code, body = post("/api/autopilot",
-                              {"slug": "selftest-offline-idea",
+                              {"slug": fixture_project("selftest-gate-fixture"),
                                "action": "start"})
             assert code == 409 and "needs_approval" in body, (code, body[:120])
             return ("capture and navigation by chat, /api/say answers, "
