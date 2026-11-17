@@ -25,6 +25,8 @@ Environment:
   MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
   MOCK_LOAD_SECONDS  /health answers 503 "Loading model" this long after
                  start, like llama-server loading a giant
+  MOCK_REFINE_BREAKS  the first attempt at a refinement changes what the
+                 code does (the project's tests must catch it)
 """
 
 import json
@@ -303,9 +305,42 @@ def plan_batch(prompt):
     return {"tasks": tasks, "project_complete": False}
 
 
+def review(prompt):
+    """A code review of one file: the core module could document itself
+    better; everything else is fine as it is."""
+    path = re.search(r"THE FILE: (\S+)", prompt)
+    path = path.group(1) if path else ""
+    if re.search(r"(^|/)core\.py$", path):
+        return {"findings": [{
+            "kind": "docs", "where": "run()",
+            "problem": "the docstring does not say what the result holds",
+            "fix": "name the keys of the returned dict in the docstring",
+            "risk": "safe", "severity": 2}]}
+    return {"findings": []}
+
+
+def refinement(prompt, title):
+    """A refinement of the core module. Behaviour-preserving — unless the
+    test wants to see a regression caught, on the first attempt."""
+    key = _slug(prompt) + "/" + title
+    STATE["attempts"][key] = attempt = STATE["attempts"].get(key, 0) + 1
+    count = "len(items) + 1" if os.environ.get("MOCK_REFINE_BREAKS") \
+        and attempt == 1 else "len(items)"
+    body = ('"""Core module."""\n\n\ndef run(items):\n'
+            '    """Summarise the items it is given.\n\n'
+            "    Returns a dict with 'count' (how many) and 'items' (a "
+            'list\n    copy of them).\n    """\n'
+            f"    return {{'count': {count}, 'items': list(items)}}\n")
+    return ("Refined as listed.\n\n```file:src/core.py\n" + body + "```\n\n"
+            "## Notes\n\nI extended the docstring of `run()` and changed "
+            "nothing else; its behaviour is the same.\n")
+
+
 def task_output(prompt):
     title = re.search(r"YOUR TASK: (.+)", prompt)
     title = title.group(1).strip() if title else "task"
+    if re.match(r"Refine (\S*/)?core\.py", title):
+        return refinement(prompt, title)
     detail = re.search(r"Detail: (.+)", prompt)
     detail = detail.group(1) if detail else ""
     key = _slug(prompt) + "/" + title
@@ -413,6 +448,8 @@ def reply_for(system, prompt):
         return json.dumps(verdict(p))
     if "You audit whether a project's requirements are met" in s:
         return json.dumps(audit(p))
+    if "reviewing ONE file of a working project" in s:
+        return json.dumps(review(p))
     if "working memory of an autonomous project" in s:
         return memory(p)
     if "opening summary of a report" in s:

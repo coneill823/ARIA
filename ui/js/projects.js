@@ -6,7 +6,7 @@
 import { $, $$, h, clear, api, stream, bus, md, modal, confirmBox, toast,
          badge, ago, title, resolvePath, store } from './core.js';
 
-const TABS = ['kanban', 'gantt', 'live', 'files', 'brief', 'changes', 'report'];
+const TABS = ['kanban', 'gantt', 'live', 'files', 'run', 'brief', 'changes', 'report'];
 const PALETTE = ['#45d6ff', '#4ade80', '#fbbf24', '#c084fc', '#fb7185',
                  '#34d399', '#f97316', '#60a5fa'];
 const PHASE_SAY = { assessing: 'Taking stock of the project…',
@@ -23,6 +23,9 @@ let filesInfo = null, fileSet = new Set(), filesSig = '', fileSel = '';
 let fileView = null, showRecords = false, openDirs = new Set();
 // history: which report is shown, the full change record, open Gantt bands
 let reportSel = '', reportCache = {}, allChanges = null, ganttOpen = new Set();
+// run: how the project is started, the program you started, its output
+let runInfo = null, runText = '', runNext = 0, runTimer = null, runStamp = 0;
+let checkRes = null, checking = false;
 
 const fmtDur = s => {
   if (s > 0 && s < 1) return '<1s';
@@ -251,6 +254,8 @@ function forget() {                 // everything that belongs to one project
   data = null; sig = ''; filesInfo = null; fileSet = new Set(); filesSig = '';
   fileSel = ''; fileView = null; reportSel = ''; reportCache = {};
   allChanges = null; ganttOpen = new Set(); openDirs = new Set();
+  runInfo = null; runText = ''; runNext = 0; checkRes = null; checking = false;
+  clearTimeout(runTimer);
 }
 
 async function select(slug) {
@@ -335,11 +340,13 @@ function render(force = false) {
     data.memory.length, data.steering.length, (data.reports || []).length,
     (data.history || []).length, data.pace, fileSet.size, fileSel,
     !!fileView && fileView.path, showRecords, reportSel, !!allChanges,
-    [...ganttOpen].join(), [...openDirs].join()]);
+    [...ganttOpen].join(), [...openDirs].join(), runStamp, checking,
+    (data.review || '').length, (data.state.refine || {}).stage]);
   if (!force && s === sig) { if (tab === 'live') updateLive(); return; }
   sig = s;
   const keep = body.scrollTop;
-  clear(body, notices(), ({ kanban, gantt, live, files, brief, changes, report })[tab]());
+  clear(body, notices(), ({ kanban, gantt, live, files, run: runTab, brief, changes, report })[tab]());
+  if (tab === 'run') afterRunDraw();
   body.scrollTop = keep;
   if (tab === 'live') updateLive();
 }
@@ -376,7 +383,13 @@ function notices() {
   if (st.status === 'stalled')
     out.push(h('div', { class: 'notice bad', text: 'She paused herself: ' + (st.stop_reason || 'no progress') + '. See the Report, give her guidance (Steer), then resume.' }));
   if (st.status === 'complete')
-    out.push(h('div', { class: 'notice good', text: 'Run complete — ' + (st.stop_reason || 'the goal is met') + '. The Report lists every change.' }));
+    out.push(h('div', { class: 'notice good row' },
+      h('span', { class: 'grow', text: 'Run complete — ' + (st.stop_reason || 'the goal is met') + '. The Report lists every change.' }),
+      tab !== 'run' ? h('button', { class: 'btn small', text: '▶ Try it', title: 'run the software yourself', onclick: () => setTab('run') }) : null));
+  const ref = st.refine;
+  if (st.status === 'running' && ref && ref.stage === 'review')
+    out.push(h('div', { class: 'notice', text: 'Reviewing the whole codebase — ' + (ref.total - (ref.queue || []).length) + ' of ' + ref.total +
+      ' files read, ' + (ref.findings || []).length + ' finding(s) so far. Refinements follow; each must leave the code\'s behaviour unchanged.' }));
   if (st.git_off && st.status === 'running')
     out.push(h('div', { class: 'notice warn', text: 'Git commits are paused for this run: ' + st.git_off }));
   return out;
@@ -401,6 +414,7 @@ function taskCard(t) {
     model ? badge(model.replace(/^ollama\//, ''), 'model') : null,
     (t.skills || []).map(sk => badge(sk, 'skill')),
     t.research ? badge('web', 'web') : null,
+    t.refine ? badge('refine', 'skill') : null,
     gated ? badge('needs you', 'ask') : null,
     t.held && t.status === 'todo' ? badge('behind a decision', 'ask') : null,
     said === 'approved' ? badge('approved by you', 'ok') : null,
@@ -424,7 +438,8 @@ function kanban() {
     ['Done', '', closed],
   ];
   const earlier = (data.history || []).slice().reverse();
-  const ghost = st.status === 'running' && PHASE_SAY[st.phase];
+  const ghost = st.status === 'running' && (PHASE_SAY[st.phase] ||
+    (/^reviewing the code/.test(st.phase || '') ? st.phase.charAt(0).toUpperCase() + st.phase.slice(1) + '…' : ''));
   if (!tasks.length && !ghost)
     return h('div', { class: 'empty' },
       h('div', { class: 'big', text: data.approved ? 'No tasks yet' : 'Not started' }),
@@ -839,10 +854,186 @@ function brief() {
       panel('Memory — what she has learned so far',
         data.memory ? body(data.memory, autoDoc('MEMORY.md'))
           : h('div', { class: 'dim', text: 'Rewritten after every batch: the state of the project, decisions made, lessons, and what is still to do. This — not a transcript — is what the next plan starts from.' })),
+      panel('Code review — what is worth refining',
+        data.review ? body(data.review, autoDoc('REVIEW.md'))
+          : h('div', { class: 'dim', text: 'When the goal is met she reads every source file, writes down what is worth changing here, and makes the refinements that leave the code\'s behaviour exactly as it is — each judged on its diff, and on the project\'s own tests where they can be run. Ask for it any time.' }),
+        data.approved ? h('button', { class: 'btn small', text: 'Review & refine now', onclick: refineNow }) : null),
       panel('Your guidance',
         notes.length ? h('ul', {}, notes.map(n => h('li', { text: n.slice(2) })))
           : h('div', { class: 'dim', text: 'None yet. Use Steer to redirect her without stopping.' }),
         data.approved ? h('button', { class: 'btn small', text: 'Steer', onclick: steer }) : null)));
+}
+
+async function refineNow() {
+  try {
+    await api.post('/api/autopilot', { slug: cur, action: 'refine' });
+    toast('She will read the whole codebase and refine it — watch the Live tab.', 'good', 6000);
+  } catch (e) { toast(e.message, 'bad', 8000); }
+  bus.emit('projects:changed', cur);
+  refresh(true);
+}
+
+// ---- run
+//
+// Try the software yourself. The command is shown; it starts when you
+// press Run, in the project's folder on this machine, and its output
+// streams here. A.R.I.A. never presses this button: nothing in chat, by
+// voice or in autopilot can start a program.
+
+async function loadRunner() {
+  try {
+    const got = await api.get('/api/runner?slug=' + encodeURIComponent(cur));
+    if (got.slug !== cur) return;
+    runInfo = got; runStamp++;
+    if (got.status.running) pollRun();
+  } catch (e) { runInfo = { slug: cur, error: e.message, run: [], check: [], setup: [], status: {}, sandbox: {} }; runStamp++; }
+  if (visible && tab === 'run') render(true);
+}
+
+async function pollRun() {
+  clearTimeout(runTimer);
+  if (!cur) return;
+  let o;
+  try { o = await api.get('/api/runner/output?slug=' + encodeURIComponent(cur) + '&since=' + runNext); }
+  catch { return; }
+  if (o.dropped) runText = '… (earlier output dropped)\n';
+  runText += o.text; runNext = o.next;
+  const was = runInfo && runInfo.status.running;
+  if (runInfo) runInfo.status = o;
+  const out = $('#run-out');
+  if (out && visible && tab === 'run') {
+    const stick = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
+    out.textContent = runText || '(no output yet)';
+    if (stick) out.scrollTop = out.scrollHeight;
+    drawRunStatus();
+  }
+  if (o.running) runTimer = setTimeout(pollRun, 700);
+  else if (was) { runStamp++; if (visible && tab === 'run') render(true); loadFiles(true); }
+}
+
+function drawRunStatus() {
+  const el = $('#run-status');
+  if (!el || !runInfo) return;
+  const s = runInfo.status;
+  clear(el,
+    s.running ? [h('span', { class: 'pill running', text: 'running' }), h('code', { text: s.cmd }),
+                 h('span', { class: 'hint', text: s.sandboxed ? 'sandboxed' : 'not sandboxed' })]
+      : s.cmd ? [h('span', { class: 'pill ' + (s.exit === 0 ? 'complete' : 'stalled'),
+                             text: s.exit === 0 ? 'finished' : 'exited with code ' + s.exit }), h('code', { text: s.cmd })]
+      : h('span', { class: 'hint', text: 'Nothing has been run yet.' }),
+    (s.urls || []).map(u => h('a', { class: 'btn small primary', href: u, target: '_blank', rel: 'noopener noreferrer', text: 'Open ' + u })),
+    h('span', { class: 'grow' }),
+    s.running ? h('button', { class: 'btn small danger', text: '■ Stop', onclick: () => runAct('stop') }) : null);
+}
+
+async function runAct(action, extra = {}) {
+  try {
+    const r = await api.post('/api/runner', { slug: cur, action, ...extra });
+    if (action === 'start') { runText = ''; runNext = 0; }
+    if (runInfo && action !== 'save') runInfo.status = r;
+    if (action === 'save') runInfo = r;
+    runStamp++;
+    render(true);
+    if (action === 'start' || action === 'stop') pollRun();
+    return r;
+  } catch (e) { toast(e.message, 'bad', 9000); }
+}
+
+async function runCommand(cmd, boxed) {
+  cmd = cmd.trim();
+  if (!cmd) return;
+  if (runInfo.status.running) return toast('Something is already running — stop it first.', 'bad');
+  const key = 'run-ok:' + cur;
+  const seen = store.get(key, []);
+  if (!seen.includes(cmd)) {
+    const ok = await confirmBox('Run this on your machine?', [
+      h('pre', { class: 'raw', text: cmd }),
+      h('p', {}, 'In ', h('code', { text: runInfo.path }), '.'),
+      boxed ? 'Sandboxed: it can change files only inside that folder. It can still read your files, use the network and open a window.'
+            : 'Not sandboxed: it runs with your own permissions, like a command typed in a terminal.',
+      'This is code a model wrote. Read the command before you run it.',
+    ], '▶ Run');
+    if (!ok) return;
+    store.set(key, [...seen, cmd].slice(-30));
+  }
+  runAct('start', { cmd, sandboxed: boxed });
+}
+
+async function runChecks() {
+  checking = true; checkRes = null; render(true);
+  try { checkRes = await api.post('/api/runner', { slug: cur, action: 'check' }); }
+  catch (e) { checkRes = { ran: false, why: e.message }; }
+  checking = false; render(true);
+}
+
+function runRow(c, boxed, kind) {
+  const input = h('input', { type: 'text', value: c.cmd, spellcheck: 'false' });
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') runCommand(input.value, boxed()); });
+  return h('div', { class: 'runrow' },
+    h('span', { class: 'rname', text: c.name + (c.mine ? ' (yours)' : '') }),
+    input,
+    h('button', { class: 'btn small', text: 'Save', title: 'remember this command for the project',
+      onclick: () => runAct('save', { kind, name: c.name, cmd: input.value }) }),
+    h('button', { class: 'btn small primary', text: '▶ Run', onclick: () => runCommand(input.value, boxed()) }));
+}
+
+function runTab() {
+  if (!runInfo || runInfo.slug !== cur) { loadRunner(); return h('div', { class: 'empty', text: 'Looking at how this project is run…' }); }
+  if (runInfo.error) return h('div', { class: 'empty', text: runInfo.error });
+  const sb = runInfo.sandbox || {};
+  const box = h('input', { type: 'checkbox', checked: sb.available && store.get('run-sandbox', true), disabled: !sb.available,
+    onchange: e => store.set('run-sandbox', e.target.checked) });
+  const boxed = () => box.checked;
+  const custom = h('input', { type: 'text', placeholder: 'any command — it runs in the project folder', spellcheck: 'false' });
+  custom.addEventListener('keydown', e => { if (e.key === 'Enter') runCommand(custom.value, boxed()); });
+  const line = h('input', { type: 'text', placeholder: 'type a line for the running program, Enter to send', spellcheck: 'false' });
+  line.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    runAct('input', { text: line.value }); line.value = '';
+  });
+  const none = !runInfo.run.length && !runInfo.setup.length;
+  const cr = checkRes;
+  return h('div', { id: 'run' },
+    h('div', { class: 'fbar' },
+      h('span', { class: 'fwhere' }, '📁 ', h('code', { text: runInfo.path })),
+      h('span', { class: 'grow' }),
+      h('label', { class: 'toggle hint', title: sb.available ? 'bubblewrap: the program can change files only inside the project folder'
+                                                             : (sb.why || 'no sandbox available') },
+        box, sb.available ? ' sandbox — it can only change files in this folder' : ' no sandbox here'),
+      h('button', { class: 'btn small', text: 'Terminal here', disabled: !(runInfo.tools || {}).terminal,
+        onclick: () => openOnDesktop('terminal') })),
+    !sb.available ? h('div', { class: 'notice warn', text: 'Programs run with your own permissions here: ' + (sb.why || 'no sandbox') + '.' }) : null,
+    h('div', { class: 'panel' }, h('h2', {}, 'Run it'),
+      h('div', { class: 'p-body' },
+        none ? h('div', { class: 'dim', text: 'Nothing here says how to start this project yet (no main.py, package.json, Makefile…). Type a command below — Save keeps it for next time.' }) : null,
+        runInfo.setup.map(c => runRow(c, boxed, 'setup')),
+        runInfo.run.map(c => runRow(c, boxed, 'run')),
+        h('div', { class: 'runrow' }, h('span', { class: 'rname', text: 'Your own' }), custom,
+          h('button', { class: 'btn small', text: 'Save', onclick: () => custom.value.trim() && runAct('save', { kind: 'run', name: 'Mine', cmd: custom.value }) }),
+          h('button', { class: 'btn small primary', text: '▶ Run', onclick: () => runCommand(custom.value, boxed()) })),
+        h('div', { class: 'hint', style: { marginTop: '8px' }, text: 'It starts when you press Run — never on its own. A.R.I.A. cannot press this for you, in chat, by voice or in autopilot.' }))),
+    h('div', { class: 'panel' }, h('h2', {}, 'Output', h('span', { class: 'grow' })),
+      h('div', { class: 'p-body' },
+        h('div', { class: 'row', id: 'run-status' }),
+        h('pre', { class: 'raw console', id: 'run-out', text: runText || '(no output yet)' }),
+        runInfo.status.running ? line : null)),
+    h('div', { class: 'panel' }, h('h2', {}, 'Tests — the way she runs them',
+        h('span', { class: 'grow' }),
+        h('button', { class: 'btn small', text: checking ? 'Running…' : 'Run the tests', disabled: checking, onclick: runChecks })),
+      h('div', { class: 'p-body' },
+        h('div', { class: 'hint', text: runInfo.checks === 'off' ? 'Running tests is switched off in Settings.'
+          : runInfo.check.length ? 'After every code change she runs ' + runInfo.check[0].cmd + (runInfo.checks === 'direct' ? ' (unsandboxed — your setting)' : sb.available ? ' in a sandbox: no network, a scratch copy of the project, nothing else writable' : ' — but only inside a sandbox, and there is none here, so it is not run') + '. A change that breaks passing tests is rejected.'
+          : 'This project has no tests yet. Once it does, she runs them after every code change.' }),
+        cr ? h('div', { class: 'notice ' + (cr.ran ? (cr.ok ? 'good' : 'bad') : 'warn'), style: { marginTop: '10px' } },
+          cr.ran ? (cr.ok ? '✓ passed — ' : '✗ failing — ') + (cr.summary || '') + ' (' + cr.cmd + ', ' + cr.seconds + 's)'
+                 : 'Not run — ' + (cr.why || 'no reason given')) : null,
+        cr && cr.output ? h('pre', { class: 'raw console', text: cr.output }) : null)));
+}
+
+function afterRunDraw() {
+  drawRunStatus();
+  const out = $('#run-out');
+  if (out) out.scrollTop = out.scrollHeight;
 }
 
 // ---- changes
@@ -868,6 +1059,7 @@ function changeCard(r) {
       badge(r.task), badge(r.agent, 'who'),
       r.model ? badge(r.model.replace(/^ollama\//, ''), 'model') : null,
       (r.skills || []).map(s => badge(s, 'skill')),
+      r.refine ? badge('refine', 'skill') : null,
       r.status === 'failed' ? badge('failed', 'bad') : null,
       r.attempts > 1 ? badge('attempt ' + r.attempts) : null,
       h('span', { class: 'c-when', text: (r.t || '').replace('T', ' ').slice(0, 16) })),
@@ -876,6 +1068,9 @@ function changeCard(r) {
       row('Why', r.why),
       row('What', r.notes),
       row(r.status === 'failed' ? 'Rejected' : 'Verified', (r.feedback || 'passed') + (r.verified === false && r.status !== 'failed' ? ' (unreviewed)' : '')),
+      row('Tests', r.checks ? (r.checks.ran
+        ? (r.checks.ok ? '✓ ' : '✗ still failing, as before this task — ') + (r.checks.summary || 'ok') + ' · ' + r.checks.cmd + (r.checks.sandboxed ? ' (sandboxed)' : '')
+        : 'not run — ' + (r.checks.why || '')) : ''),
       row('You decided', r.decision ? decisionText(r.decision) : ''),
       row('References', refs)));
 }

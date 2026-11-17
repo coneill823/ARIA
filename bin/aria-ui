@@ -29,12 +29,19 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
   POST /api/refine     {"slug", "feedback"} -> idea goes back to processing
   POST /api/export     {"slug"} -> publish project into the Obsidian vault
   POST /api/brain      {"text", "title"?, "sources"?} -> note in the vault
-  POST /api/autopilot  {"slug", "action": approve|start|stop|steer, "text"?}
+  POST /api/autopilot  {"slug", "action": approve|start|stop|steer|refine,
+                        "text"?}
   POST /api/approve-task  {"slug", "id", "note"?}  a task that waits on you:
   POST /api/skip-task     {"slug", "id", "note"?}  let it run / decline it
   GET  /api/garage     the giant models: one per role, what is loaded
   POST /api/garage     {"action": scan|load|unload, "folder"?, "role"?}
   POST /api/open       {"slug", "path"?, "how": folder|editor|terminal}
+  GET  /api/runner?slug=          how to run and check a project; what runs
+  GET  /api/runner/output?slug=&since=   output of the program you started
+  POST /api/runner     {"slug", "action": start|stop|input|check|save, …}
+                       start runs a command on this machine — reachable
+                       only from the app (see below), never from chat,
+                       voice or autopilot
 
 Only this machine may call the API. The server binds 127.0.0.1, and on top
 of that refuses requests a web page could cause from elsewhere: a Host that
@@ -80,7 +87,9 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "autopilot_max_hours", "autopilot_stall_limit",
                "context_tokens", "giant_general", "giant_research",
                "giant_coder", "giants_use", "giants_loaded",
-               "giants_idle_minutes", "editor", "terminal")
+               "giants_idle_minutes", "editor", "terminal",
+               "autopilot_checks", "autopilot_check_seconds",
+               "autopilot_refine")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
 
@@ -151,6 +160,12 @@ def config_view():
         "garage": eng.garage_status(probe=False),
         "editor": cfg["editor"],
         "terminal": cfg["terminal"],
+        "autopilot_checks": cfg["autopilot_checks"],
+        "autopilot_check_seconds": cfg["autopilot_check_seconds"],
+        "autopilot_refine": cfg["autopilot_refine"],
+        "sandbox": dict(zip(("available", "why"),
+                            (bool(eng.aria_run.sandbox()[0]),
+                             eng.aria_run.sandbox()[1]))),
         "desktop": eng.desktop_tools(cfg),
         "promotion_target": cfg["promotion_target"],
         "webhooks": sorted(cfg["webhooks"]),
@@ -357,6 +372,11 @@ class Handler(BaseHTTPRequestHandler):
                             "files": eng._autopilot().files(slug)})
         elif path == "/api/changes":
             self.send_json({"changes": eng.project_changes(arg("slug"))})
+        elif path == "/api/runner":
+            self.send_json(eng.project_run_profile(arg("slug")))
+        elif path == "/api/runner/output":
+            self.send_json(eng.project_run_output(
+                arg("slug"), int(arg("since") or 0)))
         elif path == "/api/agents":
             keys = ("name", "role", "skills", "model", "path", "web",
                     "library", "source")
@@ -460,9 +480,11 @@ class Handler(BaseHTTPRequestHandler):
                 state = eng.autopilot_stop(slug)
             elif action == "steer":
                 state = eng.autopilot_steer(slug, text("text"), via="ui")
+            elif action == "refine":
+                state = eng.autopilot_refine(slug, via="ui")
             else:
                 self.send_json({"error": "action must be approve, start, "
-                                         "stop or steer"}, 400)
+                                         "stop, steer or refine"}, 400)
                 return
             state = dict(state)
             state.pop("run_started", None)
@@ -475,6 +497,36 @@ class Handler(BaseHTTPRequestHandler):
                 via="ui")
             self.send_json({"ok": True, done["answer"]: done["task"],
                             **done})
+        elif path == "/api/runner":
+            slug, action = text("slug").lower(), text("action")
+            if action == "start":
+                # a program on the owner's machine: only a browser page of
+                # this very app may ask (a tool without an Origin — curl,
+                # the voice gateway — is turned away; `aria run` is the
+                # terminal's way)
+                if self.headers.get("Origin") is None \
+                        and self.headers.get("Sec-Fetch-Site") is None:
+                    self.send_json({"error": "programs are started from "
+                                             "the app's Run tab"}, 403)
+                    return
+                self.send_json({"ok": True, **eng.project_run_start(
+                    slug, text("cmd"), sandboxed=body.get("sandboxed")
+                    is not False)})
+            elif action == "stop":
+                self.send_json({"ok": True, **eng.project_run_stop(slug)})
+            elif action == "input":
+                self.send_json({"ok": True, **eng.project_run_input(
+                    slug, str(body.get("text", "")))})
+            elif action == "check":
+                self.send_json({"ok": True, **eng.project_check(slug)})
+            elif action == "save":
+                eng.project_run_save(slug, text("kind") or "run",
+                                     text("name"), text("cmd"))
+                self.send_json({"ok": True,
+                                **eng.project_run_profile(slug)})
+            else:
+                raise ValueError("action must be start, stop, input, check "
+                                 "or save")
         elif path == "/api/open":
             self.send_json({"ok": True, "say": eng.open_path(
                 text("slug").lower(), text("path"), text("how") or "folder")})

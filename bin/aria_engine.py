@@ -28,6 +28,7 @@ from pathlib import Path
 import aria_brain
 import aria_garage
 import aria_git
+import aria_run
 import aria_web
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -127,6 +128,13 @@ def config():
         "autopilot_stall_limit": max(
             1, int(number("autopilot_stall_limit", 3))),
         "autopilot_idle_minutes": number("autopilot_idle_minutes", 30),
+        # running a project's own tests after each change: sandbox (only
+        # inside bubblewrap), direct (unsandboxed — your call), off
+        "autopilot_checks": find("autopilot_checks", "sandbox")
+            .split(" #")[0].strip().lower(),
+        "autopilot_check_seconds": max(
+            5, int(number("autopilot_check_seconds", 300))),
+        "autopilot_refine": flag("autopilot_refine", "true"),
         # the giants: one role each, started and swapped by aria_garage
         "giants": {r: find(f"giant_{r}", "").split(" #")[0].strip()
                    for r in aria_garage.ROLES},
@@ -1513,6 +1521,19 @@ INTENT_DESKTOP = re.compile(
     r"|(?P<p3>.+?)\s+in\s+(?:my\s+|the\s+|a\s+)?(?P<h3>file manager|"
     r"files app|editor|vs ?code|code|kate|zed|terminal|shell|console))"
     r"\s*$", re.I)
+# "refine the meal planner", "review the code of …", "optimise …",
+# "clean up … code" — a review-and-refine pass
+INTENT_REFINE = re.compile(
+    r"^\s*(?:please\s+)?(?:refine|optimi[sz]e|polish|tidy(?:\s+up)?|"
+    r"clean\s+up|refactor|review(?:\s+and\s+refine)?)\s+"
+    r"(?:(?:the|all|all\s+the|my)\s+)?(?:(?:whole\s+)?(?:code(?:base)?|"
+    r"source)\s+(?:of|in|for)\s+)?(.+?)(?:'s)?(?:\s+(?:code(?:base)?|"
+    r"source))?\s*$", re.I)
+# "run the meal planner", "try out …", "launch …", "test …" — she never
+# starts programs from a sentence; this opens the Run tab
+INTENT_TRY = re.compile(
+    r"^\s*(?:please\s+)?(?:run|launch|try(?:\s+out)?|execute|test|"
+    r"run\s+the\s+(?:tests|checks)\s+(?:for|of|on))\s+(.+?)\s*$", re.I)
 INTENT_NAVIGATE = re.compile(
     r"^\s*(?:open|show(?: me)?|go to|take me to|switch to|bring up)\s+"
     r"(?:the\s+)?(.+?)(?:\s+(?:page|tab|view|screen))?\s*$", re.I)
@@ -1557,6 +1578,8 @@ PROJECT_TABS = {"gantt": "gantt", "gantt chart": "gantt", "timeline": "gantt",
                 "kanban": "kanban", "task board": "kanban", "board": "kanban",
                 "files": "files", "file": "files", "code": "files",
                 "source": "files", "source code": "files",
+                "run": "run", "run tab": "run", "tests": "run",
+                "review": "brief", "code review": "brief",
                 "changes": "changes", "changelog": "changes",
                 "report": "report", "final report": "report",
                 "live": "live", "activity": "live",
@@ -1574,7 +1597,8 @@ def command_phrases(cfg=None):
            "skip task <id> in <project>",
            "status of <project>", "what changed in <project>",
            "where is <project>", "open the folder for <project>",
-           "open <project> in my editor",
+           "open <project> in my editor", "refine <project>",
+           "run <project>",
            "ask the <agent> to <task>", "mission <agent> to <task>",
            "use skill <name>", "drop skill",
            "open <chat|projects|board|agents|orb|settings>"]
@@ -1716,6 +1740,12 @@ def detect_intent(text):
             return {"action": "status", "slug": slug}
         if re.match(r"\s*(?:status|progress)\b", text, re.I):
             return {"action": "no-project", "said": m.group(1).strip()}
+    m = INTENT_REFINE.match(text)
+    if m and not re.search(r"\b(?:plan|proposal|research|requirements|idea|"
+                           r"report|changes)\b", m.group(1), re.I):
+        slug = match_project(m.group(1))      # "review the plan for x" is
+        if slug:                              # a conversation, not this
+            return {"action": "refine", "slug": slug}
     m = INTENT_DESKTOP.match(text)
     if m:
         said = m.group("p1") or m.group("p2") or m.group("p3")
@@ -1752,6 +1782,15 @@ def detect_intent(text):
             return {"action": "web-search",
                     "query": (m.group(1) if m else text).strip(" ?.")}
         return {"action": "no-web"}
+    m = INTENT_TRY.match(text)
+    if m:
+        slug = match_project(m.group(1))
+        if slug:
+            return {"action": "navigate", "view": "projects", "tab": "run",
+                    "slug": slug, "say": (
+                        f"Opening the Run tab for {slug} — the command is "
+                        "shown there and starts when you press Run. I never "
+                        "start programs from a sentence.")}
     if INTENT_RUNISH.match(text):
         return {"action": "explain-commands"}
     return None
@@ -1916,9 +1955,25 @@ def perform(intent, source="chat"):
                  "orb": "the Orb", "settings": "Settings"}
         out.update(view=intent["view"], tab=intent.get("tab", ""),
                    slug=intent.get("slug", ""),
-                   say="Opening " + names.get(intent["view"], intent["view"])
+                   say=intent.get("say") or (
+                       "Opening " + names.get(intent["view"], intent["view"])
                        + (f" for {intent['slug']}" if intent.get("slug")
-                          else "") + ".")
+                          else "") + "."))
+    elif action == "refine":
+        slug = intent["slug"]
+        try:
+            autopilot_refine(slug, via=source)
+            out.update(slug=slug, say=(
+                f"I'll read through all of {slug}'s code, write up what is "
+                "worth changing, and make the refinements that leave its "
+                "behaviour exactly as it is — each one judged on its diff"
+                + (" and on the project's own tests"
+                   if checks_available()[0] else "")
+                + ". The review lands on the Brief tab."))
+        except NeedsApproval as exc:
+            out.update(action="needs-approval", slug=slug, say=str(exc))
+        except ValueError as exc:
+            out.update(slug=slug, say=str(exc))
     elif action == "brain-note":
         if not intent.get("text"):
             out["say"] = ("Tell me what to write — for example: note to "
@@ -3128,6 +3183,71 @@ def open_path(slug, path="", how="folder"):
     raise ValueError("how must be folder, editor or terminal")
 
 
+# ---- running a project's software (aria_run) ------------------------------
+#
+# Two things with one hard line between them. `project_run_start` starts
+# a program on the owner's machine and is reached ONLY from a click in the
+# app or their own terminal — never from autopilot, chat or voice.
+# `project_check` runs the project's own tests in the sandbox; that one
+# autopilot may use.
+
+def checks_available(cfg=None):
+    """(can checks run here?, why not)."""
+    cfg = cfg or config()
+    if cfg["autopilot_checks"] == "off":
+        return False, "running checks is switched off"
+    if cfg["autopilot_checks"] == "direct":
+        return True, ""
+    tool, why = aria_run.sandbox()
+    return bool(tool), why
+
+
+def project_run_profile(slug):
+    proj = _project_dir(slug).resolve()
+    cfg = config()
+    tool, why = aria_run.sandbox()
+    return {"slug": slug, "path": str(proj),
+            **aria_run.profile(proj, _auto_dir(slug)),
+            "sandbox": {"available": bool(tool), "why": why},
+            "checks": cfg["autopilot_checks"],
+            "status": aria_run.status(slug),
+            "tools": desktop_tools(cfg)}
+
+
+def project_run_start(slug, cmd, sandboxed=True):
+    proj = _project_dir(slug).resolve()
+    info = aria_run.start(slug, proj, _auto_dir(slug), cmd,
+                          sandboxed=sandboxed)
+    brain_journal(f"you ran [[{slug}]]: `{' '.join(str(cmd).split())[:80]}`")
+    return info
+
+
+def project_run_stop(slug):
+    return aria_run.stop(slug)
+
+
+def project_run_output(slug, since=0):
+    _project_dir(slug)
+    return aria_run.output(slug, since)
+
+
+def project_run_input(slug, text):
+    return aria_run.send(slug, text)
+
+
+def project_run_save(slug, kind, name, cmd):
+    return aria_run.save_command(_auto_dir(slug), kind, name, cmd)
+
+
+def project_check(slug):
+    """Run the project's own tests the way autopilot does: sandboxed, in
+    a scratch copy. Returns aria_run.check's result."""
+    cfg = config()
+    return aria_run.check(_project_dir(slug).resolve(), _auto_dir(slug),
+                          mode=cfg["autopilot_checks"],
+                          timeout=cfg["autopilot_check_seconds"])
+
+
 # ---- the giants (the garage lives in aria_garage) ------------------------
 
 def garage_status(probe=True):
@@ -3175,6 +3295,11 @@ def autopilot_steer(slug, text, via="chat"):
     return _autopilot().steer(slug, text, via=via)
 
 
+def autopilot_refine(slug, via="app"):
+    """Ask for a review-and-refine pass over a project's code."""
+    return _autopilot().refine(slug, via=via)
+
+
 def autopilot_decide(slug, task_id, approve=True, note="", via="app"):
     """The owner's answer on a task that waits for them."""
     return _autopilot().decide(slug, task_id, approve=approve, note=note,
@@ -3196,17 +3321,19 @@ def project_view(slug):
 # ---------------------------------------------------------------- config edit
 
 _BOOL_KEYS = {"auto_pipeline", "web_access", "github_access",
-              "brain_journal", "autopilot_git"}
+              "brain_journal", "autopilot_git", "autopilot_refine"}
 _CHOICE_KEYS = {
     "web_search": {"auto", "duckduckgo", "brave", "searxng", "wikipedia",
                    "none"},
     "autopilot_after_goal": {"improve", "stop"},
     "giants_use": {"auto", "always", "never"},
+    "autopilot_checks": {"sandbox", "direct", "off"},
 }
 _NUMBER_KEYS = {"context_tokens", "autopilot_max_tasks",
                 "autopilot_max_iterations", "autopilot_max_hours",
                 "autopilot_stall_limit", "autopilot_idle_minutes",
-                "giants_loaded", "giants_idle_minutes", "giants_ctx"}
+                "giants_loaded", "giants_idle_minutes", "giants_ctx",
+                "autopilot_check_seconds"}
 _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "web_search_url", "web_allowlist", "github_base_branch",
               "promotion_target", "giant_general", "giant_research",

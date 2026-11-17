@@ -614,8 +614,18 @@ def capabilities(goal_text, cfg=None):
              "before they are kept)",
              "check code for syntax errors (Python, JSON, shell, "
              "JavaScript) — parsing only"]
-    limits = ["cannot run or test code, install packages, or use a shell",
-              "cannot see images, audio or binary files"]
+    if eng.checks_available(cfg)[0]:
+        tools.append("the project's own tests are run after every code "
+                     "change, in a sandbox with no network — a change that "
+                     "breaks tests that passed is rejected")
+        limits = ["cannot install packages or reach the network when tests "
+                  "run: tests must be self-contained and quick",
+                  "cannot run anything else, or use a shell",
+                  "cannot see images, audio or binary files"]
+    else:
+        limits = ["cannot run or test code, install packages, or use a "
+                  "shell",
+                  "cannot see images, audio or binary files"]
     if eng.web_ready(cfg):
         tools.append("live web research (search + read pages) for tasks "
                      "marked research")
@@ -770,6 +780,34 @@ most 350 words, with exactly these headings:
 Keep what is still true from the old memory, add what this batch changed,
 drop what is obsolete. Under Lessons record what failed or was rejected and
 what to do differently. Facts only — never invent files or results."""
+
+REVIEW_SYSTEM = """You are reviewing ONE file of a working project, to find
+what would make it better WITHOUT changing what it does. Respond with ONLY
+JSON:
+
+{"findings": [{"kind": "bug|dead-code|duplication|complexity|performance|error-handling|naming|docs|tests",
+  "where": "<the function, class or lines>",
+  "problem": "<what is wrong, concretely>",
+  "fix": "<the change to make>",
+  "risk": "safe|careful", "severity": 2}]}
+
+Rules:
+- At most 5 findings, and only ones worth a change. No taste, no style
+  nitpicks, no "could be rewritten as".
+- "risk": "safe" = cannot change behaviour (dead code, a duplicated block
+  folded into a helper, a clearer local name, a missing docstring, an
+  unused import). "careful" = touches logic.
+- "severity": 3 = a real defect or a serious waste, 2 = worth doing,
+  1 = minor.
+- A real bug counts: kind "bug", and say how it shows itself.
+- If the file is fine as it is, answer {"findings": []}. Most small files
+  are."""
+
+REFINE_RULE = """THIS TASK REFINES WORKING CODE. It must not change what the
+code does: the same functions with the same signatures, the same results
+for the same inputs, the same files read and written, the same command
+line. Fail it if anything a user or a caller could observe may differ, if
+it does more than the listed points, or if you cannot tell."""
 
 SUMMARY_SYSTEM = """You write the opening summary of a report on an
 autonomous project run, for the project's owner. At most 170 words of plain
@@ -1404,12 +1442,49 @@ def _notes(output):
     return " ".join(text.split())[:700]
 
 
-def _verify(slug, task, output, records, problems, cfg, emit):
-    """Step 4. Mechanical problems fail outright; otherwise a judge reads
-    the work against done_when."""
+def _wrote_code(records):
+    """Did the task change anything a test could notice?"""
+    return any(r["action"] != "unchanged" and not r["path"].lower().endswith(
+        (".md", ".txt", ".rst")) for r in records)
+
+
+def _run_checks(slug, emit, label):
+    """The project's own tests, in the sandbox. The result, trimmed for
+    the record — plus the output's tail under "output"."""
+    emit({"event": "thinking", "label": label})
+    res = eng.project_check(slug)
+    return {k: res[k] for k in ("ran", "ok", "cmd", "summary", "why",
+                                "sandboxed", "seconds", "output")}
+
+
+def _baseline(slug, state, cfg, emit):
+    """What the project's tests said BEFORE this task touches anything —
+    known from the last verified task, else found out now. A task is
+    blamed for a failure only if the tests passed without it."""
+    if state.get("check") is not None or not eng.checks_available(cfg)[0]:
+        return state.get("check")
+    res = _run_checks(slug, emit, f"running {slug}'s tests before the task")
+    if not res["ran"]:
+        return None                      # no tests yet: nothing to compare
+    res.pop("output", None)
+    state["check"] = res
+    _save_state(slug, state)
+    if res["ok"] is False:
+        emit({"event": "error",
+              "log": f"{slug}: the project's tests are already failing "
+                     f"({res['summary']}) — the next task is not blamed "
+                     "for that"})
+    return res
+
+
+def _verify(slug, task, output, records, problems, cfg, emit, checks=None,
+            before=None):
+    """Step 4. Mechanical problems — and tests the change broke — fail
+    outright; otherwise a judge reads the work against done_when, with the
+    test result in front of it."""
     if problems:
         return {"pass": False, "reviewed": True,
-                "feedback": "; ".join(problems)[:500]}
+                "feedback": "; ".join(problems)[:1800]}
     changed = [r for r in records if r["action"] != "unchanged"]
     if not changed and len(output.strip()) < 60:
         return {"pass": False, "reviewed": True,
@@ -1433,6 +1508,17 @@ def _verify(slug, task, output, records, problems, cfg, emit):
                else "THE AGENT WROTE NO FILES. ITS OUTPUT:\n"
                     + eng.clip(output, budget))
             + f"\n\nTHE AGENT'S NOTES\n{_notes(output) or '(none)'}")
+    if checks and checks["ran"]:
+        body += (f"\n\nTHE PROJECT'S OWN TESTS (`{checks['cmd']}`, run in a "
+                 "sandbox): " + (f"PASS — {checks['summary']}" if checks["ok"]
+                                 else "FAILING, as they already were before "
+                                      f"this task — {checks['summary']}"))
+    elif task.get("refine"):
+        body += ("\n\nTHE PROJECT'S OWN TESTS could not be run, so nothing "
+                 "but your reading stands between this change and a "
+                 "regression.")
+    if task.get("refine"):
+        body += "\n\n" + REFINE_RULE + _before_after(slug, records, cfg)
     emit({"event": "thinking", "label": f"verifying {task['id']}"})
     try:
         data = eng.ask_json(eng.resolve_tier("smart", cfg),
@@ -1462,7 +1548,20 @@ def _decision_line(decision, lead):
             + (f" — “{decision['note']}”" if decision.get("note") else ""))
 
 
-def _record(slug, state, task, records, info, verdict, output, commit=""):
+def _checks_line(checks):
+    """How a test run reads in the records."""
+    if not checks:
+        return ""
+    if not checks.get("ran"):
+        return "not run — " + (checks.get("why") or "no reason given")
+    return (f"`{checks['cmd']}` "
+            + ("in a sandbox" if checks.get("sandboxed") else "unsandboxed")
+            + " — " + ("" if checks["ok"] else "FAILING (as before this "
+                       "task): ") + (checks.get("summary") or "ok"))
+
+
+def _record(slug, state, task, records, info, verdict, output, commit="",
+            checks=None):
     """Step 5: the structured change record + the readable changelog."""
     auto = _auto(slug)
     files = [{k: r[k] for k in ("path", "action", "lines", "added", "removed")}
@@ -1482,6 +1581,10 @@ def _record(slug, state, task, records, info, verdict, output, commit=""):
     }
     if task.get("decision"):
         row["decision"] = task["decision"]
+    if checks:
+        row["checks"] = {k: v for k, v in checks.items() if k != "output"}
+    if task.get("refine"):
+        row["refine"] = True
     with (auto / "changes.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
     line = (f"- **{task['title']}** [{task['id']}] — {task['status']} "
@@ -1501,6 +1604,8 @@ def _record(slug, state, task, records, info, verdict, output, commit=""):
         line += f"\n  - Review: {verdict['feedback']}"
     if task.get("decision"):
         line += _decision_line(task["decision"], "\n  - ")
+    if checks:
+        line += "\n  - Tests: " + _checks_line(checks)
     refs = [f"`{row['output']}`"] + ([f"commit `{commit}`"] if commit else [])
     refs += [f"[{s.get('title') or s['url']}]({s['url']})"
              for s in row["sources"][:6]]
@@ -1579,7 +1684,9 @@ def _run_task(slug, state, plan, task, cfg, emit):
               "log": f"{slug}: {task['id']} needs the {role} giant — "
                      "loading it (others are unloaded first; this can take "
                      "several minutes)"})
+    checks = None
     try:
+        before = _baseline(slug, state, cfg, emit)
         output = eng.run_agent(
             task["agent"], _task_prompt(slug, task, plan, cfg), emit,
             timeout=_idle_timeout(cfg, model_spec), model=task["model"],
@@ -1591,8 +1698,25 @@ def _run_task(slug, state, plan, task, cfg, emit):
         _save_plan(slug, plan)
         state["phase"] = "reviewing"
         _save_state(slug, state)
-        verdict = _verify(slug, task, output, records,
-                          static_checks(slug, records), cfg, emit)
+        problems = static_checks(slug, records)
+        if not problems and _wrote_code(records) \
+                and eng.checks_available(cfg)[0]:
+            checks = _run_checks(slug, emit,
+                                 f"running {slug}'s tests on {task['id']}")
+            if checks["ran"] and checks["ok"] is False \
+                    and (before is None or before["ok"]):
+                # they passed (or did not exist) without this change
+                problems = [
+                    f"the project's own tests fail with this change "
+                    f"(`{checks['cmd']}`: {checks['summary']}). They "
+                    + ("passed before it" if before else
+                       "are new with it, and must pass")
+                    + ". Test output:\n" + eng.clip(checks["output"], 1300)]
+                emit({"event": "error",
+                      "log": f"{slug}: {task['id']} breaks the project's "
+                             f"tests — {checks['summary']}"})
+        verdict = _verify(slug, task, output, records, problems, cfg, emit,
+                          checks, before)
         state["stats"]["calls"] += 1
     except Exception as exc:
         _revert(slug, records)
@@ -1632,7 +1756,11 @@ def _run_task(slug, state, plan, task, cfg, emit):
             + (f"Why: {task['why']}\n" if task.get("why") else "")
             + f"Agent: {task['agent']} · model: {info.get('model', '?')}\n"
               f"Verified: {verdict['feedback'] or 'passed'}", emit)
-        _record(slug, state, task, records, info, verdict, output, sha)
+        _record(slug, state, task, records, info, verdict, output, sha,
+                checks)
+        if checks and checks["ran"]:        # the new "before", for the next
+            state["check"] = {k: v for k, v in checks.items()
+                              if k != "output"}
         eng.brain_journal(f"[[{slug}]] — finished “{task['title']}”"
                           + (f" ({', '.join(task['files'][:3])})"
                              if task["files"] else ""))
@@ -1651,7 +1779,8 @@ def _run_task(slug, state, plan, task, cfg, emit):
             failed = dict(state.get("failed_titles", {}))
             failed[norm] = failed.pop(norm, 0) + 1      # newest last
             state["failed_titles"] = dict(list(failed.items())[-200:])
-            _record(slug, state, task, [], info, verdict, output)
+            _record(slug, state, task, [], info, verdict, output,
+                    checks=checks)
             emit({"event": "error",
                   "log": f"{slug}: {task['id']} failed after "
                          f"{task['attempts']} attempts — "
@@ -1811,6 +1940,10 @@ def _advance(slug, state, cfg, emit):
         return "replanned"
     open_gaps = state.get("audit_gaps") or []
     if state["mode"] == "improve":
+        if not open_gaps and _refine_due(slug, state, cfg):
+            # enough has changed since the code was last read
+            _refine_begin(slug, state, emit, "improvements made")
+            return "refining"
         _save_state(slug, state)
         _finalize(slug, emit, "complete",
                   "the goal is met and no further improvement was worth "
@@ -1836,6 +1969,9 @@ def _advance(slug, state, cfg, emit):
               "log": f"{slug}: audit passed — the requirements are met"})
     state["audits"] = 0
     open_gaps = state.get("audit_gaps") or []     # audited twice, not closed
+    if not open_gaps and _refine_due(slug, state, cfg):
+        _refine_begin(slug, state, emit, "goal met")
+        return "refining"
     if cfg["autopilot_after_goal"] == "improve":
         state["mode"] = "improve"
         _save_state(slug, state)
@@ -1873,6 +2009,301 @@ def _wait_for_owner(slug, state, gated, cfg, emit):
         _notify(cfg, f"autopilot {slug} is waiting for your decision on "
                      f"{names}")
     return "waiting"
+
+
+# ------------------------------------------------------------ review & refine
+#
+# When the goal is met — and whenever the owner asks — she reads the whole
+# codebase file by file, writes down what is worth changing (REVIEW.md),
+# and turns the findings into tasks that must leave behaviour exactly as
+# it was. Those run through the ordinary loop with a stricter judge: it is
+# shown the change as a diff, told that nothing observable may differ, and
+# has the project's own tests in front of it. Anything else is rolled
+# back, like any rejected attempt.
+
+CODE_SUFFIXES = {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".rs",
+                 ".go", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs",
+                 ".rb", ".php", ".swift", ".lua", ".sh", ".bash", ".sql",
+                 ".html", ".css", ".scss", ".vue", ".svelte", ".dart",
+                 ".ex", ".exs", ".gd", ".r"}
+REVIEW_FILES = 60           # files read in one pass, largest first
+REFINE_TASKS = 8            # refinements planned from one review
+REFINE_AFTER = 8            # verified changes before the code is re-read
+
+
+def _review_queue(slug):
+    """The source files worth reading: code, not documents or her records,
+    most substantial first."""
+    rows = [r for r in inventory(_proj(slug), limit=1000)
+            if Path(r["path"]).suffix.lower() in CODE_SUFFIXES
+            and r["lines"] > 3 and r["bytes"] < 200_000
+            and not _protected(r["path"])]
+    rows.sort(key=lambda r: -r["bytes"])
+    return [r["path"] for r in rows[:REVIEW_FILES]]
+
+
+def _before_after(slug, records, cfg):
+    """A refinement as a diff — what its judge has to rule on."""
+    proj = _proj(slug)
+    budget = int(eng.prompt_budget(cfg) * 0.5)
+    parts = []
+    for r in records:
+        if r["action"] != "modified" or r["old"] is None:
+            continue
+        try:
+            new = (proj / r["path"]).read_text(encoding="utf-8",
+                                               errors="replace")
+        except OSError:
+            continue
+        diff = "\n".join(difflib.unified_diff(
+            r["old"].splitlines(), new.splitlines(), "before/" + r["path"],
+            "after/" + r["path"], lineterm="", n=2))
+        parts.append(eng.clip(diff, max(800, budget // max(1, len(records)))))
+    return ("\n\nTHE CHANGE, AS A DIFF\n" + "\n\n".join(parts)) if parts \
+        else ""
+
+
+def _refine_due(slug, state, cfg):
+    """Is it time to read the code again? Once the goal is met, and then
+    after every REFINE_AFTER verified changes."""
+    if not cfg["autopilot_refine"]:
+        return False
+    last = state.get("refined_at")
+    if last is not None and state["stats"]["done"] - last < REFINE_AFTER:
+        return False
+    return bool(_review_queue(slug))
+
+
+def _refine_begin(slug, state, emit, why):
+    queue = _review_queue(slug)
+    state["mode"] = "refine"
+    state["refine"] = {"stage": "review", "queue": queue, "total": len(queue),
+                       "findings": [], "started": _stamp()}
+    state["phase"] = "reviewing the code"
+    _save_state(slug, state)
+    emit({"event": "stage_done", "stage": "refine",
+          "log": f"{slug}: {why} — reviewing the whole codebase "
+                 f"({len(queue)} file(s)) for refinements that leave its "
+                 "behaviour unchanged"})
+
+
+def _review_file(slug, state, path, cfg, emit):
+    """One file, one reviewer call. Returns its findings, cleaned."""
+    proj = _proj(slug)
+    try:
+        text = (proj / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    critic = eng.get_agent("critic")
+    spec = (critic or {}).get("model") or "smart"
+    target = eng.resolve_model(spec, cfg) or eng.resolve_tier("smart", cfg)
+    budget = eng.prompt_budget(cfg, spec)
+    prompt = (f"PROJECT: {slug}\nWHAT IT IS FOR\n"
+              f"{eng.clip(eng._project_goal(slug, 900), 900)}\n\n"
+              f"THE FILE: {path}\n```\n{eng.clip(text, budget - 1800)}\n```")
+    emit({"event": "thinking", "label": f"reviewing {path}"})
+    data = eng.ask_json(target, prompt, REVIEW_SYSTEM,
+                        on_token=lambda t: emit({"event": "token", "text": t}),
+                        timeout=_idle_timeout(cfg, spec))
+    state["stats"]["calls"] += 1
+    raw = data.get("findings") if isinstance(data, dict) else data
+    out = []
+    for f in (raw or [])[:5]:
+        if not isinstance(f, dict):
+            continue
+        problem = " ".join(str(f.get("problem") or "").split())[:400]
+        fix = " ".join(str(f.get("fix") or "").split())[:400]
+        if not problem or not fix:
+            continue
+        try:
+            severity = min(3, max(1, int(f.get("severity") or 2)))
+        except (TypeError, ValueError):
+            severity = 2
+        kind = str(f.get("kind") or "").lower().strip()
+        out.append({
+            "file": path, "problem": problem, "fix": fix,
+            "kind": kind if kind in (
+                "bug", "dead-code", "duplication", "complexity",
+                "performance", "error-handling", "naming", "docs",
+                "tests") else "other",
+            "where": " ".join(str(f.get("where") or "").split())[:120],
+            "risk": "careful" if str(f.get("risk") or "").lower().strip()
+            != "safe" else "safe",
+            "severity": severity})
+    return out
+
+
+def _write_review(slug, state, findings, planned):
+    """REVIEW.md: what the review found, file by file, and what became of
+    each finding. Every pass is kept under reviews/."""
+    auto = _auto(slug)
+    by_file = {}
+    for f in findings:
+        by_file.setdefault(f["file"], []).append(f)
+    out = [f"# Code review — {slug}", "",
+           f"*{_stamp()[:16].replace('T', ' ')} · {state['refine']['total']} "
+           f"file(s) read · {len(findings)} finding(s) in "
+           f"{len(by_file)} file(s) · {len(planned)} refinement task(s) "
+           "planned.*", "",
+           "Each refinement must leave the code's behaviour unchanged: it "
+           "is judged on a diff, with the project's tests run on it where "
+           "they can be, and rolled back otherwise.", ""]
+    if not findings:
+        out += ["Nothing worth changing was found.", ""]
+    for path in sorted(by_file, key=lambda p: -max(
+            f["severity"] for f in by_file[p])):
+        task = planned.get(path)
+        out += [f"## {_flink(path)}"
+                + (f" — planned as `{task}`" if task else " — noted, not "
+                   "planned in this pass"), ""]
+        for f in sorted(by_file[path], key=lambda f: -f["severity"]):
+            out.append(
+                f"- **{f['kind']}** ({'!' * f['severity']}, {f['risk']})"
+                + (f" in `{f['where']}`" if f["where"] else "")
+                + f": {f['problem']} → {f['fix']}")
+        out.append("")
+    text = "\n".join(out)
+    (auto / "reviews").mkdir(exist_ok=True)
+    stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    (auto / "reviews" / f"review-{stamp}.md").write_text(
+        place_report(text, "../..", ".."), encoding="utf-8")
+    (auto / "REVIEW.md").write_text(place_report(text, "..", "."),
+                                    encoding="utf-8")
+
+
+def _refine_plan(slug, state, cfg, emit):
+    """Findings -> tasks, one per file, most serious first. No model is
+    asked: the review already said what to change."""
+    findings = state["refine"]["findings"]
+    by_file = {}
+    for f in findings:
+        by_file.setdefault(f["file"], []).append(f)
+    order = sorted(by_file, key=lambda p: (
+        -max(f["severity"] for f in by_file[p]), -len(by_file[p])))
+    plan = _plan(slug)
+    names = {a["name"] for a in eng.list_agents()}
+    iteration = state["iteration"] + 1
+    used = [int(t["id"][1:]) for t in plan["tasks"]
+            if re.fullmatch(r"t\d+", str(t.get("id", "")))]
+    state["next_id"] = max(state["next_id"], max(used, default=0) + 1)
+    fresh, planned = [], {}
+    for path in order[:REFINE_TASKS]:
+        points = sorted(by_file[path], key=lambda f: (
+            -f["severity"], f["risk"] != "safe"))[:4]
+        tid = f"t{state['next_id']}"
+        state["next_id"] += 1
+        planned[path] = tid
+        task = {
+            "id": tid, "title": f"Refine {path}"[:140],
+            "detail": (f"Refine `{path}`. Make exactly these changes and "
+                       "nothing else:\n" + "\n".join(
+                           f"{i}. [{f['kind']}]"
+                           + (f" {f['where']}:" if f["where"] else "")
+                           + f" {f['problem']} — {f['fix']}"
+                           for i, f in enumerate(points, 1))
+                       + "\nKeep every name, signature and behaviour that "
+                         "anything else relies on. Output the complete "
+                         "file.")[:1800],
+            "why": "found by the code review: " + "; ".join(
+                f"{f['kind']} ({f['where'] or 'file'})" for f in points),
+            "agent": "coder" if "coder" in names else _guess_agent(
+                "refactor code", names),
+            "skills": [], "auto_skills": False, "model": "",
+            "phase": "refine", "est_hours": 1.0, "depends_on": [],
+            "reads": [path], "research": False, "needs_human": False,
+            "refine": True,
+            "done_when": f"every listed point is addressed in {path} and "
+                         "what the code does is unchanged",
+            "status": "todo", "attempts": 0, "iteration": iteration}
+        if cfg["giants_use"] == "always":
+            task["model"] = _matching_giant(task, cfg)
+        fresh.append(task)
+    _write_review(slug, state, findings, planned)
+    if not fresh:
+        emit({"event": "stage_done", "stage": "refine",
+              "log": f"{slug}: the review found nothing worth changing"})
+        return 0
+    state["iteration"] = iteration
+    plan["tasks"].extend(fresh)
+    plan["iteration"] = iteration
+    plan["updated"] = _stamp()
+    _save_plan(slug, plan)
+    emit({"event": "stage_done", "stage": "refine",
+          "log": f"{slug}: review done — {len(findings)} finding(s); "
+                 f"{len(fresh)} refinement(s) planned: "
+                 + "; ".join(t["title"] for t in fresh[:6])
+                 + f". The full review is in {_auto(slug).name}/REVIEW.md"})
+    return len(fresh)
+
+
+def _refine_step(slug, state, cfg, emit):
+    """One step of the review-and-refine pass (see above)."""
+    auto = _auto(slug)
+    if (auto / "REFINE").exists() or not state.get("refine"):
+        (auto / "REFINE").unlink(missing_ok=True)
+        if not _review_queue(slug):
+            emit({"event": "stage_done", "stage": "refine",
+                  "log": f"{slug}: there is no code to review yet"})
+            state["mode"] = "improve" if state["stats"]["done"] else "build"
+            state.pop("refine", None)
+            _save_state(slug, state)
+            return "reflected"
+        if not state.get("refine"):
+            _refine_begin(slug, state, emit, "asked to refine")
+    ref = state["refine"]
+    if ref["stage"] == "review":
+        if ref["queue"]:
+            path = ref["queue"][0]
+            done = ref["total"] - len(ref["queue"])
+            state["phase"] = f"reviewing the code ({done + 1} of {ref['total']})"
+            _save_state(slug, state)
+            try:
+                ref["findings"] += _review_file(slug, state, path, cfg, emit)
+            except Exception as exc:
+                if eng.backend_trouble(exc):
+                    raise                  # wait for the model, try again
+                emit({"event": "error",    # one unreadable answer: move on
+                      "log": f"{slug}: could not review {path} ({exc}) — "
+                             "skipped"})
+            ref["queue"].pop(0)
+            state["errors"] = 0
+            _save_state(slug, state)
+            return "reviewed"
+        ref["stage"] = "apply"
+        state["phase"] = "working"
+        added = _refine_plan(slug, state, cfg, emit)
+        _save_state(slug, state)
+        if added:
+            return "replanned"
+    # the refinements have run (or there were none): the pass is over
+    state["refined_at"] = state["stats"]["done"]
+    state.pop("refine", None)
+    if cfg["autopilot_after_goal"] == "improve":
+        state["mode"] = "improve"
+        _save_state(slug, state)
+        emit({"event": "stage_done", "stage": "autopilot",
+              "log": f"{slug}: code reviewed and refined — moving on to "
+                     "improvements until you stop me"})
+        return "improving"
+    state["mode"] = "build"
+    _save_state(slug, state)
+    _finalize(slug, emit, "complete",
+              "the goal is met and audited, and the code reviewed and "
+              "refined")
+    return "complete"
+
+
+def refine(slug, via="app"):
+    """The owner asks for a review-and-refine pass now. A signal file, like
+    STEER; autopilot is started if it is not running."""
+    eng._project_dir(slug)
+    (_auto(slug) / "REFINE").touch()
+    _activity(slug, "info", f"you asked for a code review and refinement "
+                            f"(via {via})")
+    state = _state(slug)
+    if state["status"] != "running":
+        state = start(slug, via=via)
+    return state
 
 
 # ------------------------------------------------------------ the loop
@@ -1980,7 +2411,7 @@ def _step(slug, state, cfg, emit):
     if state.get("gate_wait"):
         waiting_plan = _plan(slug)
         if _gated(waiting_plan) and not _runnable(waiting_plan) \
-                and not steered:
+                and not steered and not (auto / "REFINE").exists():
             return "waiting"               # nothing to do until they answer
         state["gate_wait"] = False
     if state.get("waiting") or state["backoff_until"]:
@@ -2039,7 +2470,10 @@ def _step(slug, state, cfg, emit):
         result = _close_iteration(slug, state, plan, cfg, emit)
         state["errors"] = 0
         return result
-    result = _advance(slug, state, cfg, emit)
+    if state.get("mode") == "refine" or (auto / "REFINE").exists():
+        result = _refine_step(slug, state, cfg, emit)
+    else:
+        result = _advance(slug, state, cfg, emit)
     if result != "complete":
         state = _state(slug)
         state["errors"] = 0
@@ -2076,7 +2510,7 @@ def start(slug, via="cli"):
                  backoff_until=0, errors=0, dry=0, audits=0, stop_reason="",
                  run_first_iteration=state["iteration"], current=None,
                  run_tasks=0, empty_plans=0, gate_wait=False,
-                 gate_notified=[])
+                 gate_notified=[], check=None)
     state.pop("git_off", None)
     if cfg["autopilot_git"] and aria_git.is_repo_root(proj):
         try:
@@ -2254,6 +2688,23 @@ def build_report(slug, state, reason, detail="", summary=""):
            f"{modified} modified.", ""]
     out += ["## Summary", "", summary.strip() or (
         f"{len(done)} task(s) were completed and verified in this run."), ""]
+    ran = [r for r in done if (r.get("checks") or {}).get("ran")]
+    code = [r for r in done if r.get("checks")]
+    if ran:
+        last = ran[-1]["checks"]
+        out += [f"**Tested by running it:** the project's own tests were run "
+                f"in a sandbox after {len(ran)} of {len(done)} change(s). "
+                f"At the last one: `{last['cmd']}` — "
+                + ("" if last["ok"] else "FAILING: ")
+                + f"{last.get('summary') or 'ok'}.", ""]
+    elif done:
+        why = next((r["checks"].get("why") for r in reversed(code)
+                    if r["checks"].get("why")), "") \
+            or eng.checks_available()[1]
+        out += ["**Not tested by running it.** Every change was checked by "
+                "parsing and by a reviewing model only"
+                + (f" — {why}" if why else "") + ". Run it yourself before "
+                "relying on it (the Run tab).", ""]
 
     look = []
     for name in ("README.md", "docs/README.md"):
@@ -2312,6 +2763,8 @@ def build_report(slug, state, reason, detail="", summary=""):
             if r.get("decision"):
                 out.append(_decision_line(r["decision"], "   - **")
                            .replace("Your decision:", "Your decision:**", 1))
+            if r.get("checks"):
+                out.append("   - **Tests:** " + _checks_line(r["checks"]))
             refs = [_alink(r["output"])]
             if r.get("commit"):
                 refs.append(f"commit `{r['commit']}`")
@@ -2580,6 +3033,7 @@ def view(slug):
         "needs_you": [{"id": t["id"], "title": t["title"],
                        "why": t.get("why", "")} for t in _gated(plan)],
         "assessment": text("ASSESSMENT.md"),
+        "review": text("REVIEW.md"),
         "memory": text("MEMORY.md") or text("lessons.md"),
         "steering": text("STEERING.md"),
         "changelog": text("CHANGELOG.md", tail=16000),

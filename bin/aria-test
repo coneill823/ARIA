@@ -191,7 +191,10 @@ def main():
                # the garage is exercised with stand-in servers
                giant_general="", giant_research="", giant_coder="",
                giants_use="auto", giants_loaded="1",
-               giants_idle_minutes="0")
+               giants_idle_minutes="0",
+               # the review-and-refine pass has a check of its own
+               autopilot_refine="false", autopilot_checks="sandbox",
+               autopilot_check_seconds="60", editor="", terminal="")
 
     if MOCK:
         port = free_port()
@@ -1029,6 +1032,190 @@ def main():
                 f"history; every finished task carries its measured time")
     check("autopilot — history is kept", c_history)
 
+    def c_run_sandbox():
+        """Code a model wrote is run without being trusted: the project's
+        tests in a sandbox that cannot reach the network, read the home
+        folder or write anywhere but a scratch copy."""
+        import aria_run
+        tool, why = aria_run.sandbox()
+        if not tool:
+            raise SkipTest("no sandbox here — " + why)
+        proj = os.path.join(sandbox, "_runproj")
+        rec = os.path.join(proj, "autopilot")
+        for d in ("src", "tests", "autopilot"):
+            os.makedirs(os.path.join(proj, d))
+
+        def put(rel, text):
+            with open(os.path.join(proj, rel), "w") as f:
+                f.write(text)
+        good = "def run(items):\n    return {'count': len(items)}\n"
+        put("src/core.py", good)
+        put("src/cli.py", "import sys\nfrom src.core import run\n"
+                          "print(run(sys.argv[1:]))\n")
+        put("tests/test_core.py", "from src.core import run\n\n\n"
+            "def test_count():\n    assert run(['a', 'b'])['count'] == 2\n")
+        prof = aria_run.profile(proj, rec)
+        assert any("src.cli" in c["cmd"] for c in prof["run"]) \
+            and prof["check"], prof
+        res = aria_run.check(proj, rec)
+        assert res["ran"] and res["ok"] and res["sandboxed"], res
+        assert not os.path.exists(os.path.join(proj, "src", "__pycache__"))
+        put("src/core.py", good.replace("len(items)", "len(items) + 1"))
+        res = aria_run.check(proj, rec)
+        assert res["ran"] and res["ok"] is False, res
+        put("src/core.py", good)
+        # a hostile test: every way out must be shut
+        secret = os.path.join(os.path.expanduser("~"), ".aria-selftest-secret")
+        with open(secret, "w") as f:
+            f.write("hunter2")
+        os.environ["ARIA_KEY_SELFTEST"] = "do-not-leak"
+        listener = socket.socket()          # a server on this machine that
+        listener.bind(("127.0.0.1", 0))     # the sandbox must not reach
+        listener.listen(1)
+        put("tests/test_escape.py", f"""import os, shutil, socket, urllib.request
+
+
+def test_escape():
+    got = []
+    try:
+        got.append('READ ' + open({secret!r}).read())
+    except OSError:
+        pass
+    for target in ({proj!r} + '/PWNED', {sandbox!r} + '/PWNED'):
+        try:
+            open(target, 'w').write('x')
+            got.append('WROTE ' + target)
+        except OSError:
+            pass
+    try:
+        urllib.request.urlopen('http://example.com', timeout=3)
+        got.append('NETWORK')
+    except Exception:
+        pass
+    try:
+        s = socket.socket()
+        s.settimeout(2)
+        s.connect(('127.0.0.1', {listener.getsockname()[1]}))
+        got.append('LOOPBACK')          # reached a server on the host
+    except Exception:
+        pass
+    for path in ('/run/user', '/run/dbus', '/run/docker.sock'):
+        if os.path.exists(path):
+            got.append('SEES ' + path)
+    if os.environ.get('ARIA_KEY_SELFTEST'):
+        got.append('ENV')
+    shutil.rmtree('src', ignore_errors=True)
+    assert got == [], got
+""")
+        try:
+            res = aria_run.check(proj, rec)
+            assert res["ran"] and res["ok"], res["output"][-700:]
+            assert os.path.isfile(os.path.join(proj, "src", "core.py")), \
+                "a test deleted the real project"
+            assert not os.path.exists(os.path.join(proj, "PWNED"))
+        finally:
+            listener.close()
+            os.remove(secret)
+            os.environ.pop("ARIA_KEY_SELFTEST", None)
+            os.remove(os.path.join(proj, "tests", "test_escape.py"))
+        # a test that hangs is cut short
+        put("tests/test_hang.py", "import time\n\n\ndef test_hang():\n"
+                                  "    time.sleep(600)\n")
+        t0 = time.time()
+        res = aria_run.check(proj, rec, timeout=3)
+        assert res["ok"] is False and "timed out" in res["summary"] \
+            and time.time() - t0 < 20, res
+        os.remove(os.path.join(proj, "tests", "test_hang.py"))
+        # a program the owner starts: output, input, a URL, stop
+        put("serve.py", "print('Serving on http://0.0.0.0:8123/', flush=True)"
+            "\nprint('hello ' + input(), flush=True)\n"
+            "import time\ntime.sleep(60)\n")
+        aria_run.start("selftest-run", proj, rec, "python3 serve.py")
+        try:
+            for _ in range(40):
+                if "Serving" in aria_run.output("selftest-run")["text"]:
+                    break
+                time.sleep(0.1)
+            aria_run.send("selftest-run", "world")
+            for _ in range(40):
+                out = aria_run.output("selftest-run")
+                if "hello world" in out["text"]:
+                    break
+                time.sleep(0.1)
+            assert "hello world" in out["text"] and out["running"] \
+                and out["urls"] == ["http://localhost:8123/"], out
+        finally:
+            assert not aria_run.stop("selftest-run")["running"]
+        return ("tests run in a sandbox: a regression is seen, a hostile "
+                "test gets nowhere (no network, home, sockets, secrets or "
+                "writes outside its scratch copy), a hang is cut short; a "
+                "program you start streams, takes input and stops")
+    check("running code — the sandbox", c_run_sandbox, required=False)
+
+    def c_refine():
+        """Goal met -> the whole codebase is reviewed and refined, and a
+        refinement that changes what the code does does not survive."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script the review")
+        import aria_run
+        boxed = bool(aria_run.sandbox()[0])
+        slug = "selftest-refine"
+        set_config(sandbox, autopilot_refine="true")
+        try:
+            # with a sandbox, the first refinement breaks behaviour and the
+            # project's tests have to catch it; without one that cannot be
+            # shown, so the refinement behaves
+            with scripted_model(**({"MOCK_REFINE_BREAKS": "1"} if boxed
+                                   else {})):
+                proj = started_project(slug)
+                logs, seq = [], []
+                for _ in range(160):
+                    seq.append(ap.tick(slug, lambda e: logs.append(
+                        e.get("log") or "")))
+                    if seq[-1] in ("idle", "finalized", "complete"):
+                        break
+                st = ap._state(slug)
+                assert st["status"] == "complete" and "reviewed" in seq \
+                    and "refined" in st["stop_reason"], (seq, st["status"])
+                done = [t for t in ap._plan(slug)["tasks"] if t.get("refine")]
+                assert len(done) == 1 and done[0]["status"] == "done", done
+                core = (proj / "src" / "core.py").read_text()
+                assert "'count': len(items)," in core \
+                    and "Returns a dict" in core, \
+                    "the refinement changed what the code does"
+                review = (proj / "autopilot" / "REVIEW.md").read_text()
+                assert "](../src/core.py)" in review \
+                    and f"planned as `{done[0]['id']}`" in review
+                row = [c for c in eng.project_changes(slug)
+                       if c["task"] == done[0]["id"]][-1]
+                assert row["refine"]
+                report = (proj / "autopilot" / "FINAL-REPORT.md").read_text()
+                if boxed:
+                    assert done[0]["attempts"] == 2 and any(
+                        "breaks the project's tests" in line
+                        for line in logs), "the regression was not caught"
+                    assert row["checks"]["ran"] and row["checks"]["ok"]
+                    assert "**Tested by running it:**" in report
+                else:
+                    assert "**Not tested by running it.**" in report
+                # asked for again by name: a second pass, a second review
+                out = eng.perform(eng.detect_intent(f"refine {slug}"),
+                                  source="selftest")
+                assert out["action"] == "refine", out
+                drive(slug)
+                assert ap._state(slug)["status"] == "complete"
+                assert len(list((proj / "autopilot" / "reviews")
+                                .glob("*.md"))) == 2
+        finally:
+            set_config(sandbox, autopilot_refine="false")
+        return ("the codebase was reviewed file by file and refined"
+                + ("; a refinement that changed behaviour was caught by "
+                   "the project's own tests, rolled back and redone"
+                   if boxed else " (no sandbox here: judged on its diff "
+                   "only, and the report says it was not run)")
+                + "; a second pass on request kept its own review")
+    check("autopilot — review and refine", c_refine)
+
     def c_owner_gate():
         """A task the planner marks needs_human waits for the owner while
         everything else carries on; their answer travels with the work."""
@@ -1480,6 +1667,32 @@ def main():
                 code, body = post("/api/open", {"slug": slug, "how": "folder",
                                                 "path": "../../system"})
                 assert code == 400 and "outside the project" in body, body
+                with urllib.request.urlopen(
+                        f"{base}/api/runner?slug={slug}", timeout=15) as r:
+                    runner = json.load(r)
+                assert "run" in runner and "sandbox" in runner
+                # a program is started from the app's own page only
+                code, body = post("/api/runner", {"slug": slug,
+                                                  "action": "start",
+                                                  "cmd": "echo hi"})
+                assert code == 403 and "Run tab" in body, (code, body)
+                req = urllib.request.Request(
+                    base + "/api/runner", method="POST",
+                    headers={"Origin": base, "Sec-Fetch-Site": "same-origin"},
+                    data=json.dumps({"slug": slug, "action": "start",
+                                     "cmd": "echo selftest-ran-it",
+                                     "sandboxed": False}).encode())
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    assert json.load(r)["ok"]
+                for _ in range(40):
+                    with urllib.request.urlopen(
+                            f"{base}/api/runner/output?slug={slug}",
+                            timeout=10) as r:
+                        ran = json.load(r)
+                    if not ran["running"]:
+                        break
+                    time.sleep(0.1)
+                assert "selftest-ran-it" in ran["text"] and ran["exit"] == 0
                 try:
                     urllib.request.urlopen(
                         f"{base}/api/file/raw?slug={slug}&path=README.md",
@@ -1524,8 +1737,9 @@ def main():
             with urllib.request.urlopen(req, timeout=10) as r:
                 assert r.status == 200
             return "state, board, health, config, agents, skills, " \
-                   "projects, project view, files; task answers, path " \
-                   "traversal and requests from other sites refused"
+                   "projects, project view, files, runner; task " \
+                   "answers, path traversal and requests from other " \
+                   "sites refused"
         check("api endpoints", c_api)
 
         def c_chat_http():

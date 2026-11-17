@@ -645,6 +645,23 @@ table.found .hint { overflow-wrap: anywhere; }
 .fimg img { max-width: 100%; border-radius: 6px; background: #fff1; }
 .reports { display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
            margin-bottom: 12px; }
+
+/* --------------------------------------------------------------- run */
+#run .panel { margin-bottom: 12px; }
+.runrow { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.runrow .rname { width: 190px; flex: none; font-size: 12.5px; color: var(--dim);
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runrow input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
+pre.console { background: #05080c; border: 1px solid var(--line);
+              border-radius: 8px; padding: 10px 12px; margin: 10px 0 8px;
+              max-height: 380px; min-height: 90px; overflow: auto;
+              white-space: pre-wrap; font-size: 12.5px; line-height: 1.45; }
+#run-status { gap: 8px; }
+#run-status code { font-size: 12px; color: var(--dim); max-width: 46%;
+                   overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; }
+#run input[type=text] { width: 100%; }
+.notice.row { display: flex; }
 .btn.small.on { border-color: var(--accent-dim); color: var(--accent); }
 .gantt-pace { font-size: 12.5px; color: var(--dim); margin: 2px 0 10px; }
 .gantt-pace b { color: var(--text); }

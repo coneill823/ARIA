@@ -196,6 +196,23 @@ aria:
   # row that add nothing.
   autopilot_stall_limit: 3
 
+  # Run the project's own tests after every code change:
+  #   sandbox = yes, inside bubblewrap — no network, the machine read-only,
+  #             a scratch copy of the project the only thing writable.
+  #             Without bubblewrap they are not run, and the report says so
+  #             (Arch: sudo pacman -S bubblewrap).
+  #   direct  = yes, without a sandbox (a scratch copy, your permissions)
+  #   off     = never
+  # A change that makes passing tests fail is rejected and rolled back.
+  autopilot_checks: sandbox
+  # Seconds one test run may take before it is stopped.
+  autopilot_check_seconds: 300
+
+  # When the goal is met — and again after every few more changes — read
+  # the whole codebase, write up what is worth changing (REVIEW.md) and
+  # refine it without changing what it does.
+  autopilot_refine: true
+
   # Minutes a fast/smart model may stay silent before an attempt is
   # abandoned and retried. The deep tier and hand-picked models are never
   # cut off — a giant can take an hour to produce its first token.

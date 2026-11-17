@@ -15,6 +15,12 @@ itself and hands everything below to this script:
   autopilot <slug> start|stop|status|run|steer "guidance"
   autopilot <slug> approve-task <id> ["your decision"]
   autopilot <slug> skip-task <id> ["why"]      a task that waits on you
+  autopilot <slug> refine        review the whole codebase and refine it
+                                 without changing what it does
+  run <slug> [n] [--no-sandbox]  how a project is started — or start entry
+                                 n here, in this terminal
+  check <slug>                   run the project's tests the way she does:
+                                 sandboxed, in a scratch copy
   plan <slug>                    assess + (re)plan a project now
   models [status]                the giants: which role has which model,
                                  what is loaded
@@ -106,6 +112,58 @@ def cmd_projects(_args):
             print(f"{'':34} needs you: {g['id']} — {g['title']}")
 
 
+def cmd_run(args):
+    """How to start a project — or start one of the ways, here. This is
+    your terminal: the program gets it directly."""
+    import subprocess
+    boxed = "--no-sandbox" not in args
+    args = [a for a in args if a != "--no-sandbox"]
+    need(args, 1, "run <slug> [n] [--no-sandbox]")
+    slug = args[0]
+    info = eng.project_run_profile(slug)
+    ways = info["setup"] + info["run"]
+    if len(args) < 2:
+        print(f"{slug} lives in {info['path']}")
+        if not ways:
+            print("nothing here says how to start it yet (no main.py, "
+                  "package.json, Makefile…)")
+        for i, c in enumerate(ways, 1):
+            print(f"  {i}. {c['name']:38} {c['cmd']}")
+        if info["check"]:
+            print(f"  tests: {info['check'][0]['cmd']}   (aria check {slug})")
+        print("sandbox: " + ("available — a program started with `aria run "
+                             f"{slug} <n>` can only change files in that "
+                             "folder" if info["sandbox"]["available"]
+                             else info["sandbox"]["why"]))
+        return
+    try:
+        cmd = ways[int(args[1]) - 1]["cmd"]
+    except (ValueError, IndexError):
+        raise SystemExit(f"pick 1–{len(ways)}: aria run {slug}")
+    cmd = cmd.replace("{port}", str(eng.aria_run.free_port()))
+    shell = ["bash", "-lc", cmd]
+    tool = eng.aria_run.sandbox()[0] if boxed else ""
+    print(f"$ {cmd}   (in {info['path']}"
+          + (", sandboxed)" if tool else ", not sandboxed)"), flush=True)
+    argv = eng.aria_run._wrap_user(tool, shell, info["path"]) if tool \
+        else shell
+    sys.exit(subprocess.call(argv, cwd=info["path"],
+                             env=eng.aria_run._env_user()))
+
+
+def cmd_check(args):
+    need(args, 1, "check <slug>")
+    res = eng.project_check(args[0])
+    if not res["ran"]:
+        print("not run — " + res["why"])
+        sys.exit(2)
+    print(res["output"])
+    print(("PASS" if res["ok"] else "FAIL") + f" — {res['summary']}  "
+          f"({res['cmd']}, {res['seconds']}s, "
+          + ("sandboxed" if res["sandboxed"] else "not sandboxed") + ")")
+    sys.exit(0 if res["ok"] else 1)
+
+
 def cmd_open(args):
     need(args, 1, "open <slug> [folder|editor|terminal]")
     print(eng.open_path(args[0], how=args[1] if len(args) > 1 else "folder"))
@@ -162,6 +220,13 @@ def cmd_autopilot(args):
         need(args, 3, 'autopilot <slug> steer "guidance"')
         eng.autopilot_steer(slug, " ".join(args[2:]), via="cli")
         print("noted — unstarted work is replanned around it")
+    elif action == "refine":
+        state = eng.autopilot_refine(slug, via="cli")
+        print("review and refinement requested"
+              + (" — autopilot is running it"
+                 if state["status"] == "running" else ""))
+        print("without the always-on server, work it here: "
+              f"aria autopilot {slug} run")
     elif action in ("approve-task", "skip-task"):
         need(args, 3, f'autopilot <slug> {action} <task-id> ["note"]')
         done = eng.autopilot_decide(slug, args[2],
