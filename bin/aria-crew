@@ -24,14 +24,10 @@ import aria_engine as eng  # noqa: E402
 
 
 def find_project(slug):
-    cfg = eng.config()
-    target = Path(cfg["promotion_target"])
-    if not target.is_absolute():
-        target = (eng.ROOT / target).resolve()
-    for base in (target / slug, eng.POTENTIAL / slug):
-        if base.is_dir():
-            return base
-    raise SystemExit(f"no project found for slug: {slug}")
+    try:
+        return eng._project_dir(slug)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
 
 def team_from(project):

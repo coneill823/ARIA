@@ -1,23 +1,47 @@
 #!/usr/bin/env bash
-# Install Agent Skills from every repo listed in system/skill-sources.txt
-# (Anthropic's official skills, prompt-master, Karpathy guidelines,
-# marketing skills — add your own lines). Each repo is cloned into
-# vendor/ and every folder containing a SKILL.md is linked into
-# .claude/skills/, where Claude Code sessions — and, after
-# `aria skills convert`, A.R.I.A.'s own agents and chat — can use them.
+# Install skills — and the specialist agents that travel with them — from
+# every repo listed in system/skill-sources.txt (Anthropic's official
+# skills, prompt-master, Karpathy guidelines, marketing skills, ECC — add
+# your own lines).
 #
-# First source wins on name collisions. Re-run any time to update.
+# Each repo is cloned into vendor/. Its skills are linked where A.R.I.A.
+# can load them:
+#   .claude/skills/    for sources Claude Code sessions should see too
+#   skills-library/    for sources marked `engine-only` — her own agents
+#                      and autopilot use them, Claude Code is not flooded
+# and its agents/ folder (if it has one) becomes her agent library with
+# nothing more to do: autopilot offers the relevant specialists to the
+# planner project by project.
+#
+# A repo's own top-level skills/ folder is the source of truth when it
+# exists — translations and per-tool copies elsewhere in the repo are
+# ignored. First source wins on name collisions. Re-run any time to update.
 set -euo pipefail
 
 ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCES="$ARIA_ROOT/system/skill-sources.txt"
-SKILLS="$ARIA_ROOT/.claude/skills"
+SHARED="$ARIA_ROOT/.claude/skills"
+LIBRARY="$ARIA_ROOT/skills-library"
 
-mkdir -p "$SKILLS" "$ARIA_ROOT/vendor"
-total=0 repos=0
+mkdir -p "$SHARED" "$LIBRARY" "$ARIA_ROOT/vendor"
+total=0 repos=0 agents_total=0
+
+skill_files() {   # the SKILL.md files that count, for one cloned repo
+  local dir="$1"
+  if [ -d "$dir/skills" ]; then
+    find "$dir/skills" -name SKILL.md -not -path '*/node_modules/*' | sort
+    [ -f "$dir/SKILL.md" ] && echo "$dir/SKILL.md"
+  else
+    find "$dir" -name SKILL.md -not -path '*/.*' -not -path '*/docs/*' \
+      -not -path '*/node_modules/*' -not -path '*/examples/*' | sort
+  fi
+  return 0
+}
 
 while IFS= read -r line; do
-  url="$(echo "$line" | sed 's/#.*//' | tr -d '[:space:]')"
+  entry="$(echo "$line" | sed 's/#.*//')"
+  url="$(echo "$entry" | awk '{print $1}')"
+  flag="$(echo "$entry" | awk '{print $2}')"
   [ -n "$url" ] || continue
   name="$(basename "${url%.git}" | tr '[:upper:]' '[:lower:]')"
   dir="$ARIA_ROOT/vendor/$name"
@@ -26,27 +50,47 @@ while IFS= read -r line; do
     git -C "$dir" pull --ff-only -q || echo "  (update failed — keeping current copy)"
   else
     echo "cloning $url…"
-    git clone --depth 1 -q "$url" "$dir" || { echo "  clone failed — skipping"; continue; }
+    GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 -q "$url" "$dir" \
+      || { echo "  clone failed — skipping"; continue; }
   fi
   repos=$((repos + 1))
+  dest="$SHARED"
+  [ "$flag" = "engine-only" ] && dest="$LIBRARY"
+
+  # drop this repo's old links first: a link left over from an earlier
+  # layout (or pointing at a translation) must not block the right one
+  for d in "$SHARED" "$LIBRARY"; do
+    for link in "$d"/*; do
+      [ -L "$link" ] || continue
+      case "$(readlink "$link")" in "$dir"|"$dir"/*) rm -f "$link" ;; esac
+    done
+  done
+
   count=0
   while IFS= read -r skill_md; do
+    [ -n "$skill_md" ] || continue
     sdir="$(dirname "$skill_md")"
     sname="$(basename "$sdir")"
-    # repo root SKILL.md: name the skill after the repo
-    [ "$sdir" = "$dir" ] && sname="$name"
-    if [ -e "$SKILLS/$sname" ] && [ "$(readlink "$SKILLS/$sname" 2>/dev/null)" != "$sdir" ]; then
+    [ "$sdir" = "$dir" ] && sname="$name"   # repo-root SKILL.md
+    if [ -e "$SHARED/$sname" ] || [ -e "$LIBRARY/$sname" ]; then
       echo "  skip $sname (name already taken by an earlier source)"
       continue
     fi
-    ln -sfn "$sdir" "$SKILLS/$sname"
+    ln -sfn "$sdir" "$dest/$sname"
     count=$((count + 1))
-  done < <(find "$dir" -name SKILL.md -not -path '*/.git/*' | sort)
-  echo "  $count skill(s) from $name"
+  done < <(skill_files "$dir")
+
+  nagents=0
+  if [ -d "$dir/agents" ]; then
+    nagents="$(find "$dir/agents" -maxdepth 1 -name '*.md' ! -iname 'readme.md' | wc -l | tr -d ' ')"
+  fi
+  where=".claude/skills"; [ "$dest" = "$LIBRARY" ] && where="skills-library (engine-only)"
+  echo "  $count skill(s) -> $where$([ "$nagents" -gt 0 ] && echo ", $nagents library agent(s)")"
   total=$((total + count))
+  agents_total=$((agents_total + nagents))
 done < "$SOURCES"
 
 echo
-echo "linked $total skills from $repos source(s) into .claude/skills/"
+echo "linked $total skills from $repos source(s); $agents_total library agent(s) available"
 echo "next: bin/aria skills convert   (universal pack for agents & chat)"
-echo "available in any Claude Code session run from this repo"
+echo "autopilot picks the relevant skills and specialists per project by itself"

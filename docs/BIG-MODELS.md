@@ -31,10 +31,18 @@ bin/aria llama get <url-of-part-00002>   # ... repeat per part
 bin/aria llama serve giant vendor/models/<first-part-00001-of-000NN>.gguf
 ```
 
-Then point the deep tier at it (⚙ Settings or config):
-`deep: llamacpp/giant`. The preset keeps **mmap on** (that's the disk
-streaming), puts every expert on CPU (`--n-cpu-moe 999`), attention on the
-GPU, and shrinks/quantizes the KV cache to protect your 62GB of RAM.
+That serves one giant by hand on :8080 (`deep: llamacpp/giant`). You
+rarely need to: give the model a **role** instead and A.R.I.A. starts and
+swaps the giants herself —
+
+```bash
+bin/aria models scan
+```
+
+— see **[MODEL-GARAGE.md](MODEL-GARAGE.md)**. Either way the preset keeps
+**mmap on** (that's the disk streaming), puts every expert on CPU
+(`--n-cpu-moe 999`), attention on the GPU, and shrinks/quantizes the KV
+cache to protect your 62GB of RAM.
 
 Where to get the quants: look for **Unsloth "UD" dynamic quants** on
 HuggingFace (`unsloth/DeepSeek-R1-GGUF`, `unsloth/Kimi-K2-Instruct-GGUF` —
@@ -50,13 +58,11 @@ the whole file into RAM.
 [colibri](https://github.com/JustVugg/colibri) is purpose-built for this
 exact trick: a tiny C engine that keeps per-token layers in RAM, streams
 routed experts from disk, and holds the hottest experts on the GPU. It
-serves an OpenAI-compatible API, so it's one config line away:
+serves an OpenAI-compatible API, so it's two settings away:
 
-```yaml
-backends:
-  colibri: http://localhost:8338
-models:
-  deep: colibri/<model-name>
+```bash
+bin/aria settings set backends.colibri http://localhost:8338
+bin/aria settings set deep colibri/<model-name>
 ```
 
 Its `docs/AI_SETUP.md` is written for an AI to follow — paste it into a

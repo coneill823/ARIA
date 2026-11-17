@@ -1,29 +1,441 @@
-#!/usr/bin/env bash
-# Launch A.R.I.A. as a desktop application window.
-# Starts the UI server if it isn't already running, then opens the
-# visualization screen in a chromeless app window (no tabs, no URL bar).
-set -euo pipefail
+#!/usr/bin/env python3
+"""aria-app — A.R.I.A. as a desktop application.
 
-ARIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT="${1:-8700}"
-URL="http://127.0.0.1:$PORT"
+  aria app [port]        default 8700
 
-if ! curl -sf "$URL/api/health" >/dev/null 2>&1; then
-  nohup python3 "$ARIA_ROOT/bin/aria-ui" "$PORT" \
-    >> "${XDG_STATE_HOME:-$HOME/.local/state}/aria-ui.log" 2>&1 &
-  for _ in $(seq 1 40); do
-    curl -sf "$URL/api/health" >/dev/null 2>&1 && break
-    sleep 0.25
-  done
-fi
+Opens A.R.I.A. in a window of her own — no browser, no tabs, no address
+bar — with her icon in your taskbar. The window is only a face: the work
+is done by the always-on server (aria.service), so closing the window
+stops nothing, and opening it again shows everything as it stands. If the
+server is not running, this starts it.
 
-for b in google-chrome-stable google-chrome chromium chromium-browser \
-         brave brave-browser thorium vivaldi microsoft-edge; do
-  if command -v "$b" >/dev/null 2>&1; then
-    exec "$b" --app="$URL" --window-size=1500,900 --class=ARIA \
-      >/dev/null 2>&1
-  fi
-done
+Which window, in order of preference (ARIA_APP_BACKEND=qt|gtk|webview|
+chromium|browser forces one):
 
-# no chromium-family browser found — plain browser tab still works
-exec xdg-open "$URL"
+  qt        PyQt6 or PySide6 with QtWebEngine — the real thing on KDE.
+            Arch:    sudo pacman -S python-pyqt6-webengine
+            Debian:  sudo apt install python3-pyqt6.qtwebengine
+            pip:     pip install PyQt6-WebEngine
+  gtk       PyGObject with WebKitGTK — the real thing on GNOME.
+            Arch:    sudo pacman -S python-gobject webkit2gtk-4.1
+  webview   pywebview, if you have it
+  chromium  a chromeless window of a Chromium-family browser
+  browser   a tab in your default browser (the last resort)
+
+In her own window: links to anywhere else open in your browser, the
+microphone is allowed for her own page only, the window remembers its
+size, and a second launch brings the first window forward.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ICON = ROOT / "docs" / "aria-icon.svg"
+BROWSERS = ("google-chrome-stable", "google-chrome", "chromium",
+            "chromium-browser", "brave", "brave-browser", "thorium",
+            "vivaldi", "microsoft-edge")
+BACKGROUND = "#0a0f16"
+
+
+def healthy(url, timeout=1.5):
+    try:
+        with urllib.request.urlopen(url + "/api/health", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def refresh(url, port):
+    """A server left running from before an update still has the old code
+    in memory. If it is idle, restart it onto the code on disk — nothing
+    is lost. If autopilot is mid-step it is left alone; the sidebar then
+    says a new version is waiting."""
+    try:
+        sys.path.insert(0, str(ROOT / "bin"))
+        import aria_engine as eng
+        server = eng.server_running()
+        if not server or not server["stale"] or server["port"] != port \
+                or eng.autopilot_busy():
+            return
+        eng.server_restart(server)
+        for _ in range(120):
+            time.sleep(0.25)
+            if healthy(url, timeout=0.5):
+                return
+    except Exception as exc:                # never keep the window shut
+        print(f"aria-app: could not refresh the server ({exc})",
+              file=sys.stderr)
+
+
+def ensure_server(port):
+    """The server does the work; make sure there is one — running the
+    code that is on disk."""
+    url = f"http://127.0.0.1:{port}"
+    if healthy(url):
+        refresh(url, port)
+        return url
+    state = Path(os.environ.get("XDG_STATE_HOME")
+                 or Path.home() / ".local" / "state")
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / "aria-ui.log", "ab") as log:
+        subprocess.Popen([sys.executable, str(ROOT / "bin" / "aria-ui"),
+                          str(port)], stdout=log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(60):
+        if healthy(url, timeout=0.5):
+            return url
+        time.sleep(0.25)
+    raise SystemExit(f"the A.R.I.A. server did not start — see "
+                     f"{state / 'aria-ui.log'}")
+
+
+def ours(url, base):
+    return url == base or url.startswith(base + "/") \
+        or url.startswith(base + "?")
+
+
+# ------------------------------------------------------------------ Qt
+
+def run_qt(url):
+    """A native Qt window (PyQt6 or PySide6). Returns False when Qt with
+    WebEngine is not installed."""
+    try:
+        from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
+        from PyQt6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
+                                           QWebEngineSettings)
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+    except ImportError:
+        try:
+            from PySide6 import QtCore, QtGui, QtNetwork, QtWidgets
+            from PySide6.QtWebEngineCore import (QWebEnginePage,
+                                                 QWebEngineProfile,
+                                                 QWebEngineSettings)
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+        except ImportError:
+            return False
+
+    if os.geteuid() == 0:                 # Chromium refuses its sandbox
+        os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
+    app = QtWidgets.QApplication([sys.argv[0]])
+    app.setApplicationName("ARIA")                 # X11 WM_CLASS
+    app.setApplicationDisplayName("A.R.I.A.")
+    app.setOrganizationName("aria")
+    QtGui.QGuiApplication.setDesktopFileName("aria")   # Wayland app id
+    icon = QtGui.QIcon(str(ICON))
+    app.setWindowIcon(icon)
+
+    # one window: a second launch brings the first one forward
+    key = "aria-app-" + str(os.getuid())
+    probe = QtNetwork.QLocalSocket()
+    probe.connectToServer(key)
+    if probe.waitForConnected(300) and not os.environ.get("ARIA_APP_SELFTEST"):
+        probe.write(url.encode())
+        probe.waitForBytesWritten(500)
+        return True
+    QtNetwork.QLocalServer.removeServer(key)
+    listener = QtNetwork.QLocalServer()
+    listener.listen(key)
+
+    profile = QWebEngineProfile("aria", app)       # named: it keeps your
+    profile.setHttpUserAgent(                      # chats between launches
+        profile.httpUserAgent() + " ARIA-Desktop/1")
+    Feature = QWebEnginePage.Feature
+    Policy = QWebEnginePage.PermissionPolicy
+
+    class Page(QWebEnginePage):
+        """Her pages stay in the window; everything else goes to the
+        owner's browser."""
+
+        def acceptNavigationRequest(self, target, kind, main_frame):
+            if main_frame and not ours(target.toString(), url):
+                QtGui.QDesktopServices.openUrl(target)
+                return False
+            return True
+
+        def createWindow(self, _kind):             # target=_blank, window.open
+            popup = QWebEnginePage(self.profile(), self)
+            popup.urlChanged.connect(
+                lambda target: (QtGui.QDesktopServices.openUrl(target),
+                                popup.deleteLater()))
+            return popup
+
+    page = Page(profile, app)
+    page.setBackgroundColor(QtGui.QColor(BACKGROUND))
+
+    def permission(origin, feature):
+        mic = feature in (Feature.MediaAudioCapture,)
+        allow = mic and ours(origin.toString().rstrip("/"), url)
+        page.setFeaturePermission(
+            origin, feature, Policy.PermissionGrantedByUser if allow
+            else Policy.PermissionDeniedByUser)
+    page.featurePermissionRequested.connect(permission)
+
+    settings = page.settings()
+    settings.setAttribute(
+        QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+    settings.setAttribute(
+        QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+
+    view = QWebEngineView()
+    view.setPage(page)
+    win = QtWidgets.QMainWindow()
+    win.setWindowTitle("A.R.I.A.")
+    win.setWindowIcon(icon)
+    win.setStyleSheet(f"background: {BACKGROUND};")
+    win.setCentralWidget(view)
+    page.titleChanged.connect(lambda t: win.setWindowTitle(t or "A.R.I.A."))
+
+    store = QtCore.QSettings("aria", "app")
+    geometry = store.value("geometry")
+    if geometry:
+        win.restoreGeometry(geometry)
+    else:
+        win.resize(1500, 920)
+    view.setZoomFactor(float(store.value("zoom", 1.0)))
+
+    def shortcut(keys, fn):
+        action = QtGui.QAction(win)
+        action.setShortcuts([QtGui.QKeySequence(k) for k in keys])
+        action.triggered.connect(fn)
+        win.addAction(action)
+
+    def zoom(step):
+        view.setZoomFactor(1.0 if step == 0 else max(
+            0.5, min(2.5, view.zoomFactor() + step)))
+        store.setValue("zoom", view.zoomFactor())
+    shortcut(["Ctrl++", "Ctrl+="], lambda: zoom(+0.1))
+    shortcut(["Ctrl+-"], lambda: zoom(-0.1))
+    shortcut(["Ctrl+0"], lambda: zoom(0))
+    shortcut(["F5", "Ctrl+R"], view.reload)
+    shortcut(["F11"], lambda: win.showNormal() if win.isFullScreen()
+             else win.showFullScreen())
+    shortcut(["Ctrl+Q"], win.close)
+
+    def raise_window():
+        while listener.hasPendingConnections():
+            listener.nextPendingConnection().close()
+        win.showNormal()
+        win.raise_()
+        win.activateWindow()
+    listener.newConnection.connect(raise_window)
+
+    def retry(ok):                 # the server may still be coming up
+        if not ok:
+            QtCore.QTimer.singleShot(1500, lambda: view.load(QtCore.QUrl(url)))
+    view.loadFinished.connect(retry)
+
+    selftest = os.environ.get("ARIA_APP_SELFTEST")
+    if selftest:                   # prove the window really shows the app
+        def probe_page(ok):
+            def report(found):
+                print(json.dumps({"loaded": bool(ok), "title": page.title(),
+                                  "shell": bool(found), "backend": "qt",
+                                  "agent": profile.httpUserAgent()[-14:]}),
+                      flush=True)
+                app.quit()
+            QtCore.QTimer.singleShot(1500, lambda: page.runJavaScript(
+                "!!document.querySelector('#sidebar') && "
+                "!!document.querySelector('#nav a')", report))
+        view.loadFinished.connect(probe_page)
+        QtCore.QTimer.singleShot(40000, app.quit)
+
+    def closing():
+        store.setValue("geometry", win.saveGeometry())
+        view.setPage(None)         # the page must go before its profile
+        page.deleteLater()
+    app.aboutToQuit.connect(closing)
+    view.load(QtCore.QUrl(url))
+    win.show()
+    app.exec()
+    return True
+
+
+# ------------------------------------------------------------------ GTK
+
+def run_gtk(url):
+    """A native GTK window with WebKitGTK. Returns False when missing."""
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        for version in ("4.1", "4.0"):
+            try:
+                gi.require_version("WebKit2", version)
+                break
+            except ValueError:
+                continue
+        else:
+            return False
+        from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+    except (ImportError, ValueError):
+        return False
+
+    GLib.set_prgname("aria")
+    GLib.set_application_name("A.R.I.A.")
+    app = Gtk.Application(application_id="org.aria.App",
+                          flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def activate(app):
+        if app.get_windows():                       # second launch
+            app.get_windows()[0].present()
+            return
+        data = os.path.join(GLib.get_user_data_dir(), "aria", "app")
+        manager = WebKit2.WebsiteDataManager(
+            base_data_directory=data,
+            base_cache_directory=os.path.join(GLib.get_user_cache_dir(),
+                                              "aria", "app"))
+        context = WebKit2.WebContext.new_with_website_data_manager(manager)
+        view = WebKit2.WebView.new_with_context(context)
+        settings = view.get_settings()
+        settings.set_user_agent_with_application_details("ARIA-Desktop", "1")
+        settings.set_enable_media_stream(True)
+        settings.set_media_playback_requires_user_gesture(False)
+        view.set_background_color(Gdk.RGBA(10 / 255, 15 / 255, 22 / 255, 1))
+
+        def decide(_view, decision, kind):
+            # her pages stay here; anything else goes to the browser
+            if kind in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                        WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION):
+                target = decision.get_navigation_action().get_request() \
+                    .get_uri()
+                new = kind == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION
+                if new or not ours(target, url):
+                    if target.startswith(("http://", "https://")):
+                        Gio.AppInfo.launch_default_for_uri(target, None)
+                    decision.ignore()
+                    return True
+            return False
+        view.connect("decide-policy", decide)
+
+        def permission(_view, request):
+            mic = isinstance(request, WebKit2.UserMediaPermissionRequest) \
+                and not request.props.is_for_video_device
+            request.allow() if mic and ours(view.get_uri() or "", url) \
+                else request.deny()
+            return True
+        view.connect("permission-request", permission)
+
+        win = Gtk.ApplicationWindow(application=app, title="A.R.I.A.")
+        win.set_default_size(1500, 920)
+        if ICON.is_file():
+            try:
+                win.set_icon_from_file(str(ICON))
+            except GLib.Error:
+                pass
+        win.set_wmclass("aria", "ARIA")
+        view.connect("notify::title", lambda v, _p: win.set_title(
+            v.get_title() or "A.R.I.A."))
+        view.connect("load-failed", lambda *_a: GLib.timeout_add(
+            1500, lambda: view.load_uri(url) and False) and False)
+        win.add(view)
+        view.load_uri(url)
+        win.show_all()
+
+    app.connect("activate", activate)
+    app.run([])
+    return True
+
+
+# ---------------------------------------------------------- the others
+
+def run_webview(url):
+    try:
+        import webview
+    except ImportError:
+        return False
+    webview.create_window("A.R.I.A.", url, width=1500, height=920,
+                          background_color=BACKGROUND)
+    webview.start()
+    return True
+
+
+def run_chromium(url):
+    for name in BROWSERS:
+        exe = shutil.which(name)
+        if exe:
+            os.execv(exe, [exe, f"--app={url}", "--window-size=1500,920",
+                           "--class=ARIA"])
+    return False
+
+
+def run_browser(url):
+    print("No window toolkit found, so A.R.I.A. opens in your browser.\n"
+          "For a window of her own install one of:\n"
+          "  Arch/KDE:   sudo pacman -S python-pyqt6-webengine\n"
+          "  Arch/GNOME: sudo pacman -S python-gobject webkit2gtk-4.1\n"
+          "  Debian:     sudo apt install python3-pyqt6.qtwebengine\n"
+          "  any:        pip install PyQt6-WebEngine", file=sys.stderr)
+    opener = shutil.which("xdg-open")
+    if opener:
+        subprocess.Popen([opener, url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True
+    print(f"Open {url} in a browser.", file=sys.stderr)
+    return True
+
+
+BACKENDS = {"qt": run_qt, "gtk": run_gtk, "webview": run_webview,
+            "chromium": run_chromium, "browser": run_browser}
+
+
+def available():
+    """Which backends would work here (for `aria doctor`) — found out by
+    importing them, in a child process so a broken toolkit cannot take
+    this one down."""
+    probes = {
+        "qt": "import importlib\nfor m in ('PyQt6', 'PySide6'):\n"
+              "    try:\n        importlib.import_module(m + "
+              "'.QtWebEngineWidgets'); break\n    except ImportError: pass\n"
+              "else: raise SystemExit(1)",
+        "gtk": "import gi\ngi.require_version('Gtk', '3.0')\n"
+               "for v in ('4.1', '4.0'):\n    try:\n        "
+               "gi.require_version('WebKit2', v); break\n    "
+               "except ValueError: pass\nelse: raise SystemExit(1)\n"
+               "from gi.repository import Gtk, WebKit2",
+        "webview": "import webview",
+    }
+    found = {}
+    for name, code in probes.items():
+        try:
+            found[name] = subprocess.run(
+                [sys.executable, "-c", code], capture_output=True,
+                timeout=30).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            found[name] = False
+    found["chromium"] = any(shutil.which(b) for b in BROWSERS)
+    return found
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if "--which" in sys.argv:
+        found = available()
+        first = next((k for k in BACKENDS if found.get(k)), "browser")
+        print(first)
+        return 0
+    port = int(args[0]) if args and args[0].isdigit() else 8700
+    url = ensure_server(port)
+    forced = os.environ.get("ARIA_APP_BACKEND", "").lower()
+    order = [forced] if forced in BACKENDS else list(BACKENDS)
+    for name in order:
+        try:
+            if BACKENDS[name](url):
+                return 0
+        except Exception as exc:               # a broken toolkit: try the next
+            print(f"aria-app: the {name} window failed ({exc})",
+                  file=sys.stderr)
+    if forced:
+        print(f"aria-app: the {forced} backend is not available here",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

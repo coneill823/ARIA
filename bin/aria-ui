@@ -1,27 +1,66 @@
 #!/usr/bin/env python3
-"""A.R.I.A. web UI server — Claude-style app shell at /, pipeline board at
-/board, orb focus mode at /orb, agents at /agents.
+"""A.R.I.A. web UI server — one app shell, every view behind it.
 
   aria-ui [port]     default port 8700, binds to 127.0.0.1 only
 
-Stdlib only. Endpoints:
-  GET  /  /board  /orb  /agents             the app pages
-  GET  /api/board     pipeline state as JSON
-  GET  /api/health    backend/tier reachability
-  GET  /api/agents    agent definitions (name, role, skills, model tier)
-  GET  /api/skills    universal skills index
+Stdlib only. The pages (/, /projects, /board, /agents, /orb, /settings) all
+serve the same shell, ui/index.html; its assets come from /ui/<file>.
+
+  GET  /api/state      what the shell polls: health, projects, switches
+  GET  /api/health     backend/tier reachability (full detail)
+  GET  /api/board      pipeline state
+  GET  /api/config     settings the UI can show and change
+  GET  /api/projects   every project with its autopilot status
+  GET  /api/project?slug=        everything the Projects view shows
+  GET  /api/project/live?slug=   light poll: state, activity tail, live text
+  GET  /api/file?slug=&path=     one project file (text, confined)
+  GET  /api/file/raw?slug=&path=  an image from the project, as itself
+  GET  /api/files?slug=          every file in a project (the Files view)
+  GET  /api/changes?slug=        the complete change record
+  GET  /api/agents     core agents + library specialists
+  GET  /api/skills     installed skills with descriptions
+  GET  /api/missions   background jobs
   GET  /api/note?path=<repo-relative .md>   note content
   GET  /api/run?stage=triage|develop|auto   Server-Sent Events stream
        (&file=<inbox note> scopes triage/auto, &slug=<slug> scopes develop)
-  POST /api/capture   {"text": "..."} -> new inbox note
-  POST /api/refine    {"slug", "feedback"} -> idea goes back to processing
-  POST /api/export    {"slug"} -> publish project into the Obsidian vault
-  POST /api/chat      {"messages", "skill"?} -> streamed reply / action
-  POST /api/agent     {"name", "task"} -> streamed agent run
-  POST /api/stt       raw audio body -> {"text"} via local faster-whisper
+  POST /api/chat       {"messages", "skill"?} -> streamed reply / action
+  POST /api/say        {"text"} -> {"reply"}  (integrations: Alexa, scripts)
+  POST /api/capture    {"text"} -> new inbox note
+  POST /api/refine     {"slug", "feedback"} -> idea goes back to processing
+  POST /api/export     {"slug"} -> publish project into the Obsidian vault
+  POST /api/brain      {"text", "title"?, "sources"?} -> note in the vault
+  POST /api/autopilot  {"slug", "action": approve|start|stop|steer|refine,
+                        "text"?}
+  POST /api/approve-task  {"slug", "id", "note"?}  a task that waits on you:
+  POST /api/skip-task     {"slug", "id", "note"?}  let it run / decline it
+  GET  /api/garage     the giant models: one per role, what is loaded
+  POST /api/garage     {"action": scan|load|unload, "folder"?, "role"?}
+  POST /api/open       {"slug", "path"?, "how": folder|editor|terminal}
+  GET  /api/runner?slug=          how to run and check a project; what runs
+  GET  /api/runner/output?slug=&since=   output of the program you started
+  POST /api/runner     {"slug", "action": start|stop|input|check|save, …}
+                       start runs a command on this machine — reachable
+                       only from the app (see below), never from chat,
+                       voice or autopilot
+
+Only this machine may call the API. The server binds 127.0.0.1, and on top
+of that refuses requests a web page could cause from elsewhere: a Host that
+is not this machine (DNS rebinding), a browser request marked as coming
+from another site — including another local port, such as a project's own
+web app — and a POST whose Origin is not this server. Tools without those
+headers (curl, the voice gateway, scripts) are unaffected.
+  POST /api/plan       {"slug"} -> streamed (re)plan
+  POST /api/github     {"slug", "action": init|publish|push}
+  POST /api/agent      {"name", "task"} -> streamed agent run
+  POST /api/mission    {"agent", "task"} -> queue a background job
+  POST /api/config     {key: value, …} -> update settings
+  POST /api/stt        raw audio body -> {"text"} via local faster-whisper
 """
 
 import json
+import mimetypes
+import os
+import signal
 import sys
 import threading
 import time
@@ -33,16 +72,168 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aria_engine as eng  # noqa: E402
 
 UI_DIR = eng.ROOT / "ui"
-PAGES = {"/": UI_DIR / "index.html", "/board": UI_DIR / "board.html",
-         "/orb": UI_DIR / "orb.html", "/agents": UI_DIR / "agents.html",
-         "/projects": UI_DIR / "projects.html"}
-RUN_LOCK = threading.Lock()  # one engine run at a time
+VIEWS = ("/", "/chat", "/projects", "/board", "/agents", "/orb", "/settings")
+RUN_LOCK = threading.Lock()  # one pipeline run at a time
 AUDIO_SUFFIX = {"audio/webm": ".webm", "audio/ogg": ".ogg",
                 "audio/wav": ".wav", "audio/mp4": ".m4a"}
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
+               ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp", ".svg": "image/svg+xml",
+               ".ico": "image/x-icon", ".bmp": "image/bmp"}
+CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
+               "stt_model", "web_access", "web_search", "web_search_url",
+               "web_allowlist", "github_access", "github_base_branch",
+               "brain_journal", "autopilot_git", "autopilot_after_goal",
+               "autopilot_max_tasks", "autopilot_max_iterations",
+               "autopilot_max_hours", "autopilot_stall_limit",
+               "context_tokens", "giant_general", "giant_research",
+               "giant_coder", "giants_use", "giants_loaded",
+               "giants_idle_minutes", "editor", "terminal",
+               "autopilot_checks", "autopilot_check_seconds",
+               "autopilot_refine", "desktop_notifications")
+_HEALTH = {"at": 0.0, "value": None}
+_HEALTH_LOCK = threading.Lock()
+# what this server started with (filled in by main) — see eng.server_mark
+BOOT = {"pid": os.getpid(), "code": "", "version": {}}
+_STALE = {"at": 0.0, "value": False}
+
+
+def version_view():
+    """Which version is running, and whether newer code is waiting on disk
+    for a restart (checked at most twice a minute)."""
+    if BOOT["code"] and time.time() - _STALE["at"] > 30:
+        try:
+            _STALE["value"] = eng.code_version() != BOOT["code"]
+        except OSError:
+            pass
+        _STALE["at"] = time.time()
+    return {**BOOT["version"], "pid": BOOT["pid"], "code": BOOT["code"],
+            "stale": _STALE["value"]}
+
+
+def health_cached(max_age=10):
+    """Probing three tiers on every poll would hammer a struggling
+    backend; one probe serves every open tab for a few seconds."""
+    with _HEALTH_LOCK:
+        if _HEALTH["value"] is None or time.time() - _HEALTH["at"] > max_age:
+            _HEALTH["value"] = eng.health()
+            _HEALTH["at"] = time.time()
+        return _HEALTH["value"]
+
+
+def garage_brief():
+    """What the sidebar shows about the giants: which is loaded, and what
+    is loading. Cheap: no network probes."""
+    try:
+        st = eng.garage_status(probe=False)
+    except Exception:
+        return {}
+    return {"loaded": [r for r, v in st["roles"].items()
+                       if v["state"] in ("ready", "loading")],
+            "labels": {r: v["label"] for r, v in st["roles"].items()},
+            "now": st["now"]}
+
+
+def load_giant(role):
+    try:
+        eng.garage_load(role, notify=lambda t: print("garage:", t,
+                                                     flush=True))
+    except Exception as exc:
+        print("garage:", exc, flush=True)
+
+
+def _field_text(value):
+    """A setting the way a form field holds it."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    return str(value).strip()
+
+
+def config_view():
+    cfg = eng.config()
+    tiers = {t: eng.resolve_tier(t, cfg) for t in ("fast", "smart", "deep")}
+    return {
+        "obsidian_vault": cfg["obsidian_vault"],
+        "brain_ready": eng.brain_ready(cfg),
+        "brain_journal": cfg["brain_journal"],
+        "auto_pipeline": cfg["auto_pipeline"],
+        "model": cfg["model"],
+        "tiers": {t: v.get("spec") or f"{v['kind']}/{v['model']}"
+                  for t, v in tiers.items()},
+        "tiers_set": dict(cfg["tiers"]),
+        "stt_model": cfg["stt_model"],
+        "web_access": cfg["web_access"],
+        "web_search": cfg["web_search"],
+        "web_search_url": cfg["web_search_url"],
+        "web_allowlist": ", ".join(cfg["web_allowlist"]),
+        "web_providers": eng.aria_web.provider_chain(cfg),
+        "github_access": cfg["github_access"],
+        "github_base_branch": cfg["github_base_branch"],
+        "gh": bool(eng.aria_git.gh()),
+        "autopilot_git": cfg["autopilot_git"],
+        "autopilot_after_goal": cfg["autopilot_after_goal"],
+        "autopilot_max_tasks": cfg["autopilot_max_tasks"],
+        "autopilot_max_iterations": cfg["autopilot_max_iterations"],
+        "autopilot_max_hours": cfg["autopilot_max_hours"],
+        "autopilot_stall_limit": cfg["autopilot_stall_limit"],
+        "context_tokens": cfg["context_tokens"],
+        "giants": cfg["giants"],
+        "giants_use": cfg["giants_use"],
+        "giants_loaded": cfg["giants_loaded"],
+        "giants_idle_minutes": cfg["giants_idle_minutes"],
+        "garage": eng.garage_status(probe=False),
+        "editor": cfg["editor"],
+        "terminal": cfg["terminal"],
+        "desktop_notifications": cfg["desktop_notifications"],
+        "autopilot_checks": cfg["autopilot_checks"],
+        "autopilot_check_seconds": cfg["autopilot_check_seconds"],
+        "autopilot_refine": cfg["autopilot_refine"],
+        "sandbox": dict(zip(("available", "why"),
+                            (bool(eng.aria_run.sandbox()[0]),
+                             eng.aria_run.sandbox()[1]))),
+        "desktop": eng.desktop_tools(cfg),
+        "promotion_target": cfg["promotion_target"],
+        "webhooks": sorted(cfg["webhooks"]),
+    }
+
+
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"} | {
+    h.strip().lower() for h in os.environ.get("ARIA_ALLOWED_HOSTS", "")
+    .split(",") if h.strip()}
+
+
+def _hostname(value):
+    value = (value or "").strip().lower()
+    if value.startswith("["):                    # [::1]:8700
+        return value.split("]")[0] + "]"
+    return value.rsplit(":", 1)[0] if ":" in value else value
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def refused(self):
+        """Why this request must not be served ("" when it may be). The
+        API changes things on this machine — approves plans, starts work,
+        opens folders, runs programs — so only this machine's own app and
+        tools may call it, never a page from somewhere else."""
+        host = self.headers.get("Host", "")
+        if host and _hostname(host) not in LOCAL_HOSTS:
+            return "this server only answers to this machine"
+        if not self.path.startswith("/api/"):
+            return ""
+        if self.headers.get("Sec-Fetch-Site", "same-origin") not in (
+                "same-origin", "none"):
+            return "requests from other sites are refused"
+        origin = self.headers.get("Origin")
+        if self.command == "POST" and origin is not None:
+            want = urllib.parse.urlparse(origin)
+            if want.scheme != "http" or (want.netloc or "").lower() \
+                    != host.strip().lower():
+                return "requests from other origins are refused"
+        return ""
 
     def log_message(self, fmt, *args):
         pass
@@ -54,6 +245,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_file(self, path, ctype, untrusted=False):
+        """`untrusted`: a file from a project — written by a model. It is
+        served inert: no scripts, no access to this origin."""
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")    # no clickjacking
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+            if untrusted else
+            "default-src 'self'; img-src 'self' data: blob:; "
+            "style-src 'self' 'unsafe-inline'; media-src 'self' blob:; "
+            "frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -64,89 +276,166 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
+    def sse_emitter(self):
+        """An emit() that streams events to this client and goes quiet —
+        without raising into the engine — once the client has left."""
+        state = {"dead": False}
+
+        def emit(ev):
+            if state["dead"]:
+                return
+            try:
+                self.wfile.write(b"data: " + json.dumps(ev).encode() + b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                state["dead"] = True
+        return emit
+
     # ------------------------------------------------------------ routes
 
     def do_GET(self):
+        why = self.refused()
+        if why:
+            self.send_json({"error": why}, 403)
+            return
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
+        arg = lambda name: (query.get(name) or [""])[0]  # noqa: E731
+        try:
+            self._get(url.path, arg)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 500)
 
-        if url.path in PAGES:
-            data = PAGES[url.path].read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        elif url.path == "/api/board":
-            self.send_json(eng.board())
-        elif url.path == "/api/health":
-            self.send_json(eng.health())
-        elif url.path == "/api/config":
-            cfg = eng.config()
-            self.send_json({"obsidian_vault": cfg["obsidian_vault"],
-                            "auto_pipeline": cfg["auto_pipeline"],
-                            "model": cfg["model"],
-                            "tiers": {t: (eng.resolve_tier(t, cfg)["kind"]
-                                          + "/" +
-                                          eng.resolve_tier(t, cfg)["model"])
-                                      for t in ("fast", "smart", "deep")},
-                            "stt_model": cfg["stt_model"]})
-        elif url.path == "/api/missions":
-            self.send_json({"missions": eng.mission_list()})
-        elif url.path == "/api/projects":
-            self.send_json({"projects": eng.list_projects()})
-        elif url.path == "/api/project":
-            slug = (query.get("slug") or [""])[0]
-            try:
-                auto = eng._auto_dir(slug)
-            except ValueError:
-                self.send_json({"error": "no such project"}, 404)
+    def _get(self, path, arg):
+        if path in VIEWS:
+            self.send_file(UI_DIR / "index.html", "text/html; charset=utf-8")
+        elif path.startswith("/ui/"):
+            target = (UI_DIR / path[4:]).resolve()
+            if UI_DIR.resolve() not in target.parents or not target.is_file():
+                self.send_json({"error": "not found"}, 404)
                 return
-            plan = {"tasks": []}
-            if (auto / "plan.json").is_file():
-                plan = json.loads((auto / "plan.json").read_text())
-            out = {"slug": slug, "state": eng._auto_state(slug),
-                   "plan": plan, "changelog": "", "report": "", "dir": ""}
-            try:
-                out["dir"] = str(eng._project_dir(slug)
-                                 .relative_to(eng.ROOT))
-            except ValueError:
-                pass  # promoted outside the repo — outputs not servable
-            if (auto / "CHANGELOG.md").is_file():
-                out["changelog"] = (auto / "CHANGELOG.md").read_text()[-12000:]
-            if (auto / "FINAL-REPORT.md").is_file():
-                out["report"] = (auto / "FINAL-REPORT.md").read_text()
-            self.send_json(out)
-        elif url.path == "/api/agents":
-            self.send_json({"agents": [
-                {k: a[k] for k in ("name", "role", "skills", "model", "path")}
-                for a in eng.list_agents()]})
-        elif url.path == "/api/skills":
-            idx = eng.ROOT / "skills" / "index.json"
-            if idx.is_file():
-                self.send_json({"skills":
-                                json.loads(idx.read_text(encoding="utf-8"))})
+            ctype = mimetypes.guess_type(target.name)[0] \
+                or "application/octet-stream"
+            if target.suffix in (".js", ".mjs"):
+                ctype = "text/javascript"
+            self.send_file(target, ctype + ("; charset=utf-8" if
+                           ctype.startswith("text/") else ""))
+        elif path == "/api/state":
+            h = health_cached()
+            cfg = eng.config()
+            self.send_json({
+                "health": {"ok": h["ok"], "server": h["server"],
+                           "model": h["model"],
+                           "smart": h["tiers"]["smart"]["model"],
+                           "error": h.get("error", "")},
+                "projects": eng.list_projects(),
+                "switches": {"web": cfg["web_access"],
+                             "brain": eng.brain_ready(cfg),
+                             "github": cfg["github_access"],
+                             "auto_pipeline": cfg["auto_pipeline"]},
+                "missions": len([m for m in eng.mission_list()
+                                 if m["status"] in ("queued", "running")]),
+                "version": version_view(),
+                "garage": garage_brief(),
+            })
+        elif path == "/api/board":
+            self.send_json(eng.board())
+        elif path == "/api/health":
+            self.send_json(health_cached(max_age=3))
+        elif path == "/api/version":
+            self.send_json(version_view())
+        elif path == "/api/config":
+            self.send_json(config_view())
+        elif path == "/api/garage":
+            self.send_json(eng.garage_status())
+        elif path == "/api/missions":
+            self.send_json({"missions": eng.mission_list()})
+        elif path == "/api/projects":
+            self.send_json({"projects": eng.list_projects()})
+        elif path == "/api/project":
+            self.send_json(eng.project_view(arg("slug")))
+        elif path == "/api/project/live":
+            ap = eng._autopilot()
+            slug = arg("slug")
+            eng._project_dir(slug)
+            state = ap._state(slug)
+            state.pop("run_started", None)
+            plan = ap._with_decisions(ap._plan(slug), ap._auto(slug))
+            self.send_json({"slug": slug, "state": state,
+                            "activity": ap.activity(slug, limit=60),
+                            "live": ap.live(slug),
+                            "tasks": [{k: t.get(k) for k in
+                                       ("id", "status", "attempts",
+                                        "needs_human")}
+                                      for t in plan["tasks"]]})
+        elif path in ("/api/file", "/api/file/raw"):
+            proj = eng._project_dir(arg("slug")).resolve()
+            target = (proj / arg("path")).resolve()
+            if proj not in target.parents or not target.is_file():
+                self.send_json({"error": "not found"}, 404)
+                return
+            size = target.stat().st_size
+            kind = IMAGE_TYPES.get(target.suffix.lower(), "")
+            if path == "/api/file/raw":          # images only, as themselves
+                if not kind or size > 20_000_000:
+                    self.send_json({"error": "not found"}, 404)
+                    return
+                self.send_file(target, kind, untrusted=True)
+                return
+            info = {"path": arg("path"), "size": size, "abs": str(target)}
+            if kind:
+                self.send_json({**info, "image": True})
+            elif size > 1_000_000 or not eng._autopilot()._is_text(target):
+                self.send_json({**info, "binary": True})
             else:
-                self.send_json({"skills": [{"name": n, "description": "",
-                                            "execution": "claude-only"}
-                                           for n in eng.list_skill_names()]})
-        elif url.path == "/api/note":
-            rel = (query.get("path") or [""])[0]
+                self.send_json({**info, "content": target.read_text(
+                    encoding="utf-8", errors="replace")})
+        elif path == "/api/files":
+            slug = arg("slug")
+            self.send_json({"slug": slug,
+                            "path": str(eng._project_dir(slug).resolve()),
+                            "tools": eng.desktop_tools(),
+                            "files": eng._autopilot().files(slug)})
+        elif path == "/api/changes":
+            self.send_json({"changes": eng.project_changes(arg("slug"))})
+        elif path == "/api/runner":
+            self.send_json(eng.project_run_profile(arg("slug")))
+        elif path == "/api/runner/output":
+            self.send_json(eng.project_run_output(
+                arg("slug"), int(arg("since") or 0)))
+        elif path == "/api/agents":
+            keys = ("name", "role", "skills", "model", "path", "web",
+                    "library", "source")
+            self.send_json({
+                "agents": [{k: a[k] for k in keys}
+                           for a in eng.list_agents()],
+                "library": [{k: a[k] for k in keys}
+                            for a in eng.list_library_agents()]})
+        elif path == "/api/skills":
+            self.send_json({"skills": eng.skill_index()})
+        elif path == "/api/note":
+            rel = arg("path")
             target = (eng.ROOT / rel).resolve()
-            if (not str(target).startswith(str(eng.ROOT) + "/")
+            if (eng.ROOT.resolve() not in target.parents
                     or target.suffix != ".md" or not target.is_file()):
                 self.send_json({"error": "not found"}, 404)
                 return
             self.send_json({"path": rel,
                             "content": target.read_text(encoding="utf-8")})
-        elif url.path == "/api/run":
-            self.run_stage((query.get("stage") or [""])[0],
-                           file=(query.get("file") or [""])[0],
-                           slug=(query.get("slug") or [""])[0])
+        elif path == "/api/run":
+            self.run_stage(arg("stage"), file=arg("file"), slug=arg("slug"))
         else:
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        why = self.refused()
+        if why:
+            self.send_json({"error": why}, 403)
+            return
         url = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         if url.path == "/api/stt":  # raw audio, not JSON
@@ -163,72 +452,169 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
-            if url.path == "/api/capture":
-                path = eng.capture_note(str(body.get("text", "")), source="ui")
-                self.send_json({"ok": True, "file": path.name,
-                                "path": str(path.relative_to(eng.ROOT))})
-            elif url.path == "/api/refine":
-                dest = eng.refine(str(body.get("slug", "")),
-                                  str(body.get("feedback", "")))
-                self.send_json({"ok": True, "slug": dest.stem,
-                                "path": str(dest.relative_to(eng.ROOT))})
-            elif url.path == "/api/export":
-                index = eng.export_obsidian(str(body.get("slug", "")))
-                self.send_json({"ok": True, "path": str(index)})
-            elif url.path == "/api/config":
-                for key in ("obsidian_vault", "auto_pipeline",
-                            "fast", "smart", "deep", "stt_model"):
-                    if key in body:
-                        eng.config_set(key, str(body[key]).strip())
-                cfg = eng.config()
-                self.send_json({"ok": True,
-                                "obsidian_vault": cfg["obsidian_vault"],
-                                "auto_pipeline": cfg["auto_pipeline"]})
-            elif url.path == "/api/autopilot":
-                slug = str(body.get("slug", "")).strip().lower()
-                action = str(body.get("action", "")).strip()
-                if action == "start":
-                    state = eng.autopilot_start(slug)
-                elif action == "stop":
-                    state = eng.autopilot_stop(slug)
-                else:
-                    self.send_json({"error": "action must be start|stop"}, 400)
-                    return
-                self.send_json({"ok": True, "state": state})
-            elif url.path == "/api/approve-task":
-                slug = str(body.get("slug", "")).strip().lower()
-                task_id = str(body.get("id", "")).strip()
-                plan_path = eng._auto_plan_path(slug)
-                if not plan_path.is_file():
-                    self.send_json({"error": "no plan for that project"}, 404)
-                    return
-                plan = json.loads(plan_path.read_text(encoding="utf-8"))
-                hit = False
-                for t in plan.get("tasks", []):
-                    if t.get("id") == task_id and t.get("needs_human"):
-                        t["needs_human"] = False
-                        hit = True
-                if not hit:
-                    self.send_json(
-                        {"error": "no waiting task with that id"}, 404)
-                    return
-                plan_path.write_text(json.dumps(plan, indent=2) + "\n",
-                                     encoding="utf-8")
-                self.send_json({"ok": True, "approved": task_id})
-            elif url.path == "/api/plan":
-                self.plan_project(body)
-            elif url.path == "/api/chat":
-                self.chat(body)
-            elif url.path == "/api/say":
-                self.say(body)
-            elif url.path == "/api/agent":
-                self.agent(body)
-            else:
-                self.send_json({"error": "not found"}, 404)
+            if not isinstance(body, dict):
+                raise ValueError("a JSON object is required")
+            self._post(url.path, body)
+        except eng.NeedsApproval as exc:
+            self.send_json({"error": str(exc), "needs_approval": True}, 409)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as exc:
             self.send_json({"error": str(exc)}, 400)
 
-    # ------------------------------------------------------------ voice chat
+    def _post(self, path, body):
+        text = lambda key: str(body.get(key, "")).strip()  # noqa: E731
+        if path == "/api/capture":
+            p = eng.capture_note(text("text"), source="ui")
+            eng.brain_journal(f"captured an idea: {eng.excerpt(text('text'), 80)}")
+            self.send_json({"ok": True, "file": p.name,
+                            "path": str(p.relative_to(eng.ROOT))})
+        elif path == "/api/refine":
+            dest = eng.refine(text("slug"), text("feedback"))
+            self.send_json({"ok": True, "slug": dest.stem,
+                            "path": str(dest.relative_to(eng.ROOT))})
+        elif path == "/api/export":
+            index = eng.export_obsidian(text("slug"))
+            self.send_json({"ok": True, "path": str(index)})
+        elif path == "/api/brain":
+            sources = body.get("sources")
+            if isinstance(sources, list) and sources:   # research + sources
+                p = eng.brain_research(
+                    text("title") or "web research", text("text"),
+                    [{"title": str(x.get("title", "")),
+                      "url": str(x.get("url", ""))}
+                     for x in sources if isinstance(x, dict)])
+                eng.brain_journal(f"kept research: [[{p.stem}]]")
+            else:
+                p = eng.brain_note(text("text"), title=text("title") or None,
+                                   source="ui")
+            self.send_json({"ok": True, "path": str(p), "name": p.stem})
+        elif path == "/api/config":
+            # The page posts every field. Only a field that no longer says
+            # what the page was showing is a change of the owner's — a
+            # value that came from a default or an environment variable
+            # is not written into their file as if they had typed it.
+            shown = config_view()
+            shown.update(shown["tiers_set"])
+            shown.update({f"giant_{r}": v for r, v in shown["giants"].items()})
+            pairs = {}
+            for key in CONFIG_KEYS:
+                if key in body:
+                    value = _field_text(body[key])
+                    if key not in shown or value != _field_text(shown[key]):
+                        pairs[key] = value
+            eng.config_update(pairs)
+            with _HEALTH_LOCK:
+                _HEALTH["value"] = None
+            self.send_json({"ok": True, **config_view()})
+        elif path == "/api/autopilot":
+            slug, action = text("slug").lower(), text("action")
+            if action == "approve":
+                eng.approve_project(slug, via="ui")
+                state = eng._auto_state(slug)
+            elif action == "start":
+                state = eng.autopilot_start(slug, via="ui")
+            elif action == "stop":
+                state = eng.autopilot_stop(slug)
+            elif action == "steer":
+                state = eng.autopilot_steer(slug, text("text"), via="ui")
+            elif action == "refine":
+                state = eng.autopilot_refine(slug, via="ui")
+            else:
+                self.send_json({"error": "action must be approve, start, "
+                                         "stop, steer or refine"}, 400)
+                return
+            state = dict(state)
+            state.pop("run_started", None)
+            self.send_json({"ok": True, "state": state})
+        elif path in ("/api/approve-task", "/api/skip-task"):
+            # the owner's answer on a task that waits for them
+            done = eng.autopilot_decide(
+                text("slug").lower(), text("id"),
+                approve=path == "/api/approve-task", note=text("note"),
+                via="ui")
+            self.send_json({"ok": True, done["answer"]: done["task"],
+                            **done})
+        elif path == "/api/runner":
+            slug, action = text("slug").lower(), text("action")
+            if action == "start":
+                # a program on the owner's machine: only a browser page of
+                # this very app may ask (a tool without an Origin — curl,
+                # the voice gateway — is turned away; `aria run` is the
+                # terminal's way)
+                if self.headers.get("Origin") is None \
+                        and self.headers.get("Sec-Fetch-Site") is None:
+                    self.send_json({"error": "programs are started from "
+                                             "the app's Run tab"}, 403)
+                    return
+                self.send_json({"ok": True, **eng.project_run_start(
+                    slug, text("cmd"), sandboxed=body.get("sandboxed")
+                    is not False)})
+            elif action == "stop":
+                self.send_json({"ok": True, **eng.project_run_stop(slug)})
+            elif action == "input":
+                self.send_json({"ok": True, **eng.project_run_input(
+                    slug, str(body.get("text", "")))})
+            elif action == "check":
+                self.send_json({"ok": True, **eng.project_check(slug)})
+            elif action == "save":
+                eng.project_run_save(slug, text("kind") or "run",
+                                     text("name"), text("cmd"))
+                self.send_json({"ok": True,
+                                **eng.project_run_profile(slug)})
+            else:
+                raise ValueError("action must be start, stop, input, check "
+                                 "or save")
+        elif path == "/api/open":
+            self.send_json({"ok": True, "say": eng.open_path(
+                text("slug").lower(), text("path"), text("how") or "folder")})
+        elif path == "/api/garage":
+            action, role = text("action"), text("role")
+            if action == "scan":
+                self.send_json({"found": eng.garage_scan(text("folder"))})
+            elif action == "load":
+                if role not in eng.aria_garage.ROLES:
+                    raise ValueError("role must be general, research or coder")
+                ok, why = eng.aria_garage.available(role, eng.config())
+                if not ok and "failed to load" not in why:
+                    raise ValueError(why)
+                threading.Thread(target=load_giant, args=(role,),
+                                 daemon=True).start()
+                self.send_json({"ok": True, "loading": role})
+            elif action == "unload":
+                self.send_json({"ok": True, "unloaded":
+                                eng.garage_unload(role)})
+            else:
+                raise ValueError("action must be scan, load or unload")
+        elif path == "/api/plan":
+            self.plan_project(body)
+        elif path == "/api/github":
+            slug, action = text("slug").lower(), text("action")
+            if action == "init":
+                out = {"git": eng.project_git_init(slug)}
+            elif action == "publish":
+                out = {"url": eng.project_publish(
+                    slug, private=body.get("private", True) is not False)}
+            elif action == "push":
+                out = eng.project_push(slug)
+            else:
+                self.send_json({"error": "action must be init, publish or "
+                                         "push"}, 400)
+                return
+            self.send_json({"ok": True, **out})
+        elif path == "/api/mission":
+            p = eng.mission_create(text("agent"), text("task"))
+            self.send_json({"ok": True, "id": p.stem})
+        elif path == "/api/chat":
+            self.chat(body)
+        elif path == "/api/say":
+            self.say(body)
+        elif path == "/api/agent":
+            self.agent(body)
+        else:
+            self.send_json({"error": "not found"}, 404)
+
+    # ------------------------------------------------------------ chat
 
     def chat(self, body):
         messages = body.get("messages") or []
@@ -236,134 +622,57 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "messages required"}, 400)
             return
         last = str(messages[-1].get("content", ""))
-
         self.send_sse_headers()
-
-        def emit(ev):
-            try:
-                self.wfile.write(b"data: " + json.dumps(ev).encode() + b"\n\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
+        emit = self.sse_emitter()
+        token = lambda t: emit({"event": "token", "text": t})  # noqa: E731
         try:
             intent = eng.detect_intent(last)
-            if intent and intent["action"] == "capture":
-                path = eng.capture_note(intent["text"], source="voice")
-                auto = eng.config()["auto_pipeline"]
-                say = f"Captured — filed as {path.name}."
-                if auto:
-                    say += " Auto-pipeline is on, so I'm triaging it now."
-                emit({"event": "action",
-                      "action": "auto" if auto else "capture",
-                      "file": path.name, "say": say})
-            elif intent and intent["action"] == "use-skill":
-                try:
-                    eng.skill_text(intent["name"])  # validates it exists
-                    emit({"event": "action", "action": "use-skill",
-                          "name": intent["name"],
-                          "say": f"Skill {intent['name']} loaded — it stays "
-                                 "active until you say 'drop skill'."})
-                except ValueError as exc:
-                    emit({"event": "action", "action": "drop-skill",
-                          "say": str(exc)})
-            elif intent and intent["action"] == "drop-skill":
-                emit({"event": "action", "action": "drop-skill",
-                      "say": "Skill unloaded."})
-            elif intent and intent["action"] == "webhook":
-                try:
-                    status = eng.trigger_webhook(intent["name"],
-                                                 intent.get("message", ""))
-                    emit({"event": "action", "action": "webhook",
-                          "name": intent["name"],
-                          "say": f"Triggered {intent['name']} — "
-                                 f"it answered {status}."})
-                except Exception as exc:
-                    emit({"event": "action", "action": "webhook",
-                          "say": f"Couldn't trigger {intent['name']}: {exc}"})
-            elif intent and intent["action"] == "no-web":
-                emit({"event": "action", "action": "no-web",
-                      "say": "Straight answer: I run fully local with no "
-                             "web access, so I can't search or fetch live "
-                             "data — and I won't pretend to. Say 'capture "
-                             "<the idea>' and the pipeline will draft a "
-                             "plan with research leads marked unverified; "
-                             "for sourced web research, run /develop in a "
-                             "Claude Code session."})
-            elif intent and intent["action"] == "explain-commands":
-                emit({"event": "action", "action": "explain-commands",
-                      "say": "That's not a command I have. "
-                             + eng.known_commands_text()})
-            elif intent and intent["action"] == "autopilot-start":
-                eng.autopilot_start(intent["slug"])
-                emit({"event": "action", "action": "autopilot-start",
-                      "slug": intent["slug"],
-                      "say": f"Autopilot engaged on {intent['slug']}. I'll "
-                             "plan it, work the tasks one by one, verify "
-                             "each, and keep iterating until you say "
-                             f"'stop working on {intent['slug']}'. Watch "
-                             "the Projects page."})
-            elif intent and intent["action"] == "autopilot-stop":
-                eng.autopilot_stop(intent["slug"])
-                emit({"event": "action", "action": "autopilot-stop",
-                      "slug": intent["slug"],
-                      "say": f"Standing down on {intent['slug']} — I'll "
-                             "finish the task in flight, write the final "
-                             "report of everything changed and why, and "
-                             "leave the project as is."})
-            elif intent and intent["action"] == "mission":
-                try:
-                    path = eng.mission_create(intent["name"], intent["task"])
-                    emit({"event": "action", "action": "mission",
-                          "name": intent["name"], "id": path.stem,
-                          "say": f"Mission queued for the {intent['name']} — "
-                                 "it runs in the background even if you "
-                                 "close this tab. Ask me about missions "
-                                 "anytime, or watch the Agents page."})
-                except ValueError as exc:
-                    emit({"event": "action", "action": "mission",
-                          "say": str(exc)})
-            elif intent and intent["action"] == "agent":
+            action = intent["action"] if intent else None
+            if intent is None:
+                eng.converse(messages, skill=body.get("skill") or None,
+                             on_token=token)
+            elif action in ("triage", "develop"):
+                emit({"event": "action", "action": action,
+                      "say": f"On it — running {action} now."})
+            elif action == "agent":
                 emit({"event": "action", "action": "agent",
                       "name": intent["name"], "task": intent["task"],
                       "say": f"Passing that to the {intent['name']} agent."})
-            elif intent:
-                emit({"event": "action", "action": intent["action"],
-                      "say": f"On it — running {intent['action']} now."})
+            elif action in ("web-search", "fetch"):
+                try:
+                    if action == "web-search":
+                        emit({"event": "status",
+                              "text": f"searching the web for “{intent['query']}”…"})
+                        result = eng.answer_with_web(
+                            intent["query"], on_token=token,
+                            emit=lambda ev: emit(
+                                {"event": "status", "text": ev["label"]})
+                            if ev.get("label") else None)
+                    else:
+                        emit({"event": "status",
+                              "text": f"reading {intent['url']}…"})
+                        result = eng.summarize_page(intent["url"],
+                                                    on_token=token)
+                    emit({"event": "sources", "sources": result["sources"],
+                          "question": intent.get("query") or intent.get("url"),
+                          "answer": result["text"]})
+                except eng.WebError as exc:
+                    emit({"event": "action", "action": action,
+                          "say": f"I couldn't do that: {exc}"})
             else:
-                eng.converse(messages, skill=body.get("skill") or None,
-                             on_token=lambda t: emit({"event": "token",
-                                                      "text": t}))
+                out = eng.perform(intent, source="chat")
+                if out is None:
+                    out = {"action": action,
+                           "say": f"On it — running {action} now."}
+                if out["action"] == "capture" and out.get("auto"):
+                    out["action"] = "auto"       # the UI streams the pass
+                emit({"event": "action", **out})
         except Exception as exc:
             emit({"event": "error", "log": str(exc)})
         emit({"event": "done"})
 
-    def plan_project(self, body):
-        slug = str(body.get("slug", "")).strip().lower()
-        if not RUN_LOCK.acquire(blocking=False):
-            self.send_json({"error": "a run is already in progress"}, 409)
-            return
-        try:
-            self.send_sse_headers()
-
-            def emit(ev):
-                try:
-                    self.wfile.write(b"data: " + json.dumps(ev).encode()
-                                     + b"\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-            try:
-                eng.autopilot_plan(slug, emit)
-            except Exception as exc:
-                emit({"event": "error", "log": str(exc)})
-            emit({"event": "done"})
-        finally:
-            RUN_LOCK.release()
-
     def say(self, body):
-        """Plain JSON in/out for integrations (Alexa via n8n, scripts…):
+        """Plain JSON in/out for integrations (Alexa, scripts…):
         {"text": "..."} -> {"reply": "..."}. Commands execute (long runs
         start in the background); everything else is fast-tier chat."""
         text = str(body.get("text", "")).strip()
@@ -372,43 +681,38 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             intent = eng.detect_intent(text)
-            if intent and intent["action"] == "capture":
-                path = eng.capture_note(intent["text"], source="integration")
-                auto = eng.config()["auto_pipeline"]
-                reply = f"Captured as {path.stem}."
-                if auto and self._start_stage("auto", path.name):
-                    reply += " The pipeline is processing it now."
-            elif intent and intent["action"] in ("triage", "develop"):
-                started = self._start_stage(intent["action"], "")
-                reply = (f"Running {intent['action']} in the background."
-                         if started else "I'm mid-run on something else — "
-                         "try again in a minute.")
-            elif intent and intent["action"] == "webhook":
-                status = eng.trigger_webhook(intent["name"],
-                                             intent.get("message", ""))
-                reply = f"Triggered {intent['name']}, it answered {status}."
-            elif intent and intent["action"] == "mission":
+            action = intent["action"] if intent else None
+            if intent is None:
+                reply = eng.converse([{"role": "user", "content": text}]) or "…"
+            elif action in ("triage", "develop"):
+                reply = (f"Running {action} in the background."
+                         if self._start_stage(action, "") else
+                         "I'm mid-run on something else — try again in a "
+                         "minute.")
+            elif action == "agent":
                 eng.mission_create(intent["name"], intent["task"])
-                reply = f"Mission queued for the {intent['name']}."
-            elif intent and intent["action"] == "autopilot-start":
-                eng.autopilot_start(intent["slug"])
-                reply = f"Autopilot engaged on {intent['slug']}."
-            elif intent and intent["action"] == "autopilot-stop":
-                eng.autopilot_stop(intent["slug"])
-                reply = (f"Standing down on {intent['slug']} after the "
-                         "current task.")
-            elif intent and intent["action"] == "no-web":
-                reply = ("I'm fully local with no web access. Say capture, "
-                         "followed by the idea, and I'll plan it instead.")
-            elif intent and intent["action"] == "explain-commands":
-                reply = eng.known_commands_text()
-            elif intent and intent["action"] in ("use-skill", "drop-skill"):
+                reply = (f"I've given that to the {intent['name']} as a "
+                         "background mission.")
+            elif action == "web-search":
+                reply = eng.answer_with_web(intent["query"])["text"]
+            elif action == "fetch":
+                reply = eng.summarize_page(intent["url"])["text"]
+            elif action in ("use-skill", "drop-skill"):
                 reply = ("Skills are a chat-session feature — use the app "
                          "for that one.")
+            elif action == "navigate":
+                reply = "I can only open pages in the app itself."
             else:
-                reply = eng.converse(
-                    [{"role": "user", "content": text}]) or "…"
+                out = eng.perform(intent, source="integration") or {}
+                reply = out.get("say") or "Done."
+                if out.get("action") == "capture" and out.get("auto"):
+                    reply = (f"Captured. "
+                             + ("The pipeline is processing it now."
+                                if self._start_stage("auto", out["file"])
+                                else "I'll process it after the current run."))
             self.send_json({"reply": reply})
+        except eng.WebError as exc:
+            self.send_json({"reply": f"I couldn't do that: {exc}"})
         except Exception as exc:
             self.send_json({"error": str(exc)}, 500)
 
@@ -422,18 +726,31 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 files = [f"pipeline/00-inbox/{Path(file).name}"] if file \
                     else None
-                quiet = lambda ev: None
+                quiet = lambda ev: None  # noqa: E731
                 if stage == "triage":
                     eng.triage_run(quiet, files=files)
                 elif stage == "develop":
                     eng.develop_run(quiet)
                 else:
                     eng.auto_run(quiet, files=files)
+            except Exception as exc:
+                print("background stage failed:", stage, exc)
             finally:
                 RUN_LOCK.release()
 
         threading.Thread(target=run, daemon=True).start()
         return True
+
+    def plan_project(self, body):
+        slug = str(body.get("slug", "")).strip().lower()
+        eng._project_dir(slug)
+        self.send_sse_headers()
+        emit = self.sse_emitter()
+        try:
+            eng.autopilot_plan(slug, emit)
+        except Exception as exc:
+            emit({"event": "error", "log": str(exc)})
+        emit({"event": "done"})
 
     def agent(self, body):
         name = str(body.get("name", "")).strip()
@@ -441,27 +758,16 @@ class Handler(BaseHTTPRequestHandler):
         if not name or not task:
             self.send_json({"error": "name and task required"}, 400)
             return
-        if not RUN_LOCK.acquire(blocking=False):
-            self.send_json({"error": "a run is already in progress"}, 409)
+        if eng.get_agent(name) is None:
+            self.send_json({"error": f"no such agent: {name}"}, 404)
             return
+        self.send_sse_headers()
+        emit = self.sse_emitter()
         try:
-            self.send_sse_headers()
-
-            def emit(ev):
-                try:
-                    self.wfile.write(b"data: " + json.dumps(ev).encode()
-                                     + b"\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-            try:
-                eng.run_agent(name, task, emit)
-            except Exception as exc:
-                emit({"event": "error", "log": str(exc)})
-            emit({"event": "done"})
-        finally:
-            RUN_LOCK.release()
+            eng.run_agent(name, task, emit)
+        except Exception as exc:
+            emit({"event": "error", "log": str(exc)})
+        emit({"event": "done"})
 
     # ------------------------------------------------------------ engine
 
@@ -474,18 +780,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.send_sse_headers()
-            dead = False
-
-            def emit(ev):
-                nonlocal dead
-                if dead:
-                    return  # keep the pipeline consistent even if the tab closed
-                try:
-                    self.wfile.write(b"data: " + json.dumps(ev).encode() + b"\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    dead = True
-
+            emit = self.sse_emitter()   # the run completes even if the tab closes
             files = [f"pipeline/00-inbox/{Path(file).name}"] if file else None
             try:
                 if stage == "triage":
@@ -502,24 +797,40 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def autopilot_worker():
-    """Drives every project whose autopilot is 'running': one task at a
+    """Drives every project whose autopilot is 'running': one step at a
     time, round-robin across projects, forever. Independent of RUN_LOCK —
-    a week of autonomous work must not block triage or chat."""
+    a week of autonomous work must not block triage or chat. A project
+    that is waiting (model server down, backing off) costs nothing: the
+    loop sleeps instead of spinning."""
+    def log(ev):
+        if ev.get("log"):
+            print("autopilot:", ev["log"], flush=True)
+
+    last_reap = 0.0
     while True:
         busy = False
-        for p in eng.list_projects():
-            if p["autopilot"] != "running":
-                continue
+        if time.time() - last_reap > 60:      # unload idle giants
+            last_reap = time.time()
             try:
-                result = eng.autopilot_tick(
-                    p["slug"],
-                    lambda ev: print("autopilot:", ev["log"])
-                    if ev.get("log") else None)
-                busy = busy or result not in ("idle",)
+                for role in eng.garage_reap():
+                    print(f"garage: unloaded the idle {role} giant",
+                          flush=True)
             except Exception as exc:
-                print("autopilot worker error:", p["slug"], exc)
-        if not busy:
-            time.sleep(15)
+                print("garage error:", exc, flush=True)
+        try:
+            running = [p["slug"] for p in eng.list_projects()
+                       if p["autopilot"] == "running"]
+        except Exception as exc:
+            print("autopilot worker error:", exc, flush=True)
+            running = []
+        for slug in running:
+            try:
+                result = eng.autopilot_tick(slug, log)
+            except Exception as exc:
+                print("autopilot worker error:", slug, exc, flush=True)
+                result = "waiting"
+            busy = busy or result not in ("idle", "waiting", "busy")
+        time.sleep(0.3 if busy else 5)
 
 
 def mission_worker():
@@ -543,14 +854,29 @@ def mission_worker():
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8700
+    eng.GARAGE_LISTENERS.append(lambda t: print("garage:", t, flush=True))
     threading.Thread(target=mission_worker, daemon=True).start()
     threading.Thread(target=autopilot_worker, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    BOOT.update(eng.server_mark(port))
     print(f"A.R.I.A. UI -> http://127.0.0.1:{port}  (Ctrl+C to stop)")
+
+    def leave(*_signal):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, leave)        # systemctl stop, aria update
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
+    finally:
+        # Programs started from the Run tab end with the server that
+        # started them. A loaded giant is left alone — reloading one takes
+        # minutes, and the next server finds it by its pidfile. (Under
+        # systemd the whole service group ends together, giants included.)
+        try:
+            eng.aria_run.stop_all()
+        finally:
+            eng.server_unmark()
 
 
 if __name__ == "__main__":

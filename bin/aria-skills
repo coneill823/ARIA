@@ -4,7 +4,7 @@ usable by ANY AI system (A.R.I.A.'s local agents, ChatGPT, Gemini, CrewAI,
 LangChain... anything that takes a system prompt or instructions file).
 
   aria-skills list               skills found (converted pack + raw Claude)
-  aria-skills convert            build skills/ from .claude/skills/*
+  aria-skills convert            build skills/ from every installed skill
   aria-skills prompt <name>      print a skill's universal prompt (pipe it
                                  anywhere: into another model, a crew, ...)
 
@@ -29,11 +29,12 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / ".claude" / "skills"
+SRCS = (ROOT / ".claude" / "skills",     # shared with Claude Code
+        ROOT / "skills-library")         # engine-only sources (e.g. ECC)
 OUT = ROOT / "skills"
 
-UNIVERSAL_HEADER = """<!-- Universal skill converted from Anthropic's Agent
-Skills (github.com/anthropics/skills) by A.R.I.A. Use it with any AI
+UNIVERSAL_HEADER = """<!-- Universal skill converted from an Agent Skill
+(the SKILL.md format) by A.R.I.A. Use it with any AI
 system: paste this file as (part of) the system prompt, or attach it as
 instructions. Files it references live in ./resources/ next to this file.
 If the instructions tell "the assistant" to run scripts or code, your AI
@@ -65,16 +66,26 @@ def generalise(body):
 
 
 def skill_dirs():
-    if not SRC.is_dir():
-        return []
-    return sorted(d for d in SRC.iterdir()
-                  if (d.resolve() / "SKILL.md").is_file())
+    found = {}
+    for src in SRCS:
+        if src.is_dir():
+            for d in sorted(src.iterdir()):
+                if (d.resolve() / "SKILL.md").is_file():
+                    found.setdefault(d.name, d)      # first location wins
+    return [found[name] for name in sorted(found)]
+
+
+def unquote(value):
+    value = (value or "").strip()
+    if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value
 
 
 def convert():
     dirs = skill_dirs()
     if not dirs:
-        print("no Claude skills found — run: aria install-skills")
+        print("no skills found — run: aria install-skills")
         return 1
     OUT.mkdir(exist_ok=True)
     index = []
@@ -102,8 +113,8 @@ def convert():
         execution = "requires-code-execution" if needs_exec \
             else "instructions-only"
 
-        title = meta.get("name", name)
-        description = generalise(meta.get("description", ""))
+        title = unquote(meta.get("name", name))
+        description = generalise(unquote(meta.get("description", "")))
         (dest / "PROMPT.md").write_text(
             UNIVERSAL_HEADER
             + f"# Skill: {title}\n\n"
@@ -111,9 +122,12 @@ def convert():
             + f"**Execution:** {execution}\n\n---\n\n"
             + generalise(body) + "\n",
             encoding="utf-8")
+        vendor = ROOT / "vendor"
+        origin = src.relative_to(vendor).parts[0] \
+            if vendor in src.parents else "local"
         manifest = {"name": name, "title": title, "description": description,
                     "execution": execution, "resources": resources,
-                    "source": "anthropics/skills"}
+                    "source": origin}
         (dest / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         index.append({k: manifest[k] for k in
@@ -132,8 +146,8 @@ def convert():
 
 README_OUT = """# Universal skills pack (generated)
 
-Converted from [anthropics/skills](https://github.com/anthropics/skills) by
-`aria skills convert` — regenerate any time; don't edit by hand.
+Converted by `aria skills convert` from every source in
+`system/skill-sources.txt` — regenerate any time; don't edit by hand.
 
 Use with **any** AI system:
 

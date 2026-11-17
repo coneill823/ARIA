@@ -17,12 +17,36 @@ out which pipeline stage their request belongs to and behave accordingly.
 | Processing | `pipeline/01-processing/` | `status: processing` | `/develop` |
 | Potential project | `pipeline/02-potential-projects/<slug>/` | `status: proposed` | `/approve` then `/promote-project` |
 | Knowledge | `pipeline/knowledge/{notes,lists,content-ideas,someday}/` | `status: filed` | — |
-| Active | `active-projects/<slug>/` (see `system/config.yml`) | `status: promoted` | project completion |
+| Active | `active-projects/<slug>/` (the `promotion_target` setting) | `status: promoted` | project completion |
 | Archive | `pipeline/archive/` | `status: archived` | never deleted |
 
-Configuration lives in `system/config.yml`. Templates live in
+Configuration: `system/config.yml` holds the defaults, and
+`system/config.local.yml` — when it exists — holds the owner's own values,
+which win. Read both and let the local file decide; write settings only
+to the local file (or with `aria settings set <key> <value>`), never to
+`config.yml`, which updates replace. Templates live in
 `system/templates/` — always instantiate from templates rather than
 inventing document structures.
+
+### The local app works the same folders
+
+`bin/aria ui` and its autopilot drive this pipeline on the user's local
+models. Two things follow for you:
+
+- **Approval in the app is approval.** The Approve button, "approve
+  <slug>" in its chat, or `aria approve <slug>` writes `requirements.md`
+  (`approved: true`, with `approved_via:`) and promotes the project. Treat
+  such a project as approved. It changes nothing about *your* rule: you
+  never approve on your own initiative.
+- **`autopilot/` belongs to the local engine.** An active project may
+  hold `autopilot/` (her plan, memory, change record, reports) and commits
+  on the branch `aria/autopilot`. Read them for context; do not edit or
+  remove them.
+- **A task that waits on the user is theirs to answer.** A task in
+  `autopilot/plan.json` with `needs_human: true` is waiting for the
+  user's decision (Approve / Skip on its card, or
+  `aria autopilot <slug> approve-task|skip-task <id>`). Surface it in
+  `/status`; never answer it yourself.
 
 ## Note conventions
 

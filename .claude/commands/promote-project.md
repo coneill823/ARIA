@@ -13,7 +13,8 @@ point the user at `/review` and `/approve`. No exceptions.
 
 Steps:
 
-1. Read `system/config.yml → promotion_target` and resolve it (relative
+1. Read the `promotion_target` setting — from `system/config.local.yml`
+   if it sets one, else `system/config.yml` — and resolve it (relative
    paths resolve from the aria root). Create the directory if needed. If
    `<target>/$ARGUMENTS` already exists, stop and ask rather than overwrite.
 2. Move the whole project folder to `<target>/$ARGUMENTS/` and reorganize:

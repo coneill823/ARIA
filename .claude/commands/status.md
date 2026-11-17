@@ -12,7 +12,8 @@ Render the A.R.I.A. pipeline dashboard.
    - `pipeline/01-processing/` — awaiting `/develop`
    - `pipeline/02-potential-projects/*/` — split `status: proposed`
      (awaiting review) vs `status: approved` (ready to promote)
-   - active projects in the `promotion_target` from `system/config.yml` —
+   - active projects in the `promotion_target` (`system/config.local.yml`
+     if it sets one, else `system/config.yml`) —
      read each project's `STATUS.md` for phase and progress
 2. Cross-check against `pipeline/LEDGER.md` and fix any drift you find
    (missing rows, stale states).

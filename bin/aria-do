@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""aria-do — the engine-backed verbs of the `aria` command line.
+
+`bin/aria` handles capture, installs and the headless pipeline stages
+itself and hands everything below to this script:
+
+  agent <name> "task"            run one agent, streaming to the terminal
+  mission <agent> "task"         queue a background job
+  missions [run]                 list missions / drain the queue here
+  projects                       every project, where it lives and what
+                                 autopilot is doing
+  open <slug> [folder|editor|terminal]   open a project on your desktop
+  approve <slug>                 THE HUMAN GATE: approve a proposed plan
+  adopt <repo|folder> "goal"     put an existing codebase under autopilot
+  autopilot <slug> start|stop|status|run|steer "guidance"
+  autopilot <slug> approve-task <id> ["your decision"]
+  autopilot <slug> skip-task <id> ["why"]      a task that waits on you
+  autopilot <slug> refine        review the whole codebase and refine it
+                                 without changing what it does
+  run <slug> [n] [--no-sandbox]  how a project is started — or start entry
+                                 n here, in this terminal
+  check <slug>                   run the project's tests the way she does:
+                                 sandboxed, in a scratch copy
+  plan <slug>                    assess + (re)plan a project now
+  models [status]                the giants: which role has which model,
+                                 what is loaded
+  models scan [folder]           find .gguf models (sets of parts counted
+                                 once, incomplete downloads flagged)
+  models use <role> <file.gguf>  give a role its model (general, research,
+                                 coder) — the first part of a split model
+  models load <role> | unload [role]
+  search "query"                 web search
+  fetch <url>                    read a web page as text
+  brain "text"                   write a note into the Obsidian vault
+  github status|init|publish|push <slug> [--public] [--force]
+  trigger <webhook> [message]    fire an allowlisted webhook
+  settings                       your own settings (config.local.yml)
+  settings set <key> [value]     change one;  settings unset <key>  puts it
+                                 back to the default. Lists take a dotted
+                                 key: webhooks.<name> <url>,
+                                 backends.<name> <url>, backend_keys.<name>
+  settings import <config.yml>   carry over the settings of an edited
+                                 config.yml (a copy you saved before a pull)
+  update [branch] [--restart]    get the newest version of this branch (or
+                                 switch to another), keep your settings,
+                                 restart the server
+  reach                          what is switched on (used by doctor)
+"""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aria_engine as eng  # noqa: E402
+
+
+def log(ev):
+    if ev.get("log"):
+        print(ev["log"], flush=True)
+
+
+def stream(ev):
+    if ev.get("event") == "token":
+        print(ev["text"], end="", flush=True)
+    elif ev.get("log"):
+        print("[" + ev["log"] + "]", file=sys.stderr, flush=True)
+
+
+def need(args, n, usage):
+    if len(args) < n:
+        raise SystemExit("usage: aria " + usage)
+
+
+def projects_hint():
+    return ", ".join(p["slug"] for p in eng.list_projects()) or "none yet"
+
+
+def cmd_agent(args):
+    need(args, 2, 'agent <name> "task"')
+    eng.run_agent(args[0], " ".join(args[1:]), stream)
+    print()
+
+
+def cmd_mission(args):
+    need(args, 2, 'mission <agent> "task"')
+    p = eng.mission_create(args[0], " ".join(args[1:]))
+    print(f"queued -> {p.relative_to(eng.ROOT)}")
+    print("it runs inside the always-on server (aria ui / aria.service), or "
+          "drain the queue here with: aria missions run")
+
+
+def cmd_missions(args):
+    if args[:1] == ["run"]:
+        eng.mission_requeue_stale()
+        while True:
+            if not eng.mission_run_next(log):
+                print("queue empty")
+                return
+    ms = eng.mission_list()
+    if not ms:
+        print('no missions yet — queue one: aria mission <agent> "task"')
+    for m in ms:
+        print(f"{m['status']:8} {m['id']:34} {m['task'][:70]}")
+
+
+def cmd_projects(_args):
+    rows = eng.list_projects()
+    if not rows:
+        print("no projects yet — capture an idea and run: aria auto")
+    for p in rows:
+        gate = "approved" if p["approved"] else "awaiting approval"
+        line = f"{p['slug']:34} {p['kind']:9} {gate:18} {p['autopilot']}"
+        if p["autopilot"] == "running":
+            line += (f" · iteration {p['iteration']} · {p['done']}/"
+                     f"{p['total']} tasks"
+                     + (f" · waiting {p['waiting']}" if p["waiting"] else
+                        (f" · now: {p['current']}" if p["current"] else "")))
+        print(line)
+        print(f"{'':34} {eng._project_dir(p['slug'])}")
+        for g in p["needs_you"]:
+            print(f"{'':34} needs you: {g['id']} — {g['title']}")
+
+
+def cmd_run(args):
+    """How to start a project — or start one of the ways, here. This is
+    your terminal: the program gets it directly."""
+    import subprocess
+    boxed = "--no-sandbox" not in args
+    args = [a for a in args if a != "--no-sandbox"]
+    need(args, 1, "run <slug> [n] [--no-sandbox]")
+    slug = args[0]
+    info = eng.project_run_profile(slug)
+    ways = info["setup"] + info["run"]
+    if len(args) < 2:
+        print(f"{slug} lives in {info['path']}")
+        if not ways:
+            print("nothing here says how to start it yet (no main.py, "
+                  "package.json, Makefile…)")
+        for i, c in enumerate(ways, 1):
+            print(f"  {i}. {c['name']:38} {c['cmd']}")
+        if info["check"]:
+            print(f"  tests: {info['check'][0]['cmd']}   (aria check {slug})")
+        print("sandbox: " + ("available — a program started with `aria run "
+                             f"{slug} <n>` can only change files in that "
+                             "folder" if info["sandbox"]["available"]
+                             else info["sandbox"]["why"]))
+        return
+    try:
+        cmd = ways[int(args[1]) - 1]["cmd"]
+    except (ValueError, IndexError):
+        raise SystemExit(f"pick 1–{len(ways)}: aria run {slug}")
+    cmd = cmd.replace("{port}", str(eng.aria_run.free_port()))
+    shell = ["bash", "-lc", cmd]
+    tool = eng.aria_run.sandbox()[0] if boxed else ""
+    print(f"$ {cmd}   (in {info['path']}"
+          + (", sandboxed)" if tool else ", not sandboxed)"), flush=True)
+    argv = eng.aria_run._wrap_user(tool, shell, info["path"]) if tool \
+        else shell
+    sys.exit(subprocess.call(argv, cwd=info["path"],
+                             env=eng.aria_run._env_user()))
+
+
+def cmd_check(args):
+    need(args, 1, "check <slug>")
+    res = eng.project_check(args[0])
+    if not res["ran"]:
+        print("not run — " + res["why"])
+        sys.exit(2)
+    print(res["output"])
+    print(("PASS" if res["ok"] else "FAIL") + f" — {res['summary']}  "
+          f"({res['cmd']}, {res['seconds']}s, "
+          + ("sandboxed" if res["sandboxed"] else "not sandboxed") + ")")
+    sys.exit(0 if res["ok"] else 1)
+
+
+def cmd_open(args):
+    need(args, 1, "open <slug> [folder|editor|terminal]")
+    print(eng.open_path(args[0], how=args[1] if len(args) > 1 else "folder"))
+
+
+def cmd_approve(args):
+    need(args, 1, "approve <slug>")
+    path = eng.approve_project(args[0], via="cli")
+    print(f"approved -> {path}")
+    print(f"start work with: aria autopilot {args[0]} start")
+
+
+def cmd_adopt(args):
+    usage = 'adopt <git-url | owner/repo | folder> "what you want done" [--slug name]'
+    slug = ""
+    if "--slug" in args:
+        i = args.index("--slug")
+        need(args, i + 2, usage)
+        slug = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    need(args, 2, usage)
+    dest = eng.adopt_project(args[0], " ".join(args[1:]), slug=slug)
+    print(f"adopted -> {dest}")
+    print(f"start work with: aria autopilot {dest.name} start")
+
+
+def cmd_autopilot(args):
+    need(args, 1, 'autopilot <slug> start|stop|status|run|steer "guidance"'
+                  ' | approve-task <id> ["decision"] | skip-task <id> ["why"]')
+    slug, action = args[0], (args[1] if len(args) > 1 else "status")
+    if action in ("start", "run"):
+        state = eng.autopilot_start(slug, via="cli")
+        print(f"autopilot engaged on {slug} (run {state['run']})")
+        if action == "run":
+            print("working here until it finishes — Ctrl+C or "
+                  f"`aria autopilot {slug} stop` to end it gracefully")
+            try:
+                result = eng._autopilot().run_forever(slug, log)
+            except KeyboardInterrupt:
+                print("\nstopping after the current step…")
+                eng.autopilot_stop(slug)
+                result = eng._autopilot().run_forever(slug, log)
+            print(f"ended: {result} — report: "
+                  f"{eng._auto_dir(slug) / 'FINAL-REPORT.md'}")
+        else:
+            print("the always-on server works it continuously (aria ui / "
+                  "aria.service); without the server, use: "
+                  f"aria autopilot {slug} run")
+    elif action == "stop":
+        eng.autopilot_stop(slug)
+        print("stop requested — the current step finishes, then the final "
+              "report is written")
+    elif action == "steer":
+        need(args, 3, 'autopilot <slug> steer "guidance"')
+        eng.autopilot_steer(slug, " ".join(args[2:]), via="cli")
+        print("noted — unstarted work is replanned around it")
+    elif action == "refine":
+        state = eng.autopilot_refine(slug, via="cli")
+        print("review and refinement requested"
+              + (" — autopilot is running it"
+                 if state["status"] == "running" else ""))
+        print("without the always-on server, work it here: "
+              f"aria autopilot {slug} run")
+    elif action in ("approve-task", "skip-task"):
+        need(args, 3, f'autopilot <slug> {action} <task-id> ["note"]')
+        done = eng.autopilot_decide(slug, args[2],
+                                    approve=action == "approve-task",
+                                    note=" ".join(args[3:]), via="cli")
+        print(f"{done['answer']}: {done['task']} — {done['title']}"
+              + (f" ({done['note']})" if done["note"] else ""))
+    else:
+        print(eng.project_status_text(slug))
+        state = eng._auto_state(slug)
+        state.pop("run_started", None)
+        print(json.dumps(state, indent=2))
+
+
+def cmd_models(args):
+    action = args[0] if args else "status"
+    if action == "status":
+        st = eng.garage_status()
+        for role, row in st["roles"].items():
+            line = f"{role:9} {row['state']:11}"
+            if row["label"]:
+                line += f" {row['label']}"
+                if row.get("parts", 1) > 1:
+                    line += f" ({row['found']}/{row['parts']} parts"
+                    line += f", {row['gb']} GB)" if row.get("gb") else ")"
+                line += f"  :{row['port']}"
+            else:
+                line += " — set one: aria models use " + role + " <file.gguf>"
+            if row.get("error"):
+                line += f"\n{'':21}{row['error']}"
+            print(line)
+        print(f"\nloaded at once: {st['loaded']} · use: {st['use']}"
+              " (aria.giants_use) · logs: system/garage/<role>.log")
+    elif action == "scan":
+        found = eng.garage_scan(args[1] if len(args) > 1 else "")
+        if not found:
+            print("no .gguf models found"
+                  + ("" if len(args) > 1 else " in the usual places — "
+                     "try: aria models scan <folder>"))
+        for m in found:
+            state = ("complete" if m["complete"] else m["why"])
+            print(f"{m['name']:48} {m['gb']:>7} GB  {state}"
+                  + (f"  -> {m['guess']}" if m["guess"] else ""))
+            print(f"{'':4}{m['path']}")
+        hint = [m for m in found if m["guess"] and m["complete"]]
+        if hint:
+            print("\nto use them:")
+            for m in hint:
+                print(f"  aria models use {m['guess']} \"{m['path']}\"")
+    elif action == "use":
+        need(args, 3, "models use <general|research|coder> <file.gguf>")
+        role = args[1]
+        if role not in eng.aria_garage.ROLES:
+            raise SystemExit("role must be general, research or coder")
+        eng.config_set(f"giant_{role}", args[2])
+        print(f"{role} -> {args[2]}")
+        cmd_models(["status"])
+    elif action == "load":
+        need(args, 2, "models load <general|research|coder>")
+        print(f"loading the {args[1]} giant — the first load can take "
+              "several minutes…", flush=True)
+        port = eng.garage_load(args[1], notify=lambda t: print(t, flush=True))
+        print(f"ready on http://127.0.0.1:{port}")
+    elif action == "unload":
+        gone = eng.garage_unload(args[1] if len(args) > 1 else "")
+        print("unloaded: " + (", ".join(gone) or "nothing was loaded"))
+    else:
+        raise SystemExit("models status | scan [folder] | use <role> <file> "
+                         "| load <role> | unload [role]")
+
+
+def cmd_plan(args):
+    need(args, 1, "plan <slug>")
+    plan = eng.autopilot_plan(args[0], log)
+    for t in plan["tasks"]:
+        print(f"{t['status']:10} {t['id']:5} {t['agent']:14} "
+              f"{(t['model'] or '-'):8} {t['title']}"
+              + ("  [needs you]" if t.get("needs_human") else ""))
+
+
+def cmd_search(args):
+    need(args, 1, 'search "query"')
+    print(eng.aria_web.format_results(eng.web_search(" ".join(args))))
+
+
+def cmd_fetch(args):
+    need(args, 1, "fetch <url>")
+    page = eng.web_fetch(args[0], limit=20000)
+    if page["title"]:
+        print(f"# {page['title']}\n{page['url']}\n")
+    print(page["text"])
+
+
+def cmd_brain(args):
+    need(args, 1, 'brain "text to remember"')
+    print(f"written -> {eng.brain_note(' '.join(args), source='cli')}")
+
+
+def cmd_github(args):
+    need(args, 2, "github status|init|publish|push <slug> [--public] [--force]")
+    action, slug = args[0], args[1]
+    flags = set(args[2:])
+    if action == "init":
+        info = eng.project_git_init(slug, force="--force" in flags)
+        print(f"{slug} is its own repository now (branch {info['branch']})")
+    elif action == "publish":
+        url = eng.project_publish(slug, private="--public" not in flags)
+        print(f"published -> {url}")
+    elif action == "push":
+        print(eng.project_push(slug)["say"])
+    elif action == "status":
+        print(json.dumps(eng.project_git(slug), indent=2))
+    else:
+        raise SystemExit("usage: aria github status|init|publish|push <slug>")
+
+
+def cmd_trigger(args):
+    need(args, 1, "trigger <webhook-name> [message]")
+    status = eng.trigger_webhook(args[0], " ".join(args[1:]))
+    print(f"triggered {args[0]} -> HTTP {status}")
+
+
+def _carried(kept, left):
+    """Say what config_import did."""
+    where = eng.LOCAL_FILE.relative_to(eng.ROOT)
+    if kept:
+        print(f"carried {len(kept)} setting(s) of yours into {where}: "
+              + ", ".join(kept))
+    elif not left:
+        print("nothing in it differs from the defaults")
+    for key, why in left:
+        print(f"  left out: {key} — {why}")
+
+
+def cmd_settings(args):
+    action = args[0] if args else "show"
+    where = eng.LOCAL_FILE.relative_to(eng.ROOT)
+    if action == "show":
+        mine, blocks = eng.config_mine()
+        if not mine and not blocks:
+            print("no settings of your own yet — everything is at its "
+                  "default.\nchange one on the Settings page, or: aria "
+                  "settings set <key> <value>\nevery setting is described in "
+                  "system/config.yml (the defaults; updates replace it)")
+            return
+        print(f"your settings ({where}) — everything else is at its default:")
+        for key, value in mine.items():
+            print(f"  {key}: {value}")
+        for key, pairs in blocks.items():
+            print(f"  {key}:" + ("" if pairs else " (none)"))
+            for name, value in pairs.items():
+                print(f"    {name}: {value}")
+    elif action == "set":
+        need(args, 2, "settings set <key> [value]")
+        key, value = args[1], " ".join(args[2:])
+        if key.partition(".")[0] in eng.BLOCKS and "." in key:
+            block, _dot, name = key.partition(".")      # webhooks.<name> …
+            had = eng.config_set_entry(block, name, value)
+            print(f"{key}: {value}   -> {where}" if value else
+                  (f"{key} removed" if had else f"there is no {key}"))
+            return
+        if key not in eng.SETTABLE:
+            import difflib
+            near = difflib.get_close_matches(key, sorted(eng.SETTABLE), n=3)
+            raise SystemExit(
+                f"no setting called '{key}'"
+                + (f" — did you mean {' or '.join(near)}?" if near else "")
+                + "\nevery setting is described in system/config.yml")
+        eng.config_set(key, value)
+        print(f"{key}: {value or '(empty)'}   -> {where}")
+    elif action == "unset":
+        need(args, 2, "settings unset <key>")
+        if args[1].partition(".")[0] in eng.BLOCKS and "." in args[1]:
+            return cmd_settings(["set", args[1]])       # remove one entry
+        print(f"{args[1]} is back to its default" if eng.config_unset(args[1])
+              else f"{args[1]} was not among your settings")
+    elif action == "import":
+        need(args, 2, "settings import <old-config.yml>")
+        try:
+            _carried(*eng.config_import(args[1]))
+        except OSError as exc:
+            raise SystemExit(f"cannot read {args[1]}: {exc.strerror}")
+    else:
+        raise SystemExit("settings | settings set <key> [value] | settings "
+                         "unset <key> | settings import <old-config.yml>")
+
+
+def cmd_update(args):
+    """Fast-forward this copy to the newest version of its branch."""
+    import shutil
+    import subprocess
+    import time
+    restart = "--restart" in args
+    args = [a for a in args if not a.startswith("--")]
+    root = str(eng.ROOT)
+
+    def run(*a):
+        r = subprocess.run(["git", "-C", root, *a], capture_output=True,
+                           text=True)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    def git(*a):
+        code, out, err = run(*a)
+        if code:
+            raise RuntimeError(err or out or f"git {a[0]} failed")
+        return out
+
+    if not (eng.ROOT / ".git").exists():
+        raise SystemExit("this copy of A.R.I.A. is not a git checkout — "
+                         "there is nothing to pull from")
+    here = git("rev-parse", "--abbrev-ref", "HEAD")
+    branch = args[0] if args else here
+    if branch == "HEAD":
+        raise SystemExit("this copy is not on a branch — say which one: "
+                         "aria update main")
+    print(f"fetching {branch}…", flush=True)
+    git("fetch", "origin", branch)
+    before = git("rev-parse", "HEAD")
+    # asked now, with the code that is loaded — not after it changed on disk
+    busy = eng.autopilot_busy()
+
+    # Settings edited in the shipped file would block the new one coming
+    # in: move them into your own file first (a copy of the old one stays).
+    if run("status", "--porcelain", "--", "system/config.yml")[1] \
+            and eng.CONFIG_FILE.is_file():
+        backup = eng.ROOT / "system" / time.strftime(
+            "config.backup-%Y%m%d-%H%M%S.yml")
+        shutil.copy2(eng.CONFIG_FILE, backup)
+        git("checkout", "HEAD", "--", "system/config.yml")
+        print("you had edited system/config.yml, which updates replace:")
+        _carried(*eng.config_import(backup))
+        print(f"  the file as you had it: {backup.relative_to(eng.ROOT)}")
+
+    if branch != here:
+        if run("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")[0]:
+            code, _out, err = run("checkout", "-b", branch, "FETCH_HEAD")
+            run("branch", "--set-upstream-to", f"origin/{branch}", branch)
+        else:
+            code, _out, err = run("checkout", branch)
+        if code:
+            raise RuntimeError(err + _update_hint(err, branch))
+    code, _out, err = run("merge", "--ff-only", "FETCH_HEAD")
+    if code:
+        raise RuntimeError(err + _update_hint(err, branch))
+    after = git("rev-parse", "HEAD")
+
+    if after == before:
+        print(f"already up to date ({branch} @ {after[:7]})")
+    else:
+        new = git("log", "--format=%s", f"{before}..{after}").splitlines()
+        print(f"now on {branch} @ {after[:7]} — {len(new)} change(s):")
+        for subject in new[:12]:
+            print(f"  · {subject}")
+        if len(new) > 12:
+            print(f"  … and {len(new) - 12} more (git log)")
+
+    # a branch that has been merged stops moving: say where the news is
+    default = (run("symbolic-ref", "--short",
+                   "refs/remotes/origin/HEAD")[1] or "origin/main")
+    default = default.split("/", 1)[-1]
+    if branch != default and not run("fetch", "origin", default)[0] \
+            and not run("merge-base", "--is-ancestor", after, "FETCH_HEAD")[0]:
+        print(f"\nnote: everything on {branch} is part of {default} now — "
+              f"new versions land there. Switch with: aria update {default}")
+
+    if after == before and not restart:
+        return
+    # the server that is running still has the old code in memory
+    server = eng.server_running()
+    try:
+        managed = bool(server and server.get("managed")) or subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet",
+             "aria.service"]).returncode == 0
+    except OSError:
+        managed = bool(server and server.get("managed"))
+    if not server and not managed:
+        print("\nA.R.I.A. picks the new version up the next time she starts "
+              "(aria app, or aria ui)")
+        return
+    if busy and not restart:
+        print(f"\nthe server is still running the OLD version: autopilot is "
+              f"working on {', '.join(busy)}, and a restart makes her begin "
+              "the step in flight again.\nRestart when it suits you:  "
+              "aria update --restart"
+              + ("   (or: systemctl --user restart aria)" if managed else ""))
+        return
+    if managed:
+        subprocess.run(["systemctl", "--user", "restart", "aria.service"])
+    else:
+        eng.server_restart(server)
+    print("\nrestarted the server — she is running the new version"
+          + (f" (autopilot picks {', '.join(busy)} back up)" if busy else "")
+          + "; an open window reloads itself")
+
+
+def _update_hint(err, branch):
+    if "would be overwritten" in err:
+        return ("\n\nThose files have changes of yours that the new version "
+                "changes too. Set them aside (git stash), run `aria update` "
+                "again, then bring them back (git stash pop).")
+    if "fast-forward" in err or "diverg" in err:
+        return ("\n\nThis copy has commits of its own that are not on "
+                f"GitHub, so it cannot simply move forward. Merge by hand: "
+                f"git pull origin {branch}")
+    return ""
+
+
+def cmd_reach(_args):
+    cfg = eng.config()
+    import subprocess
+    v = eng.version()
+    if v["commit"]:
+        print(f"ok   version {v['branch']} @ {v['commit']} ({v['date']}) — "
+              f"{v['subject']}")
+    server = eng.server_running()
+    if server and server["stale"]:
+        print("note the running server has older code than is on disk — "
+              "restart it: aria update --restart")
+    elif server:
+        print(f"ok   server running on :{server['port']}"
+              + (" (systemd)" if server.get("managed") else ""))
+    mine, blocks = eng.config_mine()
+    if mine or blocks:
+        print(f"ok   {len(mine) + len(blocks)} setting(s) of your own in "
+              f"{eng.LOCAL_FILE.relative_to(eng.ROOT)} (aria settings)")
+    try:
+        edited = subprocess.run(
+            ["git", "-C", str(eng.ROOT), "status", "--porcelain", "--",
+             "system/config.yml"], capture_output=True, text=True,
+            timeout=20).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        edited = ""
+    if edited:
+        print("note system/config.yml has edits of yours — it is replaced "
+              "by updates; `aria update` moves them into your own file")
+    if cfg["web_access"]:
+        chain = eng.aria_web.provider_chain(cfg)
+        print("ok   web access on — search via "
+              + (" → ".join(chain) if chain else "(search disabled)")
+              + ("; fetch limited to " + ", ".join(cfg["web_allowlist"])
+                 if cfg["web_allowlist"] else ""))
+    else:
+        print("note web access off (aria.web_access) — she will say she "
+              "cannot browse")
+    if cfg["obsidian_vault"]:
+        print(("ok   " if eng.brain_ready(cfg) else "MISS ")
+              + f"Obsidian vault {cfg['obsidian_vault']}"
+              + ("" if eng.brain_ready(cfg) else " — folder not found"))
+    else:
+        print("note no Obsidian vault set (aria.obsidian_vault)")
+    if cfg["github_access"]:
+        print("ok   gh CLI found" if eng.aria_git.gh() else
+              "MISS gh CLI not found — https://cli.github.com then: "
+              "gh auth login")
+    else:
+        print("note GitHub off (aria.github_access) — autopilot commits "
+              "locally only")
+    lib = len(eng.list_library_agents())
+    print(f"ok   {len(eng.list_agents())} core agents, {lib} library "
+          f"agents, {len(eng.list_skill_names())} skills")
+    # the giants
+    roles = eng.garage_status(probe=False)["roles"]
+    for role, row in roles.items():
+        if row["state"] == "unset":
+            continue
+        print(("ok   " if row["state"] in ("stopped", "ready", "loading",
+                                           "external") else "MISS ")
+              + f"{role} giant: {row['label']} ({row['state']}"
+              + (f" — {row['error']}" if row.get("error") else "") + ")")
+    if all(r["state"] == "unset" for r in roles.values()):
+        print("note no giant models set — aria models scan")
+    elif not eng._which("llama-server") and not any(
+            (eng.ROOT / "vendor" / "llama.cpp").glob("**/llama-server")):
+        print("MISS llama-server (the giants need it) — aria llama install")
+    # running and checking code
+    ok, why = eng.checks_available(cfg)
+    if cfg["autopilot_checks"] == "off":
+        print("note running a project's tests is off (aria.autopilot_checks)")
+    elif ok:
+        print("ok   project tests run after each change — "
+              + ("unsandboxed (your setting)"
+                 if cfg["autopilot_checks"] == "direct" else "in a sandbox"))
+    else:
+        print(f"MISS project tests are NOT run — {why}")
+    if subprocess.run([sys.executable, "-c", "import pytest"],
+                      capture_output=True).returncode:
+        print("note pytest not installed for python3 — plain tests still "
+              "run (aria-minitest); for fixtures: pacman -S python-pytest")
+    # the desktop
+    tools = eng.desktop_tools(cfg)
+    print("ok   desktop: " + ", ".join(
+        f"{k} {v if isinstance(v, str) else ''}".strip()
+        for k, v in tools.items() if v) if any(tools.values())
+        else "note no file manager, editor or terminal found to open "
+             "projects with")
+    try:
+        window = subprocess.run(
+            [sys.executable, str(eng.ROOT / "bin" / "aria-app"), "--which"],
+            capture_output=True, text=True, timeout=120).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        window = ""
+    if window in ("qt", "gtk", "webview"):
+        print(f"ok   `aria app` opens a window of its own ({window})")
+    else:
+        print("note `aria app` falls back to "
+              + ("a chromeless browser window" if window == "chromium"
+                 else "a browser tab")
+              + " — for a real window: pacman -S python-pyqt6-webengine "
+                "(or: pip install PyQt6-WebEngine)")
+    if cfg["desktop_notifications"] and not eng._which("notify-send"):
+        print("note notify-send not found — no desktop notifications "
+              "(pacman -S libnotify)")
+
+
+COMMANDS = {name[4:]: fn for name, fn in globals().items()
+            if name.startswith("cmd_")}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__.strip())
+        return 0 if len(sys.argv) < 2 else 1
+    try:
+        COMMANDS[sys.argv[1]](sys.argv[2:])
+    except eng.NeedsApproval as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    except (ValueError, RuntimeError) as exc:
+        print(f"{exc}", file=sys.stderr)
+        if "no project found" in str(exc):
+            print(f"projects: {projects_hint()}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

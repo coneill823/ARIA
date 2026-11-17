@@ -1,4 +1,10 @@
-# A.R.I.A. pipeline configuration
+# A.R.I.A. pipeline configuration — the defaults, and what each setting does.
+#
+# Don't keep your own values here: this file is replaced when A.R.I.A. is
+# updated. Yours go in system/config.local.yml (same keys; whatever is set
+# there wins), which updates never touch. The Settings page writes there,
+# and so does:   aria settings set <key> <value>
+# If you did edit this file, `aria update` carries your edits over for you.
 aria:
   # Which engine bin/aria uses for the automated stages (triage, develop).
   #   ollama — fully local & private; great for triage, drafts plans
@@ -27,6 +33,36 @@ aria:
     fast: ollama/llama3.1:8b
     smart: ollama/llama3.1:8b
     deep:
+  # ---- the giants: one model per role, loaded when work needs it ----
+  # Very large GGUF models (bigger than RAM — llama.cpp streams them from
+  # NVMe; see docs/BIG-MODELS.md). Give each role the FIRST part of its
+  # model (…-00001-of-0000N.gguf). A.R.I.A. starts a role's llama-server
+  # when a task needs it and unloads the others first; a model that is
+  # still downloading is skipped until every part is complete.
+  # Easiest: Settings → Giant models → Find models.
+  giant_general:
+  giant_research:
+  giant_coder:
+  # auto   = the planner gives a task a giant when the work is worth the
+  #          wait (they answer at ~0.5–2 words a second)
+  # always = every coding task to coder, research to research, the rest
+  #          to general — strongest, slowest
+  # never  = giants only where you name them yourself
+  giants_use: auto
+  # How many giants may be loaded at once; unload one after this many
+  # minutes unused (0 = keep it loaded); the first port (general uses it,
+  # research the next, coder the one after).
+  giants_loaded: 1
+  giants_idle_minutes: 0
+  giants_port: 8090
+  # Each giant's context window, in tokens. Prompts for a giant are sized
+  # to it. Bigger costs real RAM for the whole time the giant is loaded —
+  # raise it only if `free -h` shows room to spare.
+  giants_ctx: 8192
+  # Extra llama-server flags for every giant, appended after the preset's
+  # own so they win — e.g. "-ngl 20" if loading runs out of VRAM beside
+  # your everyday model, or "--threads 16".
+  giants_flags:
   # Backends: any name -> base URL. "ollama" speaks Ollama's native API;
   # every other name is treated as OpenAI-compatible (/v1/chat/completions):
   # llama.cpp llama-server, LM Studio, vLLM, OmniRoute, colibri (coli serve),
@@ -67,19 +103,6 @@ aria:
   # develop whatever became a project — idea in, proposed plan out.
   auto_pipeline: true
 
-  # ---- autopilot guardrails (for long unattended runs) ----
-  # Auto-commit after every completed autopilot task — only fires inside
-  # projects that have their own .git (run `git init` in the project dir);
-  # the pipeline folders and the A.R.I.A. repo itself are never touched.
-  autopilot_git: true
-  # Consecutive replans that add no new work before the run auto-pauses
-  # as "stalled" (and notifies the mission-done webhook if configured).
-  autopilot_stall_limit: 3
-  # Soft caps: pause the run as "budget" after this many executed tasks /
-  # this many wall-clock hours. 0 = unlimited.
-  autopilot_max_tasks: 0
-  autopilot_max_hours: 0
-
   # Absolute path to your Obsidian vault to enable the UI's "→ Obsidian"
   # button (exports a project's idea/research/plan plus an index note with
   # tags and wikilinks into <vault>/ARIA/). Empty = disabled.
@@ -111,3 +134,110 @@ aria:
 
   # Whether /develop may use web search for research.
   research_web_access: true
+
+  # ---- reach: the internet ------------------------------------------
+  # On: "search for …" and "read <url>" are real actions in chat and voice,
+  # the develop stage researches ideas on the live web, and autopilot
+  # tasks marked research get sourced material. Search queries leave your
+  # machine when this is on — switch it off here (or in Settings) for a
+  # fully offline A.R.I.A.; she then says plainly that she cannot browse.
+  web_access: true
+
+  # Where searches go:
+  #   auto        your SearxNG if web_search_url is set, else Brave if a key
+  #               is set, else DuckDuckGo, else Wikipedia — first to answer
+  #   duckduckgo  no key, no setup (the no-JavaScript results page)
+  #   brave       official API — free key from brave.com/search/api, put it
+  #               in the environment as ARIA_KEY_BRAVE
+  #   searxng     your own instance (most private): set web_search_url
+  #   wikipedia   encyclopedia only
+  #   none        fetch pages you name, but never search
+  web_search: auto
+
+  # Your self-hosted SearxNG search endpoint, JSON format enabled, e.g.
+  #   web_search_url: http://localhost:8888/search
+  web_search_url:
+
+  # Optional: confine page fetching to these sites (comma-separated).
+  # Empty = any public site. Your local network is always off limits —
+  # private, loopback and link-local addresses are refused.
+  #   web_allowlist: en.wikipedia.org, docs.python.org, github.com
+  web_allowlist:
+
+  # ---- reach: git and GitHub ---------------------------------------
+  # Autopilot commits every verified task when the project is its own git
+  # repository (never inside a repository that merely contains it), on the
+  # branch aria/autopilot — your base branch is never committed to.
+  autopilot_git: true
+
+  # GitHub is off until you say so. On: `aria github publish <slug>`
+  # creates a private repository for a project, and autopilot pushes its
+  # branch and keeps a pull request open as it works. Needs the gh CLI,
+  # signed in once with `gh auth login` (or a token in ARIA_GITHUB_TOKEN).
+  github_access: false
+  github_base_branch: main
+
+  # ---- autopilot ----------------------------------------------------
+  # Context window, in tokens, requested from Ollama for every call (its
+  # own default silently truncates long prompts) and used to size prompts.
+  # Raise it if your models and VRAM allow; 0 leaves the backend's own
+  # setting alone.
+  context_tokens: 8192
+
+  # After the goal is met and audited:  improve = keep going with
+  # improvements until you stop her (or she runs out of improvements
+  # worth making);  stop = write the final report and stand down.
+  autopilot_after_goal: improve
+
+  # Optional budgets for one run, 0 = no limit: task attempts, batches,
+  # wall-clock hours. When one is reached she finishes the step in flight,
+  # writes the report and stands down as "budget reached". Starting her
+  # again is a new run with a new budget.
+  autopilot_max_tasks: 0
+  autopilot_max_iterations: 0
+  autopilot_max_hours: 0
+
+  # She pauses herself as "stalled" — and writes the report — after this
+  # many batches in a row that complete nothing, or this many plans in a
+  # row that add nothing.
+  autopilot_stall_limit: 3
+
+  # Run the project's own tests after every code change:
+  #   sandbox = yes, inside bubblewrap — no network, the machine read-only,
+  #             a scratch copy of the project the only thing writable.
+  #             Without bubblewrap they are not run, and the report says so
+  #             (Arch: sudo pacman -S bubblewrap).
+  #   direct  = yes, without a sandbox (a scratch copy, your permissions)
+  #   off     = never
+  # A change that makes passing tests fail is rejected and rolled back.
+  autopilot_checks: sandbox
+  # Seconds one test run may take before it is stopped.
+  autopilot_check_seconds: 300
+
+  # When the goal is met — and again after every few more changes — read
+  # the whole codebase, write up what is worth changing (REVIEW.md) and
+  # refine it without changing what it does.
+  autopilot_refine: true
+
+  # Minutes a fast/smart model may stay silent before an attempt is
+  # abandoned and retried. The deep tier and hand-picked models are never
+  # cut off — a giant can take an hour to produce its first token.
+  autopilot_idle_minutes: 30
+
+  # ---- your desktop ---------------------------------------------------
+  # The Files tab's "Open in editor" and "Terminal here". Empty = the
+  # first one found on this machine (code, zed, kate, …; konsole,
+  # gnome-terminal, kitty, …). Set a command to choose: `editor: code`
+  # (the file or folder is added at the end), `terminal: konsole --workdir`
+  # (the folder follows a trailing option, or goes where you write {dir}).
+  editor:
+  terminal:
+  # A notification on your desktop when a task waits on your decision and
+  # when a run ends (needs notify-send, which most desktops have).
+  desktop_notifications: true
+
+  # ---- the Obsidian brain -------------------------------------------
+  # With obsidian_vault set (above), she writes into <vault>/ARIA/ only:
+  # project hubs, notes you dictate ("note to brain: …"), research she
+  # did, and — when this is on — a daily journal of what she worked on.
+  brain_journal: true
