@@ -13,6 +13,9 @@ tell you what success looks like before moving on.
       `git checkout -- system/config.yml`, `git pull`,
       `bin/aria settings import ~/aria-config-backup.yml`,
       `systemctl --user restart aria`
+- [ ] The bottom of the sidebar shows the version that is running
+      (`version <commit> · <date>`); **⟳ update ready — restart** there
+      means the code on disk is newer than the running server
 - [ ] `bin/aria test --mock` → every check PASS or SKIP, in seconds
 - [ ] `bin/aria test` → the same against your models. If the only FAIL is
       `backends reachable`, Ollama is not running:

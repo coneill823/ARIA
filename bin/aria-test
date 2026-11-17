@@ -1915,9 +1915,61 @@ def test_escape():
                 and seen["title"].startswith("A.R.I.A"), seen
             return "a Qt window opened and showed the app shell"
         check("desktop app window", c_app_window, required=False)
+
+        def c_server_version():
+            """The server says which version it is running; newer code on
+            disk is noticed, and an idle server restarts onto it — found
+            by a record that is only believed if the process answers."""
+            with urllib.request.urlopen(base + "/api/version", timeout=15) as r:
+                v = json.load(r)
+            assert v["pid"] == srv.pid and v["code"] and not v["stale"], v
+            with urllib.request.urlopen(base + "/api/state", timeout=15) as r:
+                assert json.load(r)["version"]["code"] == v["code"]
+            found = eng.server_running()
+            assert found and found["pid"] == srv.pid and not found["stale"] \
+                and not found["managed"], found
+            # a left-over record may name a pid that is someone else's by
+            # now (here: this very process) — it must not be believed
+            record = os.path.join(sandbox, "system", "server.json")
+            real = open(record).read()
+            with open(record, "w") as f:
+                json.dump(dict(json.loads(real), pid=os.getpid()), f)
+            assert eng.server_running() is None, \
+                "a record naming another process was believed"
+            with open(record, "w") as f:
+                f.write(real)
+            # newer code on disk
+            with open(os.path.join(sandbox, "bin", "aria_brain.py"), "a") as f:
+                f.write("\n# self-test: newer code than the server runs\n")
+            found = eng.server_running()
+            assert found and found["stale"], "new code on disk went unnoticed"
+            old_state = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = os.path.join(sandbox, "_state")
+            try:
+                how = eng.server_restart(found)
+            finally:
+                if old_state is None:
+                    os.environ.pop("XDG_STATE_HOME")
+                else:
+                    os.environ["XDG_STATE_HOME"] = old_state
+            assert how == "respawned", how
+            assert wait_http(base + "/api/health"), "no server after restart"
+            with urllib.request.urlopen(base + "/api/version", timeout=15) as r:
+                v2 = json.load(r)
+            state["respawned"] = v2["pid"]
+            assert v2["pid"] != v["pid"] and v2["code"] != v["code"] \
+                and not v2["stale"], (v, v2)
+            return ("version reported, a left-over record not believed, "
+                    "new code on disk noticed and restarted onto")
+        check("version + restart onto new code", c_server_version)
     finally:
         for p in procs:
             p.terminate()
+        if state.get("respawned"):
+            try:
+                os.kill(state["respawned"], 15)
+            except OSError:
+                pass
 
     # ---- machine integration (informational) ------------------------
     def c_install():

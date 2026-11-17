@@ -52,10 +52,34 @@ def healthy(url, timeout=1.5):
         return False
 
 
+def refresh(url, port):
+    """A server left running from before an update still has the old code
+    in memory. If it is idle, restart it onto the code on disk — nothing
+    is lost. If autopilot is mid-step it is left alone; the sidebar then
+    says a new version is waiting."""
+    try:
+        sys.path.insert(0, str(ROOT / "bin"))
+        import aria_engine as eng
+        server = eng.server_running()
+        if not server or not server["stale"] or server["port"] != port \
+                or eng.autopilot_busy():
+            return
+        eng.server_restart(server)
+        for _ in range(120):
+            time.sleep(0.25)
+            if healthy(url, timeout=0.5):
+                return
+    except Exception as exc:                # never keep the window shut
+        print(f"aria-app: could not refresh the server ({exc})",
+              file=sys.stderr)
+
+
 def ensure_server(port):
-    """The server does the work; make sure there is one."""
+    """The server does the work; make sure there is one — running the
+    code that is on disk."""
     url = f"http://127.0.0.1:{port}"
     if healthy(url):
+        refresh(url, port)
         return url
     state = Path(os.environ.get("XDG_STATE_HOME")
                  or Path.home() / ".local" / "state")

@@ -3,7 +3,7 @@
 // survives a tab switch), the state poll that keeps the sidebar honest,
 // and the composer every talking surface shares.
 
-import { $, $$, h, clear, api, bus, title } from './js/core.js';
+import { $, $$, h, clear, api, bus, title, toast } from './js/core.js';
 import { talk, submit, newChat, openChat, deleteChat, toggleVoice,
          toggleListening, voiceInput } from './js/talk.js';
 import * as chat from './js/chat.js';
@@ -141,6 +141,32 @@ function renderRecents() {
 $('#new-chat').onclick = () => { newChat(); go({ view: 'chat' }); };
 bus.on('talk:chats', renderRecents);
 
+// Which version is running — and what to do when it is not the newest.
+// The server restarts onto new code (aria update); this page is then the
+// old app talking to a new server, so it reloads itself — at once if
+// nothing would be lost, otherwise when you click.
+let bootCode = null;
+function renderVersion(v) {
+  let el = $('#version-now');
+  if (!el) { el = h('button', { id: 'version-now', type: 'button' }); $('#side-foot').append(el); }
+  if (v.code && bootCode === null) bootCode = v.code;
+  const moved = !!v.code && v.code !== bootCode;       // the server restarted
+  const draft = ($('#view-chat textarea') || {}).value || '';
+  if (moved && !talk.busy && !draft.trim()) { location.reload(); return; }
+  const when = v.date ? ' · ' + v.date : '';
+  el.className = moved || v.stale ? 'attention' : '';
+  const how = 'A newer version is on disk than the one running. Restart her onto it with:  aria update --restart  '
+    + '(or: systemctl --user restart aria). If autopilot is mid-step, it begins that step again.';
+  el.textContent = moved ? '⟳ updated — click to reload'
+    : v.stale ? '⟳ update ready — restart'
+    : v.commit ? 'version ' + v.commit + when : '';
+  el.title = moved ? 'A.R.I.A. was updated and restarted; this window still shows the old app'
+    : v.stale ? how
+    : v.commit ? (v.branch || '') + ' @ ' + v.commit + (v.subject ? ' — ' + v.subject : '') + '\nUpdate with: aria update' : '';
+  el.onclick = moved ? () => location.reload() : v.stale ? () => toast(how, 'info', 12000) : null;
+  el.hidden = !el.textContent;
+}
+
 function renderState(st) {
   appState = st;
   const hl = st.health;
@@ -156,6 +182,7 @@ function renderState(st) {
     : gl.length ? '◆ giant: ' + gl.map(r => r + (gz.labels[r] ? ' (' + gz.labels[r].split('-').slice(0, 2).join('-') + ')' : '')).join(', ')
     : '';
   gnow.hidden = !gnow.textContent;
+  renderVersion(st.version || {});
   for (const [key, on] of Object.entries(st.switches)) {
     const el = $('#sw-' + key);
     if (el) el.classList.toggle('on', !!on);

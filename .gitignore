@@ -12,3 +12,4 @@ skills-library/
 system/garage/
 system/config.local.yml
 system/config.backup-*.yml
+system/server.json

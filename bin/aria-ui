@@ -60,6 +60,7 @@ headers (curl, the voice gateway, scripts) are unaffected.
 import json
 import mimetypes
 import os
+import signal
 import sys
 import threading
 import time
@@ -92,6 +93,22 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "autopilot_refine", "desktop_notifications")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
+# what this server started with (filled in by main) — see eng.server_mark
+BOOT = {"pid": os.getpid(), "code": "", "version": {}}
+_STALE = {"at": 0.0, "value": False}
+
+
+def version_view():
+    """Which version is running, and whether newer code is waiting on disk
+    for a restart (checked at most twice a minute)."""
+    if BOOT["code"] and time.time() - _STALE["at"] > 30:
+        try:
+            _STALE["value"] = eng.code_version() != BOOT["code"]
+        except OSError:
+            pass
+        _STALE["at"] = time.time()
+    return {**BOOT["version"], "pid": BOOT["pid"], "code": BOOT["code"],
+            "stale": _STALE["value"]}
 
 
 def health_cached(max_age=10):
@@ -322,12 +339,15 @@ class Handler(BaseHTTPRequestHandler):
                              "auto_pipeline": cfg["auto_pipeline"]},
                 "missions": len([m for m in eng.mission_list()
                                  if m["status"] in ("queued", "running")]),
+                "version": version_view(),
                 "garage": garage_brief(),
             })
         elif path == "/api/board":
             self.send_json(eng.board())
         elif path == "/api/health":
             self.send_json(health_cached(max_age=3))
+        elif path == "/api/version":
+            self.send_json(version_view())
         elif path == "/api/config":
             self.send_json(config_view())
         elif path == "/api/garage":
@@ -838,11 +858,25 @@ def main():
     threading.Thread(target=mission_worker, daemon=True).start()
     threading.Thread(target=autopilot_worker, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    BOOT.update(eng.server_mark(port))
     print(f"A.R.I.A. UI -> http://127.0.0.1:{port}  (Ctrl+C to stop)")
+
+    def leave(*_signal):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, leave)        # systemctl stop, aria update
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
+    finally:
+        # Programs started from the Run tab end with the server that
+        # started them. A loaded giant is left alone — reloading one takes
+        # minutes, and the next server finds it by its pidfile. (Under
+        # systemd the whole service group ends together, giants included.)
+        try:
+            eng.aria_run.stop_all()
+        finally:
+            eng.server_unmark()
 
 
 if __name__ == "__main__":

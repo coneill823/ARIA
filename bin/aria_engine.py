@@ -16,10 +16,15 @@ loop lives in aria_autopilot, which builds on everything here.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
+import socket
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -3188,7 +3193,6 @@ def desktop_notify(title, body=""):
     that want them: a task waits on their decision, a run has ended. Sent
     by the always-on server, so it arrives with no window open. Returns
     whether one was sent."""
-    import subprocess
     if not config()["desktop_notifications"]:
         return False
     tool = _which("notify-send")
@@ -3219,7 +3223,6 @@ def desktop_tools(cfg=None):
 
 
 def _spawn(argv, cwd):
-    import subprocess
     subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
@@ -3413,6 +3416,124 @@ def autopilot_plan(slug, emit):
 
 def project_view(slug):
     return _autopilot().view(slug)
+
+
+# ---------------------------------------------------------------- version
+#
+# Code changes on disk (an update, a pull) reach the always-on server only
+# when it restarts. So the server records what it started with, the app
+# shows it, and whoever updates can tell — and restart it — when the two
+# have drifted apart.
+
+SERVER_FILE = ROOT / "system" / "server.json"
+
+
+def code_version():
+    """A fingerprint of the server's own code as it is on disk now."""
+    digest = hashlib.sha1()
+    for f in sorted((ROOT / "bin").iterdir()):
+        if f.is_file() and (f.name == "aria-ui" or
+                            (f.name.startswith("aria_") and f.suffix == ".py")):
+            digest.update(f.name.encode())
+            digest.update(f.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def version():
+    """Which version this copy is: {branch, commit, date, subject} — empty
+    strings when it is not a git checkout."""
+    def git(*argv):
+        try:
+            r = subprocess.run(["git", "-C", str(ROOT), *argv],
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+    commit = git("rev-parse", "--short", "HEAD")
+    if not commit:
+        return {"branch": "", "commit": "", "date": "", "subject": ""}
+    return {"branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "commit": commit, "date": git("log", "-1", "--format=%cs"),
+            "subject": git("log", "-1", "--format=%s")}
+
+
+def server_mark(port):
+    """The server, at start: put on record who is serving this copy."""
+    info = {"pid": os.getpid(), "port": int(port), "code": code_version(),
+            "version": version(),
+            "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            # systemd names every service run; nothing else sets this
+            "managed": bool(os.environ.get("INVOCATION_ID"))}
+    tmp = SERVER_FILE.with_name(SERVER_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    os.replace(tmp, SERVER_FILE)
+    return info
+
+
+def server_unmark():
+    """The server, on its way out: take its own record away."""
+    try:
+        if json.loads(SERVER_FILE.read_text("utf-8")).get("pid") == os.getpid():
+            SERVER_FILE.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def server_running():
+    """The server of this copy, if one is up: its record plus `stale`
+    (newer code is on disk than it is running). The record is believed
+    only if the process answers for it — a left-over file may name a pid
+    that is somebody else's by now."""
+    try:
+        info = json.loads(SERVER_FILE.read_text("utf-8"))
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(info['port'])}/api/version",
+                timeout=3) as r:
+            live = json.load(r)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if live.get("pid") != info.get("pid"):
+        return None
+    info["stale"] = info.get("code") != code_version()
+    return info
+
+
+def server_restart(info):
+    """Restart the server `info` describes onto the code on disk. Returns
+    how it was done: "systemd" or "respawned"."""
+    if info.get("managed"):
+        subprocess.run(["systemctl", "--user", "restart", "aria.service"],
+                       check=False)
+        return "systemd"
+    pid, port = int(info["pid"]), int(info["port"])
+    os.kill(pid, signal.SIGTERM)
+    # Gone is "no longer listening", not "no such pid": a server the app
+    # window started lingers as that window's defunct child.
+    for _ in range(150):                        # it stops her programs first
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        except OSError:
+            break
+        time.sleep(0.1)
+    else:
+        raise RuntimeError(f"the server (pid {pid}) did not stop — stop it "
+                           "by hand, then open the app again")
+    state = Path(os.environ.get("XDG_STATE_HOME")
+                 or Path.home() / ".local" / "state")
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / "aria-ui.log", "ab") as log:
+        subprocess.Popen([sys.executable, str(ROOT / "bin" / "aria-ui"),
+                          str(info["port"])], stdout=log,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    return "respawned"
+
+
+def autopilot_busy():
+    """Projects autopilot is in the middle of a step on (a run that only
+    waits for the owner is not: nothing would be lost)."""
+    return [p["slug"] for p in list_projects()
+            if p["autopilot"] == "running" and not p["waiting"]]
 
 
 # ---------------------------------------------------------------- config edit

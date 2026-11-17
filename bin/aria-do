@@ -456,8 +456,7 @@ def cmd_update(args):
     git("fetch", "origin", branch)
     before = git("rev-parse", "HEAD")
     # asked now, with the code that is loaded — not after it changed on disk
-    busy = [p["slug"] for p in eng.list_projects()
-            if p["autopilot"] == "running" and not p["waiting"]]
+    busy = eng.autopilot_busy()
 
     # Settings edited in the shipped file would block the new one coming
     # in: move them into your own file first (a copy of the old one stays).
@@ -505,12 +504,15 @@ def cmd_update(args):
 
     if after == before and not restart:
         return
+    # the server that is running still has the old code in memory
+    server = eng.server_running()
     try:
-        active = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
-                                 "aria.service"]).returncode == 0
+        managed = bool(server and server.get("managed")) or subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet",
+             "aria.service"]).returncode == 0
     except OSError:
-        active = False
-    if not active:
+        managed = bool(server and server.get("managed"))
+    if not server and not managed:
         print("\nA.R.I.A. picks the new version up the next time she starts "
               "(aria app, or aria ui)")
         return
@@ -518,12 +520,16 @@ def cmd_update(args):
         print(f"\nthe server is still running the OLD version: autopilot is "
               f"working on {', '.join(busy)}, and a restart makes her begin "
               "the step in flight again.\nRestart when it suits you:  "
-              "systemctl --user restart aria   (or now: aria update "
-              "--restart)")
+              "aria update --restart"
+              + ("   (or: systemctl --user restart aria)" if managed else ""))
         return
-    subprocess.run(["systemctl", "--user", "restart", "aria.service"])
+    if managed:
+        subprocess.run(["systemctl", "--user", "restart", "aria.service"])
+    else:
+        eng.server_restart(server)
     print("\nrestarted the server — she is running the new version"
-          + (f" (autopilot picks {', '.join(busy)} back up)" if busy else ""))
+          + (f" (autopilot picks {', '.join(busy)} back up)" if busy else "")
+          + "; an open window reloads itself")
 
 
 def _update_hint(err, branch):
@@ -541,6 +547,17 @@ def _update_hint(err, branch):
 def cmd_reach(_args):
     cfg = eng.config()
     import subprocess
+    v = eng.version()
+    if v["commit"]:
+        print(f"ok   version {v['branch']} @ {v['commit']} ({v['date']}) — "
+              f"{v['subject']}")
+    server = eng.server_running()
+    if server and server["stale"]:
+        print("note the running server has older code than is on disk — "
+              "restart it: aria update --restart")
+    elif server:
+        print(f"ok   server running on :{server['port']}"
+              + (" (systemd)" if server.get("managed") else ""))
     mine, blocks = eng.config_mine()
     if mine or blocks:
         print(f"ok   {len(mine) + len(blocks)} setting(s) of your own in "

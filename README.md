@@ -172,12 +172,21 @@ bin/aria update            # the newest version of the branch you are on
 bin/aria update main       # …or move to another branch
 ```
 
-It fast-forwards this copy, lists what changed and restarts the always-on
-server — unless autopilot is in the middle of a step, in which case it
-leaves her running and tells you how to restart when it suits you
-(`--restart` to do it anyway). It never merges, never discards a change
-of yours: if a file you edited is also changed upstream it stops and says
-which.
+It fast-forwards this copy, lists what changed and restarts the server
+(under systemd or started by the app, either way) — unless autopilot is
+in the middle of a step, in which case it leaves her running and tells
+you how to restart when it suits you (`--restart` to do it anyway). An
+open window reloads itself onto the new version. It never merges and
+never discards a change of yours: if a file you edited is also changed
+upstream it stops and says which.
+
+**Which version am I running?** The bottom of the sidebar says
+(`version 31edfc2 · 2026-11-17`; hover for the branch and the last
+change), and so does `aria doctor`. New code reaches the server only
+when it restarts, so if the code on disk is newer than what is running —
+after a plain `git pull`, say — that line turns into
+**⟳ update ready — restart**. Opening `aria app` restarts an idle server
+onto the new code by itself.
 
 Your settings are not part of what gets updated. `system/config.yml`
 holds the defaults and the explanation of every key; your own values
