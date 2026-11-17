@@ -7,7 +7,9 @@ itself and hands everything below to this script:
   agent <name> "task"            run one agent, streaming to the terminal
   mission <agent> "task"         queue a background job
   missions [run]                 list missions / drain the queue here
-  projects                       every project and what autopilot is doing
+  projects                       every project, where it lives and what
+                                 autopilot is doing
+  open <slug> [folder|editor|terminal]   open a project on your desktop
   approve <slug>                 THE HUMAN GATE: approve a proposed plan
   adopt <repo|folder> "goal"     put an existing codebase under autopilot
   autopilot <slug> start|stop|status|run|steer "guidance"
@@ -99,8 +101,14 @@ def cmd_projects(_args):
                      + (f" · waiting {p['waiting']}" if p["waiting"] else
                         (f" · now: {p['current']}" if p["current"] else "")))
         print(line)
+        print(f"{'':34} {eng._project_dir(p['slug'])}")
         for g in p["needs_you"]:
             print(f"{'':34} needs you: {g['id']} — {g['title']}")
+
+
+def cmd_open(args):
+    need(args, 1, "open <slug> [folder|editor|terminal]")
+    print(eng.open_path(args[0], how=args[1] if len(args) > 1 else "folder"))
 
 
 def cmd_approve(args):

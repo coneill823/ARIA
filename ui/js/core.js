@@ -133,18 +133,39 @@ export const store = {
 // Small and safe: builds DOM nodes, never parses HTML. Covers what
 // A.R.I.A. writes — headings, lists, tables, code, quotes, links.
 
-const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))|(https?:\/\/[^\s<>)\]]+)|(\*[^*\s][^*\n]*\*)/g;
+// Links: [text](https://…) opens outside; [text](relative/path) and a
+// `code span` that names a file are handed to `opts.file` — the caller
+// says whether that is a file it can show, and what a click does. Nothing
+// else ever becomes a link, so no document can smuggle in a scheme.
+const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]\n]+\]\([^)\s]+\))|(https?:\/\/[^\s<>)\]]+)|(\*[^*\s][^*\n]*\*)/g;
 
-function inline(text, into) {
+function fileLink(opts, target, kids) {
+  const path = opts && opts.file ? opts.file(target) : null;
+  if (!path) return null;
+  return h('a', { class: 'filelink', title: 'open ' + path, href: '#',
+                  onclick: e => { e.preventDefault(); opts.open(path); } }, kids);
+}
+
+function inline(text, into, opts) {
   let last = 0;
   for (const m of text.matchAll(INLINE)) {
     if (m.index > last) into.append(text.slice(last, m.index));
     const t = m[0];
-    if (m[1]) into.append(h('code', { text: t.slice(1, -1) }));
-    else if (m[2]) into.append(h('strong', {}, ...inlineKids(t.slice(2, -2))));
+    if (m[1]) {
+      const code = h('code', { text: t.slice(1, -1) });
+      into.append(fileLink(opts, t.slice(1, -1), code) || code);
+    } else if (m[2]) into.append(h('strong', {}, ...inlineKids(t.slice(2, -2), opts)));
     else if (m[3]) {
       const mm = /^\[([^\]]+)\]\((.+)\)$/.exec(t);
-      into.append(h('a', { href: mm[2], target: '_blank', rel: 'noopener noreferrer', text: mm[1] }));
+      if (/^https?:\/\//i.test(mm[2]))
+        into.append(h('a', { href: mm[2], target: '_blank', rel: 'noopener noreferrer' },
+                      ...inlineKids(mm[1])));
+      else {                              // a path: a file we can show, or plain text
+        let target = mm[2];
+        try { target = decodeURIComponent(target); } catch { /* keep as written */ }
+        const label = inlineKids(mm[1]);  // no opts: a code span inside is not a second link
+        into.append(fileLink(opts, target, label) || h('span', {}, label));
+      }
     } else if (m[4]) {
       const url = t.replace(/[.,;:!?]+$/, '');
       into.append(h('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: url }));
@@ -155,9 +176,21 @@ function inline(text, into) {
   if (last < text.length) into.append(text.slice(last));
   return into;
 }
-const inlineKids = text => [...inline(text, h('span')).childNodes];
+const inlineKids = (text, opts) => [...inline(text, h('span'), opts).childNodes];
 
-export function md(src) {
+// Resolve a link written inside a document at `base` (a path within the
+// project) to a path within the project; null if it climbs out of it.
+export function resolvePath(base, href) {
+  const parts = /^\//.test(href) ? [] : base.split('/').slice(0, -1);
+  for (const seg of href.split(/[?#]/)[0].split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') { if (!parts.length) return null; parts.pop(); }
+    else parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+export function md(src, opts) {
   const root = h('div', { class: 'md' });
   const lines = String(src || '').replace(/\r/g, '').split('\n');
   let i = 0;
@@ -167,7 +200,7 @@ export function md(src) {
   }
   let para = [];
   const flush = () => {
-    if (para.length) root.append(inline(para.join(' '), h('p')));
+    if (para.length) root.append(inline(para.join(' '), h('p'), opts));
     para = [];
   };
   while (i < lines.length) {
@@ -191,7 +224,7 @@ export function md(src) {
     const head = /^(#{1,6})\s+(.*)$/.exec(line);
     if (head) {
       flush();
-      root.append(inline(head[2], h('h' + Math.min(head[1].length + 1, 6))));
+      root.append(inline(head[2], h('h' + Math.min(head[1].length + 1, 6)), opts));
       i++;
       continue;
     }
@@ -199,11 +232,11 @@ export function md(src) {
     if (/^\s*\|.*\|\s*$/.test(line) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] || '')) {
       flush();
       const cells = l => l.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
-      const table = h('table', {}, h('thead', {}, h('tr', {}, cells(line).map(c => inline(c, h('th'))))));
+      const table = h('table', {}, h('thead', {}, h('tr', {}, cells(line).map(c => inline(c, h('th'), opts)))));
       const tbody = h('tbody');
       i += 2;
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]))
-        tbody.append(h('tr', {}, cells(lines[i++]).map(c => inline(c, h('td')))));
+        tbody.append(h('tr', {}, cells(lines[i++]).map(c => inline(c, h('td'), opts))));
       table.append(tbody);
       root.append(h('div', { class: 'md-table' }, table));
       continue;
@@ -213,7 +246,7 @@ export function md(src) {
       const body = [];
       while (i < lines.length && /^\s*>\s?/.test(lines[i]))
         body.push(lines[i++].replace(/^\s*>\s?/, ''));
-      root.append(h('blockquote', {}, ...md(body.join('\n')).childNodes));
+      root.append(h('blockquote', {}, ...md(body.join('\n'), opts).childNodes));
       continue;
     }
     const item = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line);
@@ -230,7 +263,7 @@ export function md(src) {
           const sub = [];
           while (i < lines.length && /^\s+\S/.test(lines[i]) &&
                  lines[i].search(/\S/) > base) sub.push(lines[i++].slice(base + 2));
-          if (li) li.append(...md(sub.join('\n')).childNodes);
+          if (li) li.append(...md(sub.join('\n'), opts).childNodes);
           continue;
         }
         const li = h('li');
@@ -239,14 +272,14 @@ export function md(src) {
           li.classList.add('task-item');
           li.append(h('span', { class: 'box' + (box[1] === ' ' ? '' : ' on'),
                                 text: box[1] === ' ' ? '☐' : '☑' }));
-          inline(box[2], li);
-        } else inline(m[3], li);
+          inline(box[2], li, opts);
+        } else inline(m[3], li, opts);
         list.append(li);
         i++;
         while (i < lines.length && /^\s{2,}\S/.test(lines[i]) &&
                !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
           li.append(' ');
-          inline(lines[i++].trim(), li);
+          inline(lines[i++].trim(), li, opts);
         }
       }
       root.append(list);

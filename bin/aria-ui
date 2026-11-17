@@ -14,6 +14,9 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
   GET  /api/project?slug=        everything the Projects view shows
   GET  /api/project/live?slug=   light poll: state, activity tail, live text
   GET  /api/file?slug=&path=     one project file (text, confined)
+  GET  /api/file/raw?slug=&path=  an image from the project, as itself
+  GET  /api/files?slug=          every file in a project (the Files view)
+  GET  /api/changes?slug=        the complete change record
   GET  /api/agents     core agents + library specialists
   GET  /api/skills     installed skills with descriptions
   GET  /api/missions   background jobs
@@ -31,6 +34,14 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
   POST /api/skip-task     {"slug", "id", "note"?}  let it run / decline it
   GET  /api/garage     the giant models: one per role, what is loaded
   POST /api/garage     {"action": scan|load|unload, "folder"?, "role"?}
+  POST /api/open       {"slug", "path"?, "how": folder|editor|terminal}
+
+Only this machine may call the API. The server binds 127.0.0.1, and on top
+of that refuses requests a web page could cause from elsewhere: a Host that
+is not this machine (DNS rebinding), a browser request marked as coming
+from another site — including another local port, such as a project's own
+web app — and a POST whose Origin is not this server. Tools without those
+headers (curl, the voice gateway, scripts) are unaffected.
   POST /api/plan       {"slug"} -> streamed (re)plan
   POST /api/github     {"slug", "action": init|publish|push}
   POST /api/agent      {"name", "task"} -> streamed agent run
@@ -41,6 +52,7 @@ serve the same shell, ui/index.html; its assets come from /ui/<file>.
 
 import json
 import mimetypes
+import os
 import sys
 import threading
 import time
@@ -56,6 +68,10 @@ VIEWS = ("/", "/chat", "/projects", "/board", "/agents", "/orb", "/settings")
 RUN_LOCK = threading.Lock()  # one pipeline run at a time
 AUDIO_SUFFIX = {"audio/webm": ".webm", "audio/ogg": ".ogg",
                 "audio/wav": ".wav", "audio/mp4": ".m4a"}
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
+               ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp", ".svg": "image/svg+xml",
+               ".ico": "image/x-icon", ".bmp": "image/bmp"}
 CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "stt_model", "web_access", "web_search", "web_search_url",
                "web_allowlist", "github_access", "github_base_branch",
@@ -64,7 +80,7 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "autopilot_max_hours", "autopilot_stall_limit",
                "context_tokens", "giant_general", "giant_research",
                "giant_coder", "giants_use", "giants_loaded",
-               "giants_idle_minutes")
+               "giants_idle_minutes", "editor", "terminal")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
 
@@ -133,13 +149,49 @@ def config_view():
         "giants_loaded": cfg["giants_loaded"],
         "giants_idle_minutes": cfg["giants_idle_minutes"],
         "garage": eng.garage_status(probe=False),
+        "editor": cfg["editor"],
+        "terminal": cfg["terminal"],
+        "desktop": eng.desktop_tools(cfg),
         "promotion_target": cfg["promotion_target"],
         "webhooks": sorted(cfg["webhooks"]),
     }
 
 
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"} | {
+    h.strip().lower() for h in os.environ.get("ARIA_ALLOWED_HOSTS", "")
+    .split(",") if h.strip()}
+
+
+def _hostname(value):
+    value = (value or "").strip().lower()
+    if value.startswith("["):                    # [::1]:8700
+        return value.split("]")[0] + "]"
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def refused(self):
+        """Why this request must not be served ("" when it may be). The
+        API changes things on this machine — approves plans, starts work,
+        opens folders, runs programs — so only this machine's own app and
+        tools may call it, never a page from somewhere else."""
+        host = self.headers.get("Host", "")
+        if host and _hostname(host) not in LOCAL_HOSTS:
+            return "this server only answers to this machine"
+        if not self.path.startswith("/api/"):
+            return ""
+        if self.headers.get("Sec-Fetch-Site", "same-origin") not in (
+                "same-origin", "none"):
+            return "requests from other sites are refused"
+        origin = self.headers.get("Origin")
+        if self.command == "POST" and origin is not None:
+            want = urllib.parse.urlparse(origin)
+            if want.scheme != "http" or (want.netloc or "").lower() \
+                    != host.strip().lower():
+                return "requests from other origins are refused"
+        return ""
 
     def log_message(self, fmt, *args):
         pass
@@ -155,12 +207,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_file(self, path, ctype):
+    def send_file(self, path, ctype, untrusted=False):
+        """`untrusted`: a file from a project — written by a model. It is
+        served inert: no scripts, no access to this origin."""
         data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")    # no clickjacking
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+            if untrusted else
+            "default-src 'self'; img-src 'self' data: blob:; "
+            "style-src 'self' 'unsafe-inline'; media-src 'self' blob:; "
+            "frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -189,6 +252,10 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ routes
 
     def do_GET(self):
+        why = self.refused()
+        if why:
+            self.send_json({"error": why}, 403)
+            return
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
         arg = lambda name: (query.get(name) or [""])[0]  # noqa: E731
@@ -260,15 +327,36 @@ class Handler(BaseHTTPRequestHandler):
                                        ("id", "status", "attempts",
                                         "needs_human")}
                                       for t in plan["tasks"]]})
-        elif path == "/api/file":
+        elif path in ("/api/file", "/api/file/raw"):
             proj = eng._project_dir(arg("slug")).resolve()
             target = (proj / arg("path")).resolve()
-            if proj not in target.parents or not target.is_file() \
-                    or target.stat().st_size > 1_000_000:
+            if proj not in target.parents or not target.is_file():
                 self.send_json({"error": "not found"}, 404)
                 return
-            self.send_json({"path": arg("path"), "content": target.read_text(
-                encoding="utf-8", errors="replace")})
+            size = target.stat().st_size
+            kind = IMAGE_TYPES.get(target.suffix.lower(), "")
+            if path == "/api/file/raw":          # images only, as themselves
+                if not kind or size > 20_000_000:
+                    self.send_json({"error": "not found"}, 404)
+                    return
+                self.send_file(target, kind, untrusted=True)
+                return
+            info = {"path": arg("path"), "size": size, "abs": str(target)}
+            if kind:
+                self.send_json({**info, "image": True})
+            elif size > 1_000_000 or not eng._autopilot()._is_text(target):
+                self.send_json({**info, "binary": True})
+            else:
+                self.send_json({**info, "content": target.read_text(
+                    encoding="utf-8", errors="replace")})
+        elif path == "/api/files":
+            slug = arg("slug")
+            self.send_json({"slug": slug,
+                            "path": str(eng._project_dir(slug).resolve()),
+                            "tools": eng.desktop_tools(),
+                            "files": eng._autopilot().files(slug)})
+        elif path == "/api/changes":
+            self.send_json({"changes": eng.project_changes(arg("slug"))})
         elif path == "/api/agents":
             keys = ("name", "role", "skills", "model", "path", "web",
                     "library", "source")
@@ -294,6 +382,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        why = self.refused()
+        if why:
+            self.send_json({"error": why}, 403)
+            return
         url = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         if url.path == "/api/stt":  # raw audio, not JSON
@@ -383,6 +475,9 @@ class Handler(BaseHTTPRequestHandler):
                 via="ui")
             self.send_json({"ok": True, done["answer"]: done["task"],
                             **done})
+        elif path == "/api/open":
+            self.send_json({"ok": True, "say": eng.open_path(
+                text("slug").lower(), text("path"), text("how") or "folder")})
         elif path == "/api/garage":
             action, role = text("action"), text("role")
             if action == "scan":

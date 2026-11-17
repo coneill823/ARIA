@@ -82,23 +82,29 @@ export function makeComposer({ placeholder, hint = true } = {}) {
 function parse(loc = location) {
   const view = Object.keys(PATHS).find(v => PATHS[v] === loc.pathname) || 'chat';
   const q = new URLSearchParams(loc.search);
-  return { view, slug: q.get('p') || '', tab: q.get('tab') || '' };
+  return { view, slug: q.get('p') || '', tab: q.get('tab') || '',
+           file: q.get('f') || '' };
 }
 
-export function go({ view, slug = '', tab = '' }, { replace = false } = {}) {
+// `quiet`: only the address changes (a view that has already drawn the
+// new state itself, e.g. picking a file, keeps the URL shareable without
+// reloading everything).
+export function go({ view, slug = '', tab = '', file = '' },
+                   { replace = false, quiet = false } = {}) {
   if (!VIEWS[view]) view = 'chat';
   const q = new URLSearchParams();
   if (view === 'projects') {
     if (slug) q.set('p', slug);
     if (tab) q.set('tab', tab);
+    if (file && tab === 'files') q.set('f', file);
   }
   const url = PATHS[view] + (q.toString() ? '?' + q : '');
   if (url !== location.pathname + location.search)
     history[replace ? 'replaceState' : 'pushState'](null, '', url);
-  show({ view, slug, tab });
+  if (!quiet) show({ view, slug, tab, file });
 }
 
-function show({ view, slug, tab }) {
+function show({ view, slug, tab, file }) {
   if (current && current !== view) VIEWS[current].hide?.();
   for (const v of Object.keys(VIEWS))
     $('#view-' + v).hidden = v !== view;
@@ -107,7 +113,7 @@ function show({ view, slug, tab }) {
   $('#dock').hidden = view === 'chat' || view === 'orb';
   document.title = TITLES[view];
   current = view;
-  VIEWS[view].show({ slug, tab });
+  VIEWS[view].show({ slug, tab, file });
 }
 
 addEventListener('popstate', () => show(parse()));
@@ -115,7 +121,8 @@ document.addEventListener('click', e => {
   const a = e.target.closest('a[data-view]');
   if (!a || e.metaKey || e.ctrlKey || e.shiftKey) return;
   e.preventDefault();
-  go({ view: a.dataset.view, slug: a.dataset.slug || '', tab: a.dataset.tab || '' });
+  go({ view: a.dataset.view, slug: a.dataset.slug || '', tab: a.dataset.tab || '',
+       file: a.dataset.file || '' });
 });
 bus.on('nav', target => go(target));
 

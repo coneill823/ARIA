@@ -5,7 +5,8 @@
 #   aria triage                classify the inbox
 #   aria develop [slug]        ideas -> researched, proposed plans
 #   aria auto                  triage, then develop new projects (idea -> plan)
-#   aria projects              every project and what autopilot is doing
+#   aria projects              every project, where it lives, what she is doing
+#   aria open <slug> [folder|editor|terminal]   open a project on your desktop
 #   aria approve <slug>        THE HUMAN GATE: approve a proposed plan
 #   aria adopt <repo|folder> "goal"   put an existing codebase under autopilot
 #   aria autopilot <slug> start|stop|status|run|steer "guidance"
@@ -172,7 +173,7 @@ DESKTOP
     exec python3 "$ARIA_ROOT/bin/aria-test" "$@"
     ;;
 
-  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger|models)
+  agent|mission|missions|projects|approve|adopt|autopilot|plan|search|fetch|brain|github|trigger|models|open)
     exec python3 "$ARIA_ROOT/bin/aria-do" "$cmd" "$@"
     ;;
 

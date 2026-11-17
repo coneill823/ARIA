@@ -201,6 +201,15 @@ aria:
   # cut off — a giant can take an hour to produce its first token.
   autopilot_idle_minutes: 30
 
+  # ---- your desktop ---------------------------------------------------
+  # The Files tab's "Open in editor" and "Terminal here". Empty = the
+  # first one found on this machine (code, zed, kate, …; konsole,
+  # gnome-terminal, kitty, …). Set a command to choose: `editor: code`
+  # (the file or folder is added at the end), `terminal: konsole --workdir`
+  # (the folder follows a trailing option, or goes where you write {dir}).
+  editor:
+  terminal:
+
   # ---- the Obsidian brain -------------------------------------------
   # With obsidian_vault set (above), she writes into <vault>/ARIA/ only:
   # project hubs, notes you dictate ("note to brain: …"), research she

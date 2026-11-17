@@ -355,6 +355,7 @@ def main():
                  ("approve t2 in a project that does not exist", "no-project"),
                  ("how is your day going", None),
                  ("what is triage, exactly?", None),
+                 ("where is the nearest pizza place", None),
                  ("tell me a joke", None)]
         for text, want in cases:
             got = (eng.detect_intent(text) or {}).get("action")
@@ -918,6 +919,24 @@ def main():
         assert "## Earlier runs" in report and "## Files touched" in report
         status = (proj / "STATUS.md").read_text()
         assert "Complete" in status
+        view = ap.view(slug)
+        assert [r["run"] for r in view["reports"]] == [2, 1], view["reports"]
+        # the files a report names are links, and each one leads somewhere
+        import re as _re
+        for doc in [proj / "autopilot" / "FINAL-REPORT.md"] + reports:
+            links = _re.findall(r"\]\((\.\.?/[^)\s]+)\)", doc.read_text())
+            for link in links:
+                target = (doc.parent / urllib.parse.unquote(link)).resolve()
+                assert target.is_file(), f"{doc.name}: dead link {link}"
+        assert "](../src/" in report or "](../README.md)" in report, \
+            "the report does not link to the files it names"
+        listed = {f["path"]: f for f in ap.files(slug)}
+        assert "README.md" in listed and any(
+            f.get("by") for f in listed.values()), \
+            "the file list does not say which task last changed a file"
+        assert any(f["record"] for f in listed.values())
+        where = eng.perform(eng.detect_intent(f"where is {slug}"))
+        assert where["where"] == str(proj) and str(proj) in where["say"], where
         return (f"resumed as run 2 and ran to completion: "
                 f"{st['stats']['done']} tasks over {st['iteration']} "
                 "iterations, memory rewritten each batch, both reports kept")
@@ -980,6 +999,35 @@ def main():
         return ("an outage was waited out with back-off; code that did not "
                 "parse was rolled back, retried with the error, then kept")
     check("autopilot — failures handled", c_autopilot_rejects)
+
+    def c_history():
+        """Finished work leaves the board after a while; it must not leave
+        the record. Tasks carry how long they really took."""
+        if not MOCK:
+            raise SkipTest("needs --mock (runs a whole project)")
+        slug = "selftest-history"
+        keep, ap.KEEP_FINISHED = ap.KEEP_FINISHED, 3
+        try:
+            proj = started_project(slug)
+            drive(slug)
+        finally:
+            ap.KEEP_FINISHED = keep
+        view = ap.view(slug)
+        board = view["plan"]["tasks"]
+        past = view["history"]
+        assert past, "nothing was archived — the check proves nothing"
+        assert len(board) + len(past) == view["state"]["stats"]["done"], \
+            "a finished task is on neither the board nor in the history"
+        assert all(t["status"] == "done" and "took" in t and t["title"]
+                   for t in past), past[:1]
+        assert all("took" in t for t in board if t["status"] == "done"), \
+            "a finished task on the board has no measured time"
+        assert "pace" in view and view["changes_total"] == len(board) + len(past)
+        archive = (proj / "autopilot" / "plan-archive.jsonl").read_text()
+        assert len(archive.splitlines()) == len(past)
+        return (f"{len(past)} task(s) left the board and stayed in the "
+                f"history; every finished task carries its measured time")
+    check("autopilot — history is kept", c_history)
 
     def c_owner_gate():
         """A task the planner marks needs_human waits for the owner while
@@ -1421,6 +1469,24 @@ def main():
                     code, body = post(route, {"slug": slug, "id": "t1"})
                     assert code == 400 and "waiting on you" in body, \
                         (route, code, body[:120])
+                with urllib.request.urlopen(
+                        f"{base}/api/files?slug={slug}", timeout=15) as r:
+                    listing = json.load(r)
+                assert listing["path"] and any(
+                    f["path"] == "README.md" for f in listing["files"])
+                with urllib.request.urlopen(
+                        f"{base}/api/changes?slug={slug}", timeout=15) as r:
+                    assert json.load(r)["changes"]
+                code, body = post("/api/open", {"slug": slug, "how": "folder",
+                                                "path": "../../system"})
+                assert code == 400 and "outside the project" in body, body
+                try:
+                    urllib.request.urlopen(
+                        f"{base}/api/file/raw?slug={slug}&path=README.md",
+                        timeout=10)
+                    raise AssertionError("a non-image was served raw")
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 404
                 try:
                     urllib.request.urlopen(
                         f"{base}/api/file?slug={slug}&path=../../system/"
@@ -1434,9 +1500,32 @@ def main():
                 raise AssertionError("static route left ui/")
             except urllib.error.HTTPError as exc:
                 assert exc.code == 404
+            # only this machine's own app may call the API: not a page on
+            # another site, not another local port, not a rebound hostname
+            for headers in ({"Sec-Fetch-Site": "cross-site",
+                             "Origin": "https://evil.example"},
+                            {"Sec-Fetch-Site": "same-site",
+                             "Origin": "http://127.0.0.1:5173"},
+                            {"Origin": "http://localhost:5173"},
+                            {"Host": "evil.example"}):
+                req = urllib.request.Request(
+                    base + "/api/capture", method="POST", headers=headers,
+                    data=json.dumps({"text": "selftest foreign"}).encode())
+                try:
+                    urllib.request.urlopen(req, timeout=10)
+                    raise AssertionError(f"served a foreign request: {headers}")
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 403, (headers, exc.code)
+            assert not any("foreign" in f for f in os.listdir(
+                os.path.join(sandbox, "pipeline/00-inbox")))
+            req = urllib.request.Request(
+                base + "/api/state", headers={
+                    "Sec-Fetch-Site": "same-origin", "Origin": base})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                assert r.status == 200
             return "state, board, health, config, agents, skills, " \
-                   "projects, project view; task answers and path " \
-                   "traversal refused"
+                   "projects, project view, files; task answers, path " \
+                   "traversal and requests from other sites refused"
         check("api endpoints", c_api)
 
         def c_chat_http():

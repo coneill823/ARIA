@@ -137,6 +137,8 @@ def config():
         "giants_port": int(number("giants_port", 8090)),
         "giants_ctx": int(number("giants_ctx", 8192)),
         "giants_flags": find("giants_flags", "").split(" #")[0].strip(),
+        "editor": find("editor", "").split(" #")[0].strip(),
+        "terminal": find("terminal", "").split(" #")[0].strip(),
     }
 
 
@@ -1184,7 +1186,7 @@ def brain_sync_project(slug):
         f = _project_doc(proj, name)
         if f:
             docs.append((name, f.read_text(encoding="utf-8"), False))
-    auto = proj / "autopilot"
+    auto = _auto_dir(slug, create=False)
     for name, fname, limit in (("assessment", "ASSESSMENT.md", 40000),
                                ("memory", "MEMORY.md", 40000),
                                ("changelog", "CHANGELOG.md", 80000),
@@ -1192,6 +1194,14 @@ def brain_sync_project(slug):
         f = auto / fname
         if f.is_file():
             text = f.read_text(encoding="utf-8")
+            if name == "final-report":
+                # its file links are relative to where it sits in the
+                # project; in the vault they must point back there
+                text = re.sub(
+                    r"\]\((\.\.?)/([^)\s]+)\)",
+                    lambda m: "](" + (proj.resolve() if m.group(1) == ".."
+                                      else auto.resolve()).as_uri()
+                    + "/" + m.group(2) + ")", text)
             docs.append((name, text[-limit:] if name == "changelog"
                          else text[:limit], True))
     state = {}
@@ -1485,6 +1495,24 @@ INTENT_CHANGES = re.compile(
     r"(?:do|change|build)(?: (?:in|on|to|for))?|(?:show (?:me )?)?(?:the )?"
     r"(?:changes|changelog|final report|report) (?:in|on|for|of))\s+(.+?)"
     r"\s*\??\s*$", re.I)
+# "where is the meal planner", "where are the files for …", "where does
+# … live" — the answer is a path and a link, not a guess
+INTENT_WHERE = re.compile(
+    r"^\s*where(?:'s|\s+is|\s+are|\s+does|\s+do|\s+did you (?:put|save))"
+    r"\s+(.+?)\s*\??\s*$", re.I)
+_WHERE_FILLER = re.compile(
+    r"\b(?:the|my|code|files?|folder|directory|project|source|for|of|in|"
+    r"from|stored|saved|kept|located|live|lives|living|at|is|are|it)\b", re.I)
+# "open the folder for …", "open … in my editor", "open a terminal in …"
+INTENT_DESKTOP = re.compile(
+    r"^\s*(?:open|show|launch|start)\s+(?:me\s+)?(?:"
+    r"(?:the\s+)?(?P<f1>folder|directory|file manager)\s+(?:for|of)\s+"
+    r"(?P<p1>.+?)"
+    r"|(?:a\s+|the\s+)?(?P<t1>terminal|shell|console)\s+(?:in|for|at)\s+"
+    r"(?P<p2>.+?)"
+    r"|(?P<p3>.+?)\s+in\s+(?:my\s+|the\s+|a\s+)?(?P<h3>file manager|"
+    r"files app|editor|vs ?code|code|kate|zed|terminal|shell|console))"
+    r"\s*$", re.I)
 INTENT_NAVIGATE = re.compile(
     r"^\s*(?:open|show(?: me)?|go to|take me to|switch to|bring up)\s+"
     r"(?:the\s+)?(.+?)(?:\s+(?:page|tab|view|screen))?\s*$", re.I)
@@ -1527,6 +1555,8 @@ VIEWS = {"chat": "chat", "conversation": "chat", "home": "chat",
          "settings": "settings", "preferences": "settings"}
 PROJECT_TABS = {"gantt": "gantt", "gantt chart": "gantt", "timeline": "gantt",
                 "kanban": "kanban", "task board": "kanban", "board": "kanban",
+                "files": "files", "file": "files", "code": "files",
+                "source": "files", "source code": "files",
                 "changes": "changes", "changelog": "changes",
                 "report": "report", "final report": "report",
                 "live": "live", "activity": "live",
@@ -1543,6 +1573,8 @@ def command_phrases(cfg=None):
            "approve task <id> in <project>: <your decision>",
            "skip task <id> in <project>",
            "status of <project>", "what changed in <project>",
+           "where is <project>", "open the folder for <project>",
+           "open <project> in my editor",
            "ask the <agent> to <task>", "mission <agent> to <task>",
            "use skill <name>", "drop skill",
            "open <chat|projects|board|agents|orb|settings>"]
@@ -1684,6 +1716,23 @@ def detect_intent(text):
             return {"action": "status", "slug": slug}
         if re.match(r"\s*(?:status|progress)\b", text, re.I):
             return {"action": "no-project", "said": m.group(1).strip()}
+    m = INTENT_DESKTOP.match(text)
+    if m:
+        said = m.group("p1") or m.group("p2") or m.group("p3")
+        slug = match_project(said)
+        if slug:
+            what = (m.group("h3") or "").lower()
+            how = ("folder" if m.group("f1") or what in ("file manager",
+                                                         "files app")
+                   else "terminal" if m.group("t1") or what in (
+                       "terminal", "shell", "console") else "editor")
+            return {"action": "open-desktop", "slug": slug, "how": how}
+    m = INTENT_WHERE.match(text)
+    if m:
+        slug = match_project(" ".join(_WHERE_FILLER.sub(
+            " ", m.group(1)).split()))
+        if slug:
+            return {"action": "where", "slug": slug}
     m = INTENT_NAVIGATE.match(text)
     if m:
         target = _nav_target(m.group(1))
@@ -1829,9 +1878,38 @@ def perform(intent, source="chat"):
         out.update(slug=intent.get("slug", ""),
                    say=project_status_text(intent["slug"])
                    if intent.get("slug") else workspace_status_text())
+        if intent.get("slug"):
+            out["where"] = str(_project_dir(intent["slug"]))
+    elif action == "where":
+        slug = intent["slug"]
+        proj = _project_dir(slug)
+        kind = project_kind(proj)
+        out.update(slug=slug, where=str(proj), say=(
+            f"{slug.replace('-', ' ')} lives in {proj}. "
+            + ("That is its own workspace — everything I write for it goes "
+               "there." if kind != "potential" else
+               "It is still a proposal: the plan and research are there; it "
+               "gets its own workspace when you approve it.")
+            + " The Files tab on its Projects page shows every file, and "
+              "opens the folder or your editor."))
+    elif action == "open-desktop":
+        slug = intent["slug"]
+        if source in ("integration", "voice"):
+            out.update(slug=slug, say="I can only open things on your "
+                       "screen from the app itself.")
+        else:
+            try:
+                did = open_path(slug, how=intent["how"])
+                out.update(slug=slug, where=str(_project_dir(slug)),
+                           say=did[0].upper() + did[1:] + ".")
+            except ValueError as exc:
+                out.update(slug=slug, say=str(exc))
     elif action == "changes":
         out.update(slug=intent["slug"],
-                   say=project_changes_text(intent["slug"]))
+                   say=project_changes_text(intent["slug"]),
+                   files=sorted({f["path"] for r in project_changes(
+                       intent["slug"])[-12:] for f in r.get("files", [])}),
+                   where=str(_project_dir(intent["slug"])))
     elif action == "navigate":
         names = {"chat": "the chat", "projects": "Projects",
                  "board": "the pipeline board", "agents": "Agents",
@@ -2946,6 +3024,110 @@ def project_push(slug, body=""):
             "say": f"Pushed {slug}'s autopilot branch. Pull request: {pr}"}
 
 
+# ---- the owner's desktop: file manager, editor, terminal ------------------
+#
+# Only ever on a click in the app or a command in a terminal, and only for
+# a project's own folder. Files are handed to an editor, never to
+# "whatever opens this type" — a model-written .desktop or script must not
+# be launched by looking at it.
+
+EDITORS = ("code", "codium", "zed", "zeditor", "kate", "subl", "pulsar",
+           "gnome-text-editor", "gedit", "kwrite", "mousepad", "xed",
+           "pluma", "geany")
+FOLDER_EDITORS = {"code", "codium", "zed", "zeditor", "kate", "subl",
+                  "pulsar", "geany"}
+TERMINALS = (("konsole", ["--workdir", "{dir}"]),
+             ("gnome-terminal", ["--working-directory={dir}"]),
+             ("kgx", ["--working-directory={dir}"]),
+             ("ptyxis", ["--new-window", "-d", "{dir}"]),
+             ("xfce4-terminal", ["--working-directory={dir}"]),
+             ("kitty", ["--directory", "{dir}"]),
+             ("alacritty", ["--working-directory", "{dir}"]),
+             ("wezterm", ["start", "--cwd", "{dir}"]),
+             ("foot", ["--working-directory={dir}"]),
+             ("tilix", ["-w", "{dir}"]),
+             ("terminator", ["--working-directory={dir}"]),
+             ("xterm", []))
+
+
+def _which(name):
+    import shutil
+    return shutil.which(name)
+
+
+def desktop_tools(cfg=None):
+    """What can be opened from the app on this machine."""
+    cfg = cfg or config()
+    editor = cfg["editor"].split()[0] if cfg["editor"] else next(
+        (e for e in EDITORS if _which(e)), "")
+    terminal = cfg["terminal"].split()[0] if cfg["terminal"] else next(
+        (name for name, _ in TERMINALS if _which(name)), "")
+    return {"folder": bool(_which("xdg-open")), "editor": editor,
+            "terminal": terminal}
+
+
+def _spawn(argv, cwd):
+    import subprocess
+    subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def open_path(slug, path="", how="folder"):
+    """Open a project's folder in the file manager, the project (or one
+    of its files) in an editor, or a terminal in its folder. Returns what
+    was opened, in words."""
+    import shlex
+    cfg = config()
+    proj = _project_dir(slug).resolve()
+    target = (proj / path).resolve() if path else proj
+    if target != proj and proj not in target.parents:
+        raise ValueError("that path is outside the project")
+    if not target.exists():
+        raise ValueError(f"{path} is not in the project")
+    tools = desktop_tools(cfg)
+    if how == "folder":
+        folder = target if target.is_dir() else target.parent
+        if not tools["folder"]:
+            raise ValueError("no way to open a file manager here (xdg-open "
+                             f"is missing). The folder is: {folder}")
+        _spawn(["xdg-open", str(folder)], folder)
+        return f"opened {folder} in your file manager"
+    if how == "editor":
+        if not tools["editor"]:
+            raise ValueError("no editor found — set one in Settings "
+                             "(e.g. code, kate, zed). The path is: "
+                             f"{target}")
+        argv = shlex.split(cfg["editor"]) if cfg["editor"] \
+            else [tools["editor"]]
+        if target.is_dir() and argv[0] not in FOLDER_EDITORS \
+                and not cfg["editor"]:
+            raise ValueError(f"{argv[0]} opens files, not folders — pick a "
+                             "file, or set an editor that opens folders in "
+                             f"Settings. The folder is: {target}")
+        _spawn(argv + [str(target)], proj)
+        return f"opened {target.name} in {argv[0]}"
+    if how == "terminal":
+        folder = target if target.is_dir() else target.parent
+        if cfg["terminal"]:
+            # the owner's own command: "{dir}" is filled in; a trailing
+            # option ("konsole --workdir") gets the folder as its value
+            parts = shlex.split(cfg["terminal"])
+            argv = [a.replace("{dir}", str(folder)) for a in parts]
+            if argv == parts and argv[-1].startswith("-"):
+                argv.append(str(folder))
+        else:
+            hit = next(((name, args) for name, args in TERMINALS
+                        if _which(name)), None)
+            if hit is None:
+                raise ValueError("no terminal emulator found — set one in "
+                                 f"Settings. The folder is: {folder}")
+            argv = [hit[0]] + [a.format(dir=str(folder)) for a in hit[1]]
+        _spawn(argv, folder)
+        return f"opened a terminal in {folder}"
+    raise ValueError("how must be folder, editor or terminal")
+
+
 # ---- the giants (the garage lives in aria_garage) ------------------------
 
 def garage_status(probe=True):
@@ -3028,7 +3210,7 @@ _NUMBER_KEYS = {"context_tokens", "autopilot_max_tasks",
 _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "web_search_url", "web_allowlist", "github_base_branch",
               "promotion_target", "giant_general", "giant_research",
-              "giant_coder", "giants_flags"}
+              "giant_coder", "giants_flags", "editor", "terminal"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 

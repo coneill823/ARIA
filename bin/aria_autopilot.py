@@ -56,6 +56,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import aria_engine as eng
@@ -65,7 +66,9 @@ import aria_git
 MAX_ATTEMPTS = 3            # generations a task gets before it is failed
 MAX_FILE_BYTES = 400_000    # per file an agent may write
 MAX_FILES_PER_TASK = 25
-KEEP_FINISHED = 40          # finished tasks kept on the board; older archive
+# finished tasks kept on the board; older ones move to plan-archive.jsonl
+# (the Gantt and the Done column still show them)
+KEEP_FINISHED = int(os.environ.get("ARIA_BOARD_KEEP") or 40)
 LONG_TIMEOUT = 7 * 24 * 3600
 
 SKIP_DIRS = {"autopilot", ".aria", ".git", "node_modules", "__pycache__",
@@ -188,9 +191,13 @@ def _activity(slug, kind, text, **extra):
     try:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
-        if path.stat().st_size > 600_000:      # keep the feed bounded
+        if path.stat().st_size > 600_000:      # keep the live feed quick…
             lines = path.read_text(encoding="utf-8").splitlines()
-            path.write_text("\n".join(lines[len(lines) // 2:]) + "\n",
+            half = len(lines) // 2
+            with (path.parent / "activity-archive.jsonl").open(
+                    "a", encoding="utf-8") as old:   # …and lose nothing
+                old.write("\n".join(lines[:half]) + "\n")
+            path.write_text("\n".join(lines[half:]) + "\n",
                             encoding="utf-8")
     except OSError:
         pass
@@ -239,15 +246,34 @@ def _emitter(slug, emit):
 
 # ------------------------------------------------------------ project files
 
+BINARY_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf", ".zip",
+    ".gz", ".xz", ".bz2", ".7z", ".tar", ".whl", ".so", ".o", ".a", ".dll",
+    ".exe", ".bin", ".pyc", ".class", ".jar", ".woff", ".woff2", ".ttf",
+    ".otf", ".mp3", ".mp4", ".ogg", ".wav", ".webm", ".mov", ".sqlite",
+    ".db", ".gguf"}
+
+
 def _is_text(path):
-    name = path.name.lower()
-    if path.suffix.lower() in TEXT_SUFFIXES or name in (
+    """Text by its name where the name says so; otherwise by its first
+    bytes — a file type nobody listed is still readable if it reads."""
+    if path.suffix.lower() in BINARY_SUFFIXES:
+        return False
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    if b"\x00" in head:
+        return False
+    if path.suffix.lower() in TEXT_SUFFIXES or path.name.lower() in (
             "makefile", "dockerfile", "license", "readme"):
-        try:
-            return b"\x00" not in path.open("rb").read(2048)
-        except OSError:
-            return False
-    return False
+        return True
+    try:
+        head.decode("utf-8")
+        return True
+    except UnicodeDecodeError as exc:
+        return exc.start >= len(head) - 4     # only a character cut in half
 
 
 def inventory(proj, limit=200):
@@ -270,6 +296,53 @@ def inventory(proj, limit=200):
                 except OSError:
                     pass
             rows.append({"path": rel, "bytes": size, "lines": lines})
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+HIDE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+             ".pytest_cache", ".mypy_cache", ".ruff_cache", ".idea"}
+
+
+def files(slug, limit=4000):
+    """Every file in the project, for the Files view: the work and — marked
+    as such — her own records. [{path, size, lines, text, mtime, record,
+    by}] where `by` is the last task that changed the file."""
+    proj = _proj(slug)
+    auto_name = eng._auto_dir(slug, create=False).name
+    last = {}
+    for r in eng.project_changes(slug):
+        if r.get("status") == "done":
+            for f in r.get("files", []):
+                last[f["path"]] = {"task": r["task"], "title": r["title"],
+                                   "t": r.get("t", "")}
+    rows = []
+    for root, dirs, names in os.walk(proj):
+        dirs[:] = sorted(d for d in dirs if d not in HIDE_DIRS)
+        for name in sorted(names):
+            f = Path(root) / name
+            rel = f.relative_to(proj).as_posix()
+            if name in ("LOCK",) or name.endswith(".tmp"):
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            text = st.st_size < 2_000_000 and _is_text(f)
+            lines = 0
+            if text and st.st_size < 400_000:
+                try:
+                    with open(f, "rb") as fh:
+                        lines = fh.read().count(b"\n") + 1
+                except OSError:
+                    pass
+            row = {"path": rel, "size": st.st_size, "lines": lines,
+                   "text": bool(text), "mtime": int(st.st_mtime),
+                   "record": rel.startswith(auto_name + "/")}
+            if rel in last:
+                row["by"] = last[rel]
+            rows.append(row)
             if len(rows) >= limit:
                 return rows
     return rows
@@ -1532,7 +1605,7 @@ def _run_task(slug, state, plan, task, cfg, emit):
                    "feedback": f"the attempt errored: {exc}"}
         if "HTTP 404" in str(exc) or "not found" in str(exc).lower():
             task["model"] = ""                 # the assigned model is gone
-    task["seconds"] = task.get("seconds", 0) + int(time.time() - t0)
+    task["seconds"] = round(task.get("seconds", 0) + time.time() - t0, 1)
     with (auto / f"task-{task['id']}.md").open("a", encoding="utf-8") as fh:
         fh.write(f"# {task['title']} — attempt {task['attempts']}\n\n"
                  f"agent: {task['agent']} · model: "
@@ -2119,10 +2192,36 @@ def _sync_brain(slug):
         pass                              # the vault is never load-bearing
 
 
+def _flink(path):
+    """A link to a project file, from wherever the report ends up."""
+    return f"[`{path}`](@@ROOT@@/{urllib.parse.quote(path)})"
+
+
+def _alink(output):
+    """A link to one of her own records ("autopilot/task-t3.md")."""
+    rel = output.split("/", 1)[1] if "/" in output else output
+    return f"[`{output}`](@@AUTO@@/{urllib.parse.quote(rel)})"
+
+
+def place_report(report, root, auto):
+    """Resolve the report's file links for where a copy is written: `root`
+    and `auto` are the paths from that copy to the project folder and to
+    her records."""
+    return report.replace("@@ROOT@@", root).replace("@@AUTO@@", auto)
+
+
+def unlinked(report):
+    """The report with file links as plain names (for a pull request body
+    or anywhere else a relative link would lead nowhere)."""
+    return re.sub(r"\[(`[^`\n]+`)\]\(@@(?:ROOT|AUTO)@@/[^)\s]*\)", r"\1",
+                  report)
+
+
 def build_report(slug, state, reason, detail="", summary=""):
     """The final report: a complete, deterministic list of every change in
     this run — files, reasoning, references — built from the structured
-    record, never from a model's memory of it."""
+    record, never from a model's memory of it. Files are links (see
+    place_report)."""
     auto = _auto(slug)
     rows = eng.project_changes(slug)
     run = state["run"]
@@ -2146,8 +2245,11 @@ def build_report(slug, state, reason, detail="", summary=""):
            f"Run {run} {ending} at {_stamp()[:16].replace('T', ' ')}"
            + (f" — {detail}" if detail else "") + ".",
            f"Started {str(state.get('started', '?'))[:16].replace('T', ' ')}"
-           f" · iterations {state.get('run_first_iteration', 0) + 1}–"
-           f"{state['iteration']} · {len(done)} task(s) completed and "
+           + (f" · iterations {state.get('run_first_iteration', 0) + 1}–"
+              f"{state['iteration']}" if state["iteration"]
+              > state.get("run_first_iteration", 0) else
+              " · no new batch was planned")
+           + f" · {len(done)} task(s) completed and "
            f"verified, {len(failed)} failed · {created} file(s) created, "
            f"{modified} modified.", ""]
     out += ["## Summary", "", summary.strip() or (
@@ -2156,7 +2258,7 @@ def build_report(slug, state, reason, detail="", summary=""):
     look = []
     for name in ("README.md", "docs/README.md"):
         if (_proj(slug) / name).is_file():
-            look.append(f"`{name}` — the project's own front page")
+            look.append(f"{_flink(name)} — the project's own front page")
             break
     touched = {}
     for r in done:
@@ -2164,8 +2266,9 @@ def build_report(slug, state, reason, detail="", summary=""):
             touched.setdefault(f["path"], []).append(r["task"])
     for path, _tasks in sorted(touched.items(),
                                key=lambda kv: -len(kv[1]))[:5]:
-        if not any(f"`{path}`" in x for x in look) and len(look) < 5:
-            look.append(f"`{path}` — changed by {len(_tasks)} task(s)")
+        if not any(f"`{path}`" in x for x in look) and len(look) < 5 \
+                and (_proj(slug) / path).is_file():
+            look.append(f"{_flink(path)} — changed by {len(_tasks)} task(s)")
     if waiting:
         look.insert(0, f"**{len(waiting)} task(s) waiting for your "
                        "decision** — listed below; nothing that builds on "
@@ -2194,7 +2297,7 @@ def build_report(slug, state, reason, detail="", summary=""):
                 + (f", attempt {r['attempts']}" if r["attempts"] > 1 else ""))
             if r["files"]:
                 out.append("   - **Changed:** " + ", ".join(
-                    f"`{f['path']}` ({f['action']}, +{f['added']}/"
+                    f"{_flink(f['path'])} ({f['action']}, +{f['added']}/"
                     f"−{f['removed']} lines)" for f in r["files"]))
             else:
                 out.append("   - **Changed:** no files — the result is the "
@@ -2209,7 +2312,7 @@ def build_report(slug, state, reason, detail="", summary=""):
             if r.get("decision"):
                 out.append(_decision_line(r["decision"], "   - **")
                            .replace("Your decision:", "Your decision:**", 1))
-            refs = [f"`{r['output']}`"]
+            refs = [_alink(r["output"])]
             if r.get("commit"):
                 refs.append(f"commit `{r['commit']}`")
             refs += [f"[{s.get('title') or s['url']}]({s['url']})"
@@ -2236,15 +2339,15 @@ def build_report(slug, state, reason, detail="", summary=""):
         out += ["## Not completed", ""]
         out += [f"- **{r['title']}** (`{r['task']}`) — failed after "
                 f"{r['attempts']} attempt(s): {r.get('feedback') or '?'} "
-                f"(attempts kept in `{r['output']}`; nothing from them was "
-                "left in the project)" for r in failed]
+                f"(attempts kept in {_alink(r['output'])}; nothing from "
+                "them was left in the project)" for r in failed]
         out += [f"- **{d['title']}** (`{d['id']}`) — {d.get('feedback')}; "
                 "it was not attempted" for d in declined]
         out.append("")
 
     if touched:
         out += ["## Files touched", "", "| File | Tasks |", "|---|---|"]
-        out += [f"| `{p}` | {', '.join(t)} |"
+        out += [f"| {_flink(p)} | {', '.join(t)} |"
                 for p, t in sorted(touched.items())]
         out.append("")
 
@@ -2259,8 +2362,12 @@ def build_report(slug, state, reason, detail="", summary=""):
                        f"`{auto.name}/reports/`")
         out.append("")
     out += ["---", f"Complete record: `{auto.name}/changes.jsonl` · "
-            f"readable log: `{auto.name}/CHANGELOG.md` · every task's full "
-            f"output: `{auto.name}/task-<id>.md`."]
+            f"readable log: " + (_alink(auto.name + "/CHANGELOG.md")
+                                 if (auto / "CHANGELOG.md").is_file()
+                                 else f"`{auto.name}/CHANGELOG.md`")
+            + " · every "
+            f"task's full output: `{auto.name}/task-<id>.md`. The project "
+            f"lives in `{_proj(slug)}`."]
     return "\n".join(out) + "\n"
 
 
@@ -2298,8 +2405,9 @@ def _finalize(slug, emit, reason, detail=""):
     (auto / "reports").mkdir(exist_ok=True)
     stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}"
     (auto / "reports" / f"run-{state['run']:03d}-{stamp}.md").write_text(
-        report, encoding="utf-8")
-    (auto / "FINAL-REPORT.md").write_text(report, encoding="utf-8")
+        place_report(report, "../..", ".."), encoding="utf-8")
+    (auto / "FINAL-REPORT.md").write_text(
+        place_report(report, "..", "."), encoding="utf-8")
     state["status"] = reason if reason in ("stopped", "complete", "stalled",
                                            "budget") else "stopped"
     state["gate_wait"] = False
@@ -2314,8 +2422,8 @@ def _finalize(slug, emit, reason, detail=""):
     if cfg["github_access"] and aria_git.is_repo_root(_proj(slug)) \
             and aria_git.remote_url(_proj(slug)) and not state.get("git_off"):
         try:
-            pushed = eng.project_push(slug, eng.clip(report, 6000)).get(
-                "pr", "")
+            pushed = eng.project_push(
+                slug, eng.clip(unlinked(report), 6000)).get("pr", "")
         except Exception as exc:
             emit({"event": "error",
                   "log": f"{slug}: could not push to GitHub — {exc}"})
@@ -2364,9 +2472,14 @@ def _count_lines(path):
 def _brief_task(t):
     keep = ("id", "title", "status", "iteration", "agent", "model",
             "model_used", "phase", "est_hours", "seconds", "started",
-            "first_started", "finished", "depends_on", "attempts", "took",
-            "files")
-    return {k: t[k] for k in keep if k in t}
+            "first_started", "finished", "depends_on", "attempts", "files",
+            "skills", "why", "detail", "done_when", "feedback", "decision",
+            "research")
+    row = {k: t[k] for k in keep if k in t}
+    row.setdefault("depends_on", [])
+    row["took"] = t.get("seconds", 0)
+    row["archived"] = True
+    return row
 
 
 def _ts(stamp):
@@ -2398,8 +2511,8 @@ def _timings(tasks, archived, state):
     overall = median(ratios)
     for t in tasks:
         size = max(0.25, float(t.get("est_hours") or 1))
-        if t.get("seconds") and t["status"] in ("done", "failed", "skipped"):
-            t["took"] = t["seconds"]
+        if "seconds" in t and t["status"] in ("done", "failed", "skipped"):
+            t["took"] = t["seconds"]          # measured, however short
             continue
         model_r = median(by_model.get(t.get("model") or "", []))
         rate = model_r if len(by_model.get(t.get("model") or "", [])) >= 3 \
@@ -2444,7 +2557,7 @@ def view(slug):
 
     plan = _with_decisions(_plan(slug), auto) \
         if (auto / "plan.json").is_file() else {"tasks": []}
-    _timings(plan["tasks"], _archived(auto), state)
+    pace = _timings(plan["tasks"], _archived(auto), state)
     held = _held(plan)
     for t in plan["tasks"]:
         t["held"] = t["id"] in held and not t.get("needs_human")
@@ -2473,6 +2586,9 @@ def view(slug):
         "report": text("FINAL-REPORT.md"),
         "reports": reports(slug),
         "history": [_brief_task(t) for t in _archived(auto)],
+        # measured seconds of work per unit of the planner's size estimate
+        # (0 until a task has finished): what predictions are scaled by
+        "pace": pace,
         "changes": eng.project_changes(slug, limit=300),
         "changes_total": _count_lines(auto / "changes.jsonl"),
         "activity": activity(slug) if auto.is_dir() else [],

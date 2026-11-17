@@ -126,6 +126,11 @@ export async function submit(text) {
   reply.pending = false;
   reply.status = '';
   if (action && action.action === 'needs-approval') reply.approve = action.slug;
+  if (action && action.slug && action.where) {
+    // a reply about a project: where it lives, and its files as links
+    reply.project = { slug: action.slug, where: action.where,
+                      files: (action.files || []).slice(0, 12) };
+  }
   bus.emit('talk:update', reply);
   save();
   talk.busy = false;

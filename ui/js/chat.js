@@ -47,6 +47,21 @@ function gateBlock(msg) {
       onclick: e => { e.target.closest('.gate').remove(); msg.approve = null; approveFromChat(slug, true); } }));
 }
 
+// A reply about a project carries where it lives and the files it
+// mentions — each a link into the Files tab, so "go and look at X" is one
+// click.
+function projectBlock(msg) {
+  const p = msg.project;
+  if (!p) return null;
+  const to = (file, text, cls) => h('a', { class: cls, text,
+    href: '/projects?p=' + p.slug + '&tab=files' + (file ? '&f=' + encodeURIComponent(file) : ''),
+    dataset: { view: 'projects', slug: p.slug, tab: 'files', file: file || '' } });
+  return h('div', { class: 'sources files' },
+    h('div', { class: 's-h' }, 'Files', to('', 'browse them all', 'btn small')),
+    h('div', { class: 'where' }, '📁 ', h('code', { text: p.where })),
+    (p.files || []).map(f => to(f, f, 'filelink')));
+}
+
 function draw(msg) {
   let node = nodes.get(msg);
   const fresh = !node;
@@ -62,6 +77,7 @@ function draw(msg) {
     clear(node.children[2],
       msg.status ? h('div', { class: 'status', text: msg.status }) : null,
       msg.pending ? null : sourcesBlock(msg),
+      msg.pending ? null : projectBlock(msg),
       msg.pending ? null : gateBlock(msg));
   } else if (msg.role === 'agent') {
     node ||= h('div', { class: 'agentcard' }, h('div', { class: 'ah' }), h('div', { class: 'body' }));
