@@ -89,7 +89,7 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "giant_coder", "giants_use", "giants_loaded",
                "giants_idle_minutes", "editor", "terminal",
                "autopilot_checks", "autopilot_check_seconds",
-               "autopilot_refine")
+               "autopilot_refine", "desktop_notifications")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
 
@@ -160,6 +160,7 @@ def config_view():
         "garage": eng.garage_status(probe=False),
         "editor": cfg["editor"],
         "terminal": cfg["terminal"],
+        "desktop_notifications": cfg["desktop_notifications"],
         "autopilot_checks": cfg["autopilot_checks"],
         "autopilot_check_seconds": cfg["autopilot_check_seconds"],
         "autopilot_refine": cfg["autopilot_refine"],

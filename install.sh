@@ -13,7 +13,10 @@
 #      system/skill-sources.txt (Anthropic, ECC, …) and builds the skills
 #      pack (needs network; skipped cleanly if offline)
 #
-# Optional extras afterwards:
+# Optional extras afterwards (these need sudo, so they are yours to run):
+#   sudo pacman -S bubblewrap       # she runs each project's tests, sandboxed
+#   sudo pacman -S python-pyqt6-webengine   # a window of her own (aria app)
+#   sudo pacman -S python-pytest libnotify  # fuller tests; notifications
 #   pip install faster-whisper      # local voice input for Firefox
 #   ollama pull qwen3:30b           # bigger 'smart' tier
 #   ollama pull gpt-oss:120b        # 'deep' tier (needs ~64GB RAM)
@@ -51,4 +54,8 @@ echo "check it works: bin/aria test --mock   (seconds, no GPU needed)"
 echo "her reach:      Settings -> Internet, Obsidian brain, Git & GitHub"
 echo "voice (Firefox): pip install faster-whisper     Alexa: docs/ALEXA.md"
 echo "bigger models:  ollama pull qwen3:30b   then Settings -> smart: ollama/qwen3:30b"
+echo "giant models:   bin/aria models scan     (one role each, loaded on demand)"
+echo "worth adding:   sudo pacman -S bubblewrap python-pyqt6-webengine"
+echo "                (sandboxed tests of what she writes; a window of her own)"
+echo "what is missing: bin/aria doctor"
 echo "stop recursion: systemctl --user stop aria-auto.timer"

@@ -376,6 +376,59 @@ def cmd_reach(_args):
     lib = len(eng.list_library_agents())
     print(f"ok   {len(eng.list_agents())} core agents, {lib} library "
           f"agents, {len(eng.list_skill_names())} skills")
+    # the giants
+    roles = eng.garage_status(probe=False)["roles"]
+    for role, row in roles.items():
+        if row["state"] == "unset":
+            continue
+        print(("ok   " if row["state"] in ("stopped", "ready", "loading",
+                                           "external") else "MISS ")
+              + f"{role} giant: {row['label']} ({row['state']}"
+              + (f" — {row['error']}" if row.get("error") else "") + ")")
+    if all(r["state"] == "unset" for r in roles.values()):
+        print("note no giant models set — aria models scan")
+    elif not eng._which("llama-server") and not any(
+            (eng.ROOT / "vendor" / "llama.cpp").glob("**/llama-server")):
+        print("MISS llama-server (the giants need it) — aria llama install")
+    # running and checking code
+    ok, why = eng.checks_available(cfg)
+    if cfg["autopilot_checks"] == "off":
+        print("note running a project's tests is off (aria.autopilot_checks)")
+    elif ok:
+        print("ok   project tests run after each change — "
+              + ("unsandboxed (your setting)"
+                 if cfg["autopilot_checks"] == "direct" else "in a sandbox"))
+    else:
+        print(f"MISS project tests are NOT run — {why}")
+    import subprocess
+    if subprocess.run([sys.executable, "-c", "import pytest"],
+                      capture_output=True).returncode:
+        print("note pytest not installed for python3 — plain tests still "
+              "run (aria-minitest); for fixtures: pacman -S python-pytest")
+    # the desktop
+    tools = eng.desktop_tools(cfg)
+    print("ok   desktop: " + ", ".join(
+        f"{k} {v if isinstance(v, str) else ''}".strip()
+        for k, v in tools.items() if v) if any(tools.values())
+        else "note no file manager, editor or terminal found to open "
+             "projects with")
+    try:
+        window = subprocess.run(
+            [sys.executable, str(eng.ROOT / "bin" / "aria-app"), "--which"],
+            capture_output=True, text=True, timeout=120).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        window = ""
+    if window in ("qt", "gtk", "webview"):
+        print(f"ok   `aria app` opens a window of its own ({window})")
+    else:
+        print("note `aria app` falls back to "
+              + ("a chromeless browser window" if window == "chromium"
+                 else "a browser tab")
+              + " — for a real window: pacman -S python-pyqt6-webengine "
+                "(or: pip install PyQt6-WebEngine)")
+    if cfg["desktop_notifications"] and not eng._which("notify-send"):
+        print("note notify-send not found — no desktop notifications "
+              "(pacman -S libnotify)")
 
 
 COMMANDS = {name[4:]: fn for name, fn in globals().items()

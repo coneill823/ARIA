@@ -147,6 +147,7 @@ def config():
         "giants_flags": find("giants_flags", "").split(" #")[0].strip(),
         "editor": find("editor", "").split(" #")[0].strip(),
         "terminal": find("terminal", "").split(" #")[0].strip(),
+        "desktop_notifications": flag("desktop_notifications", "true"),
     }
 
 
@@ -3110,6 +3111,30 @@ def _which(name):
     return shutil.which(name)
 
 
+def desktop_notify(title, body=""):
+    """A notification on the owner's desktop (notify-send), for the moments
+    that want them: a task waits on their decision, a run has ended. Sent
+    by the always-on server, so it arrives with no window open. Returns
+    whether one was sent."""
+    import subprocess
+    if not config()["desktop_notifications"]:
+        return False
+    tool = _which("notify-send")
+    if not tool or not (os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+                        or os.environ.get("XDG_RUNTIME_DIR")):
+        return False
+    try:
+        subprocess.Popen(
+            [tool, "-a", "A.R.I.A.", "-i", str(ROOT / "docs" / "aria-icon.svg"),
+             " ".join(str(title).split())[:120],
+             " ".join(str(body).split())[:400]],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
 def desktop_tools(cfg=None):
     """What can be opened from the app on this machine."""
     cfg = cfg or config()
@@ -3321,7 +3346,8 @@ def project_view(slug):
 # ---------------------------------------------------------------- config edit
 
 _BOOL_KEYS = {"auto_pipeline", "web_access", "github_access",
-              "brain_journal", "autopilot_git", "autopilot_refine"}
+              "brain_journal", "autopilot_git", "autopilot_refine",
+              "desktop_notifications"}
 _CHOICE_KEYS = {
     "web_search": {"auto", "duckduckgo", "brave", "searxng", "wikipedia",
                    "none"},

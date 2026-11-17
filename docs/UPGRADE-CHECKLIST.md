@@ -4,8 +4,26 @@ Each stage is independent; stop at whichever rung suits you. Verify lines
 tell you what success looks like before moving on.
 
 ## Stage 0 — sync (2 min)
-- [ ] `cd ~/ARIA && git pull origin main`
-- [ ] `bin/aria test` → expect 21+ PASS incl. `gpu acceleration`
+- [ ] `cd ~/ARIA && git pull` (pulls the branch you are on; your own
+      `system/config.yml` edits are yours — `git stash` first if git
+      complains, `git stash pop` after)
+- [ ] `systemctl --user restart aria` — the always-on server loads the
+      new code
+- [ ] `bin/aria test --mock` → every check PASS or SKIP, in seconds
+- [ ] `bin/aria test` → the same against your models. If the only FAIL is
+      `backends reachable`, Ollama is not running:
+      `sudo systemctl enable --now ollama`
+- [ ] `bin/aria doctor` → one line per thing that is switched on, missing
+      or optional
+
+## Stage 0.5 — the three small installs that unlock the most
+- [ ] `sudo pacman -S bubblewrap` → she runs each project's tests in a
+      sandbox after every change, and a change that breaks them is rolled
+      back (without it nothing is executed, and reports say so)
+- [ ] `sudo pacman -S python-pyqt6-webengine` → `bin/aria app` opens her
+      in a window of her own instead of a browser
+- [ ] `sudo pacman -S python-pytest libnotify` → full test support for
+      Python projects; desktop notifications when she needs you
 
 ## Stage 1 — smart tier: qwen3:30b (~19GB download)
 - [ ] `ollama pull qwen3:30b`
@@ -29,22 +47,31 @@ tell you what success looks like before moving on.
       `bin/aria llama serve smart` and set **smart:** `llamacpp/qwen3-30b`
 - [ ] Only keep it if tok/s beats Ollama on your card
 
-## Stage 4 — the giant: DeepSeek 671B, then Kimi K2 1T (NVMe-streamed)
-- [ ] Check disk: `df -h ~` (need ~200GB free for DeepSeek, ~300GB for K2)
+## Stage 4 — the giants: a general model, a researcher, a coder
+- [ ] Check disk: `df -h ~` (~170GB DeepSeek-R1, ~250GB Kimi K2, ~180GB
+      Qwen3-Coder)
 - [ ] `bin/aria llama install` (if not done in stage 3)
-- [ ] On HuggingFace open `unsloth/DeepSeek-R1-GGUF` (or current V3.x),
-      pick the **UD-TQ1_0** folder, and for EACH part:
-      `bin/aria llama get <part-url>`   (resumable; rerun if interrupted)
-- [ ] `bin/aria llama serve giant vendor/models/<first-part-00001-of-N>.gguf`
-      → wait for "server is listening"; first load reads the whole file once
-- [ ] ⚙ Settings → **deep:** `llamacpp/giant` → Save
-- [ ] Overnight job: `ask the strategist to <hard question>` — expect
-      ~0.5–2 tok/s; minutes of silence before the first word is normal
-- [ ] Happy? Repeat the downloads with `unsloth/Kimi-K2-Instruct-GGUF`
-      (1T params, ~250GB+) and serve that instead
-- [ ] Keep it permanent: `bin/aria llama service giant`
+- [ ] Download every part of each model (`bin/aria llama get <part-url>`,
+      resumable — or any downloader, any folder)
+- [ ] `bin/aria models scan` → lists what it found, flags a model that is
+      still downloading, and prints one `bin/aria models use …` line per
+      model. Run those (or: ⚙ Settings → Giant models → Scan → Use)
+- [ ] `bin/aria models` → each role shows its model and "ready to load"
+- [ ] That is all. She starts the right one when a task needs it, unloads
+      the others first (one in memory at a time), and skips one that is
+      still downloading. Watch it happen: the sidebar says which giant is
+      loaded or loading; logs are in `system/garage/<role>.log`
+- [ ] Try one by hand: `bin/aria models load general` (first load: minutes)
+      then in chat `ask the strategist to <hard question>` with
+      `model: general` in `system/agents/strategist.md`
+- [ ] If you made the old per-model services, stop them — the roles
+      replace them: `systemctl --user disable --now aria-llama-deepseek
+      aria-llama-kimi aria-llama-coder`
+- [ ] Too slow for everyday tasks? That is expected (~0.5–2 words a
+      second). `giants_use: auto` leaves the choice to her per task;
+      `never` keeps them for agents you pin yourself
 - [ ] NEVER run giants through Ollama (it disables mmap → OOM); details in
-      docs/BIG-MODELS.md
+      docs/BIG-MODELS.md and docs/MODEL-GARAGE.md
 
 ## Stage 5 — finishing touches
 - [ ] `pip install faster-whisper` → voice input in Firefox (last SKIP)

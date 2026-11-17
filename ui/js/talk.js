@@ -264,7 +264,11 @@ export function toggleVoice() {
 // Chromium has the Web Speech API; elsewhere (Firefox) the audio is
 // recorded and transcribed locally by the server's faster-whisper.
 
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+// In her own window (the desktop app) the engine advertises the browser's
+// speech recognition but has no service behind it: go straight to the
+// local whisper path there.
+const SR = /ARIA-Desktop/.test(navigator.userAgent) ? null
+  : (window.SpeechRecognition || window.webkitSpeechRecognition);
 export const voiceInput = SR ? 'browser'
   : (navigator.mediaDevices && window.MediaRecorder ? 'whisper' : 'none');
 let rec = null, mediaRec = null, meterStop = null;

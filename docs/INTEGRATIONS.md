@@ -5,7 +5,7 @@ switch away, and what is documented-only (with the reason). Guiding rule:
 **every reach is something you switched on, and each has a boundary she
 cannot talk her way across** — the web but never your local network,
 GitHub but never your base branch, your vault but only her own folder,
-webhooks but only the ones you named.
+webhooks but only the ones you named, code but only its tests, in a box.
 
 ## Her reach
 
@@ -76,10 +76,53 @@ Set `obsidian_vault` (Settings → Obsidian brain) and she writes into
 
 Every note carries tags and wikilinks, so it joins your graph.
 
+### Running code
+
+Two different things, with a hard line between them.
+
+**She runs a project's tests** — after every code change, in a sandbox
+(bubblewrap): no network, the machine read-only with home folders, other
+drives and the desktop's sockets not there at all, a scratch copy of the
+project as the only writable place, a time limit. A change that breaks
+passing tests is rolled back. No bubblewrap, no execution — the report
+says "not tested by running it". `autopilot_checks: sandbox | direct |
+off`. Details: [AUTOPILOT.md](AUTOPILOT.md#she-runs-the-tests).
+
+**You run the program** — the Run tab shows the command and starts it on
+your click, in the project's folder, sandboxed to that folder where
+bubblewrap is installed. Nothing else can start one: the route answers
+only to the app's own page, chat and voice only open the tab, and
+autopilot has no way to call it.
+
+### Your desktop
+
+From the Files tab (or "open the folder for *project*", `aria open`):
+the project's folder in your file manager, the project or a file in your
+editor, a terminal in its directory — only ever a project's own folder,
+only on your click, and a file goes to an editor command, never to
+"whatever opens this type" (a model-written `.desktop` file or script is
+not launched by looking at it). She also sends a desktop notification
+when a task waits on your decision and when a run ends
+(`desktop_notifications`, needs `notify-send`).
+
+`bin/aria app` opens her in a window of her own (Qt WebEngine or
+WebKitGTK when installed; a chromeless browser window otherwise). In
+that window, links to anywhere else open in your browser and the
+microphone is granted to her own page only.
+
+### Giant models
+
+Larger-than-RAM models get a role — `general`, `research`, `coder` —
+and she starts the right `llama-server` when a task needs it, unloading
+the others first. One that is still downloading is skipped; one that
+fails to load is reported and stepped around. She only ever starts and
+stops servers she started herself. See
+**[MODEL-GARAGE.md](MODEL-GARAGE.md)**.
+
 ### Voice
 
 The app's microphone works everywhere (Chrome's built-in recognition, or
-local whisper elsewhere). For Echo devices see **[ALEXA.md](ALEXA.md)**:
+local whisper elsewhere — including her own desktop window). For Echo devices see **[ALEXA.md](ALEXA.md)**:
 a skill, a small Lambda, and `aria voice-gateway` — the one
 authenticated route a tunnel is ever pointed at.
 
@@ -136,12 +179,21 @@ that holds whatever a model says.**
 
 - She has no shell. Agents produce text and files; files land only inside
   their project, never over the approved requirements or her own records.
+  The one thing she executes is a project's own tests, inside a sandbox
+  with no network and nothing writable but a scratch copy.
+- Programs are started by you, from the Run tab — never by chat, voice
+  or autopilot.
 - The web is read-only and stops at your local network.
 - Git stays on `aria/autopilot`; nothing is forced; merging is yours.
 - The vault is written only under `ARIA/`.
 - Webhooks, backends, skills and agents are the ones you named.
-- The server binds 127.0.0.1 and has no login — never expose it. The only
-  thing built to face the internet is `aria voice-gateway`.
+- The server binds 127.0.0.1 and has no login — never expose it. It also
+  refuses what a web page could send it from your own browser: a foreign
+  Host (DNS rebinding), a request marked as coming from another site —
+  another local port included, such as a project's own web app — and a
+  POST with a foreign Origin. (`ARIA_ALLOWED_HOSTS=name,…` adds hostnames
+  if you reach it through your own private proxy.) The only thing built
+  to face the internet is `aria voice-gateway`.
 - The human gate: nothing is executed without a plan you approved, a
   task she marks as yours to decide waits for your answer, and a voice
   can give neither.

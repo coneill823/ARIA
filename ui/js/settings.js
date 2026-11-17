@@ -163,17 +163,26 @@ function render() {
       toggle('autopilot_git', 'Commit each task', 'local commits only'),
       toggle('github_access', 'GitHub', cfg.gh ? 'push the branch and keep a pull request open (gh CLI found)' : 'needs the gh CLI: install it, then run gh auth login'),
       text('github_base_branch', 'Base branch', 'Pull requests target this branch.')),
-    section('Autopilot', 'How long she keeps going on her own.',
+    section('Autopilot', 'How long she keeps going on her own, and how her work is checked.',
       choice('autopilot_after_goal', 'When the goal is met', [
         ['improve', 'keep improving until I stop her'], ['stop', 'write the report and stop']],
         'Either way the goal is audited against the requirements first.'),
+      toggle('autopilot_refine', 'Review & refine', 'when the goal is met, read the whole codebase and refine it without changing what it does'),
+      choice('autopilot_checks', 'Run the project\'s tests', [
+        ['sandbox', 'after every code change, in a sandbox'],
+        ['direct', 'after every code change, without a sandbox'],
+        ['off', 'never']],
+        (cfg.sandbox || {}).available
+          ? 'Sandbox ready (bubblewrap): no network, the machine read-only, a scratch copy of the project. A change that breaks passing tests is rejected.'
+          : 'No sandbox on this machine — ' + ((cfg.sandbox || {}).why || 'bubblewrap is missing') + '. Until there is one, “in a sandbox” means the tests are not run, and the report says so.'),
       text('autopilot_max_hours', 'Stop after (hours)', '0 = no limit. At a budget she finishes the step in flight, writes the report and pauses; resuming is a new run with a fresh budget.'),
       text('autopilot_max_tasks', 'Stop after (tasks)', '0 = no limit. Counts tasks finished in one run, verified or failed.'),
       text('autopilot_max_iterations', 'Stop after (batches)', '0 = no limit.'),
       text('autopilot_stall_limit', 'Pause when stuck after', 'Batches in a row that complete nothing before she pauses herself as stalled.')),
     section('Your desktop', 'What the Files tab opens a project with. Leave empty and she uses the first one she finds on this machine.',
       text('editor', 'Editor', (cfg.desktop || {}).editor ? 'using: ' + cfg.desktop.editor : 'none found — name the command of yours, e.g. code, zed, kate', 'code'),
-      text('terminal', 'Terminal', (cfg.desktop || {}).terminal ? 'using: ' + cfg.desktop.terminal : 'none found — e.g. konsole --workdir', 'konsole --workdir')),
+      text('terminal', 'Terminal', (cfg.desktop || {}).terminal ? 'using: ' + cfg.desktop.terminal : 'none found — e.g. konsole --workdir', 'konsole --workdir'),
+      toggle('desktop_notifications', 'Notifications', 'tell me on the desktop when a task waits on my decision and when a run ends')),
     section('Pipeline', 'What happens when an idea is captured.',
       toggle('auto_pipeline', 'Auto-pipeline', 'triage and plan every new idea straight away — your approval is still required before any work starts')),
     h('div', { class: 'savebar' },

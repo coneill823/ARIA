@@ -226,6 +226,9 @@ aria:
   # (the folder follows a trailing option, or goes where you write {dir}).
   editor:
   terminal:
+  # A notification on your desktop when a task waits on your decision and
+  # when a run ends (needs notify-send, which most desktops have).
+  desktop_notifications: true
 
   # ---- the Obsidian brain -------------------------------------------
   # With obsidian_vault set (above), she writes into <vault>/ARIA/ only:

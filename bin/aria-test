@@ -194,7 +194,9 @@ def main():
                giants_idle_minutes="0",
                # the review-and-refine pass has a check of its own
                autopilot_refine="false", autopilot_checks="sandbox",
-               autopilot_check_seconds="60", editor="", terminal="")
+               autopilot_check_seconds="60", editor="", terminal="",
+               # …and it stays off your screen
+               desktop_notifications="false")
 
     if MOCK:
         port = free_port()
@@ -1761,6 +1763,34 @@ def test_escape():
             return ("capture and navigation by chat, /api/say answers, "
                     "the gate holds over HTTP")
         check("chat API + spoken commands", c_chat_http)
+
+        def c_app_window():
+            """`aria app`: a window of her own. Where Qt WebEngine is
+            installed the window is really built (off-screen) and has to
+            show the app."""
+            app = os.path.join(sandbox, "bin", "aria-app")
+            which = subprocess.run([sys.executable, app, "--which"],
+                                   capture_output=True, text=True,
+                                   timeout=120).stdout.strip()
+            assert which in ("qt", "gtk", "webview", "chromium", "browser"), \
+                which
+            if which != "qt":
+                raise SkipTest(
+                    f"no Qt WebEngine for this python — `aria app` would "
+                    f"use: {which} (for a window of her own: pacman -S "
+                    "python-pyqt6-webengine)")
+            env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+                       ARIA_APP_SELFTEST="1", ARIA_APP_BACKEND="qt")
+            done = subprocess.run([sys.executable, app, str(port)], env=env,
+                                  capture_output=True, text=True, timeout=120)
+            lines = [ln for ln in done.stdout.splitlines()
+                     if ln.startswith("{")]
+            assert lines, f"the window reported nothing: {done.stderr[-300:]}"
+            seen = json.loads(lines[-1])
+            assert seen["loaded"] and seen["shell"] \
+                and seen["title"].startswith("A.R.I.A"), seen
+            return "a Qt window opened and showed the app shell"
+        check("desktop app window", c_app_window, required=False)
     finally:
         for p in procs:
             p.terminate()

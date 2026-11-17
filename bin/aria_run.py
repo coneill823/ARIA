@@ -41,6 +41,7 @@ COPY_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv",
              ".ruff_cache", "target", "dist", "build", ".idea", ".next",
              ".cache", "crew"}
 BIND_BACK = ("node_modules", ".venv", "venv")   # read-only into the copy
+COPY_MAX_FILE = 25_000_000      # larger files stay out of the scratch copy
 URL = re.compile(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])"
                  r"(?::\d+)?[^\s\"'<>)\]]*", re.I)
 
@@ -547,9 +548,17 @@ def _copy(proj, dest):
     """A scratch copy of the project's own files — what the checks may
     scribble on instead of the real thing."""
     def skip(folder, names):
-        return [n for n in names if n in COPY_SKIP
-                or (Path(folder) / n).is_symlink()
-                and not (Path(folder) / n).exists()]
+        out = []
+        for n in names:
+            item = Path(folder) / n
+            try:
+                if n in COPY_SKIP or (item.is_symlink() and not item.exists()) \
+                        or (item.is_file() and not item.is_symlink()
+                            and item.stat().st_size > COPY_MAX_FILE):
+                    out.append(n)             # tests do not need the big
+            except OSError:                   # data files to say pass/fail
+                out.append(n)
+        return out
     shutil.copytree(proj, dest, ignore=skip, symlinks=True)
 
 

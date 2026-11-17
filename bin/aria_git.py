@@ -21,7 +21,13 @@ from pathlib import Path
 WORK_BRANCH = "aria/autopilot"
 IGNORE_LINES = ("autopilot/state.json", "autopilot/STOP", "autopilot/LOCK",
                 "autopilot/activity.jsonl", ".env", "__pycache__/",
-                "node_modules/")
+                "node_modules/",
+                # signals, and what belongs to this machine rather than to
+                # the project's history
+                "autopilot/STEER", "autopilot/REFINE",
+                "autopilot/decision-*.json", "autopilot/run.log",
+                "autopilot/run.json", "autopilot/activity-archive.jsonl",
+                "autopilot/*.tmp")
 
 
 class GitError(RuntimeError):

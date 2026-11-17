@@ -64,6 +64,9 @@ talk to her:
 | `status of <project>` · `what are you working on` | Where things stand, in a sentence. |
 | `tell <project> to <guidance>` | Redirects her without stopping. |
 | `approve task t5 in <project>: <your decision>` · `skip task t5 in <project>` | Answers a task she marked as yours to decide. |
+| `refine <project>` | She reads the whole codebase, writes up what is worth changing, and refines it without changing what it does. |
+| `where is <project>` · `open the folder for <project>` · `open <project> in my editor` | Where the code lives — and one step to it. |
+| `run <project>` | Opens its Run tab: the command is there, and starts when you press Run. |
 | `stop working on <project>` | She finishes the step in flight and writes the final report. |
 | `what changed in <project>` | The latest verified changes. |
 | `search for <topic>` · `read <url>` | The live web, answered with sources. |
@@ -96,17 +99,21 @@ any automation:
 ```bash
 bin/aria capture "app that turns my grocery receipts into a meal planner"
 bin/aria auto                        # triage + plan everything new
-bin/aria projects                    # every project and what she is doing
+bin/aria projects                    # every project, where it lives, what she is doing
 bin/aria approve <slug>              # the human gate
-bin/aria autopilot <slug> start      # ...stop | status | steer "…" | run
+bin/aria autopilot <slug> start      # ...stop | status | steer "…" | run | refine
 bin/aria autopilot <slug> approve-task t5 "decision"   # ...or skip-task
+bin/aria open <slug> editor          # ...folder | terminal — on your desktop
+bin/aria run <slug>                  # how it is started (add a number to start it here)
+bin/aria check <slug>                # run its tests the way she does: sandboxed
+bin/aria models scan                 # your giant models: one per role, loaded on demand
 bin/aria adopt <repo|folder> "goal"  # put an existing codebase under autopilot
 bin/aria search "query"              # web search      (fetch <url> reads a page)
 bin/aria brain "text"                # a note in your Obsidian vault
 bin/aria github publish <slug>       # ...init | push | status
 bin/aria agent critic "..."          # run one agent   (mission = in the background)
 bin/aria skills list                 # the skills pack (convert / prompt too)
-bin/aria ui                          # the app on :8700     (app = own window)
+bin/aria app                         # the app in a window of her own   (ui = just the server)
 bin/aria voice-gateway               # the authenticated door for Alexa
 bin/aria install-service             # always-on: server at login + hourly pipeline
 bin/aria install-skills              # skills and specialist agents (ECC, Anthropic…)
@@ -128,11 +135,18 @@ It builds a throwaway copy (your real pipeline, projects and vault are
 never touched) and runs everything: capture, spoken commands, triage,
 develop with and without web research, the Obsidian brain, the human
 gate, promotion, a full autopilot run — plus rejected work, a model-server
-outage, stop and resume — a commit per task, a stubbed GitHub push,
-adopting a repository, the agent library, the voice gateway with simulated
-Alexa requests, and every page and endpoint of the app. `--mock` proves
-the plumbing on any machine; without it you prove your models too. The
-self-test never touches the internet. Run it after every `git pull`.
+outage, stop and resume, a task that waits on you, budgets, the review
+pass — the test sandbox (with a deliberately hostile test in it), the
+giant-model garage against stand-in servers, a commit per task, a stubbed
+GitHub push, adopting a repository, the agent library, the voice gateway
+with simulated Alexa requests, and every page and endpoint of the app.
+`--mock` proves the plumbing on any machine; without it you prove your
+models too. The self-test never touches the internet, never loads one of
+your real models, and never puts anything on your screen. Run it after
+every `git pull`.
+
+If the only failure is **backends reachable**, the model server is not
+running: `sudo systemctl enable --now ollama` (or `ollama serve`).
 
 ### Always-on mode
 
@@ -146,9 +160,23 @@ away. Pause with `systemctl --user stop aria-auto.timer`.
 ## The app
 
 ```bash
-bin/aria ui          # -> http://127.0.0.1:8700  (or: bin/aria ui 9000)
-bin/aria app         # the same thing in its own desktop window
+bin/aria app
 ```
+
+A.R.I.A. in a window of her own — her icon in the taskbar, no browser, no
+tabs. `./install.sh` puts her in your application menu. The window is only
+a face: the work is done by the always-on server, so closing it stops
+nothing. A real window needs one toolkit:
+
+```bash
+sudo pacman -S python-pyqt6-webengine
+```
+
+(GNOME: `python-gobject webkit2gtk-4.1` · Debian/Ubuntu:
+`python3-pyqt6.qtwebengine` · anywhere: `pip install PyQt6-WebEngine`.)
+Without one she opens as a chromeless browser window, or a tab —
+`bin/aria doctor` says which. `bin/aria ui` runs just the server, on
+<http://127.0.0.1:8700>.
 
 ![A.R.I.A. — chat](docs/ui-shell.png)
 
@@ -165,12 +193,16 @@ leaving.
 
 ![Projects — the task board](docs/ui-projects.png)
 
-Pick a project, approve its plan, press Start.
+Pick a project, approve its plan, press Start. The bar at the top always
+says where the project lives on your disk.
 
 - **Board** — To Do · Planning · In Progress · Reviewing · Done. Every
-  card shows the agent, model and skills the plan gave it.
-- **Gantt** — the plan as a timeline: estimates, dependencies as arrows,
-  one band per iteration.
+  card shows the agent, model and skills the plan gave it, and how long
+  it took. Older finished work folds away; "Show earlier" brings it back.
+- **Gantt** — everything the project ever planned, in measured time: a
+  finished bar is as long as the task took, and work not done yet is
+  predicted from the pace measured so far in this project. Dependencies
+  are arrows; older batches fold into one line each.
 
   ![Projects — Gantt chart](docs/ui-gantt.png)
 
@@ -179,15 +211,30 @@ Pick a project, approve its plan, press Start.
 
   ![Projects — live](docs/ui-live.png)
 
+- **Files** — the project's folder: every file, viewable, with the task
+  that last changed it. Copy path, **Open folder**, **Open in editor**,
+  **Terminal here**. Wherever she names a file — in a report, a change, a
+  chat reply — it is a link to it.
+
+  ![Projects — files](docs/ui-files.png)
+
+- **Run** — try the software yourself. How to start it is worked out from
+  what is in the folder; the command is shown and starts when *you* press
+  Run. Output streams back, a local address becomes an Open button, and
+  with bubblewrap installed it can change files only inside its own
+  folder. "Run the tests" does what she does after every change.
+
+  ![Projects — run](docs/ui-run.png)
+
 - **Brief** — the assessment she wrote before planning (what needs doing,
-  what she can do with what she has, the gaps), her working memory, and
-  your guidance.
+  what she can do with what she has, the gaps), her working memory, her
+  code review, and your guidance.
 - **Changes** — every completed task: files touched, why, how it was
-  verified, references.
+  verified, what the tests said, references.
 
   ![Projects — changes](docs/ui-changes.png)
 
-- **Report** — the final report of the last run.
+- **Report** — the final report of every run, newest first.
 
 **Steer** gives her guidance without stopping; **Stop** lets her finish
 the step in flight and write the report. A task that is yours to decide —
@@ -264,6 +311,9 @@ says. Details and reasoning: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
 | **Git** | `autopilot_git` (on) | A commit per verified task, on `aria/autopilot`, when a project is its own repository | Commit to your base branch; stage files she did not write |
 | **GitHub** | `github_access` (off) | A private repo per project, the branch pushed, a pull request kept open | Push to the base branch; force anything; merge |
 | **Obsidian** | `obsidian_vault` (unset) | Project hubs, dictated notes, saved research, a daily journal | Write outside `<vault>/ARIA/` |
+| **Running code** | `autopilot_checks` (sandbox) | The project's own tests after every change, in a sandbox; a change that breaks them is rolled back | Use the network, read your home folder or write outside a scratch copy while testing; start a program — only you do that, in the Run tab |
+| **Your desktop** | — | Open a project's folder, editor or a terminal on your click; a notification when she needs you or a run ends | Open anything but a project's own folder; hand a file to "whatever opens this type" |
+| **Giant models** | `giant_general` … (unset) | Your largest models, one role each, loaded when a task needs them and swapped so only one is in memory | Unload one mid-answer; use one that is still downloading |
 | **Alexa** | `aria voice-gateway` | Everything above, by voice, from any Echo | Approve a plan, answer a task that waits on you, or push to GitHub by voice |
 | **Webhooks** | `webhooks:` (none) | n8n flows, Home Assistant, deploy hooks — "trigger deploy-site" | Reach any URL you did not name |
 
@@ -310,12 +360,26 @@ bin/aria llama install       # optional: llama.cpp Vulkan (fastest on AMD)
 
 MoE models keep attention on the GPU and park expert weights in system
 RAM (`--n-cpu-moe` — presets in `bin/aria-llama serve smart|deep`), which
-is what makes 30B fast and ~120B possible on this hardware. For going
-further — 671B and 1T-class models streamed from NVMe at ~1 tok/s — see
-**[docs/BIG-MODELS.md](docs/BIG-MODELS.md)**. To install the whole
-model roster and assign a brain per agent — plus background **missions**
-that keep agents working with every tab closed — see
-**[docs/MODEL-GARAGE.md](docs/MODEL-GARAGE.md)**.
+is what makes 30B fast and ~120B possible on this hardware.
+
+**Giants — one role each.** Larger-than-RAM models (671B and 1T-class,
+streamed from NVMe at about a word a second) get a role: `general`,
+`research`, `coder`.
+
+```bash
+bin/aria models scan
+```
+
+finds the GGUF files you have downloaded and prints the command that
+gives each its role (or: Settings → Giant models). From then on she
+starts the right one when a task needs it and unloads the others first —
+only one is in memory at a time — runs what the loaded one can do before
+swapping, and leaves out a model that is still downloading until every
+part is there. Whether a task gets a giant is hers to judge
+(`giants_use: auto`): she is told what they cost, and keeps planning and
+reviewing on your everyday tiers. The whole setup:
+**[docs/MODEL-GARAGE.md](docs/MODEL-GARAGE.md)**; how such models run at
+all: **[docs/BIG-MODELS.md](docs/BIG-MODELS.md)**.
 
 ### Engines: local models vs Claude
 
@@ -446,6 +510,13 @@ to `pip install` or build.
    `type: unclear` with clarifying questions, and wait for you.
 4. **Only verified work stays** — a rejected attempt is rolled back; the
    approved requirements and her own records cannot be overwritten by an
-   agent.
+   agent. A change that breaks the project's own tests is a rejected
+   attempt.
 5. **She says what she cannot do** — no web access means "I can't browse",
-   not an invented answer; work she could not run is reported as unrun.
+   not an invented answer; a report opens by saying whether its changes
+   were tested by running them or not.
+6. **Code she wrote is never trusted with your machine** — her tests of it
+   run in a sandbox with no network and nothing writable but a scratch
+   copy; a program is only ever started by you.
+7. **Only this machine talks to her** — the server answers 127.0.0.1 and
+   refuses requests a web page elsewhere could send it.

@@ -35,7 +35,7 @@
 #   aria llama <cmd>           llama.cpp Vulkan helper (install|get|serve|service)
 #   aria status                pipeline dashboard        (headless Claude Code)
 #   aria ui [port]             the app (one shell, default :8700)
-#   aria app [port]            open A.R.I.A. as a desktop app window
+#   aria app [port]            open A.R.I.A. in a window of her own
 #   aria install-desktop       add A.R.I.A. to your application menu
 #   aria install-service       always-on: server at login + hourly auto-pipeline
 #   aria uninstall-service     remove the systemd user services
@@ -166,6 +166,15 @@ DESKTOP
     update-desktop-database "$APPS" 2>/dev/null || true
     echo "installed -> $APPS/aria.desktop"
     echo "A.R.I.A. is now in your application menu"
+    case "$(python3 "$ARIA_ROOT/bin/aria-app" --which 2>/dev/null)" in
+      qt|gtk|webview) echo "she opens in a window of her own" ;;
+      *) echo "note: no window toolkit found, so she opens in a browser window."
+         echo "      For a window of her own (KDE/Arch):"
+         echo "        sudo pacman -S python-pyqt6-webengine"
+         echo "      GNOME: sudo pacman -S python-gobject webkit2gtk-4.1"
+         echo "      Debian/Ubuntu: sudo apt install python3-pyqt6.qtwebengine"
+         echo "      any: pip install PyQt6-WebEngine" ;;
+    esac
     ;;
 
   install-skills)

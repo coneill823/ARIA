@@ -837,13 +837,18 @@ def _remember(state, key, title, cap=400):
                       + [norm])[-cap:]
 
 
-def _notify(cfg, text):
-    """Reach the owner through the mission-done webhook, if they named one."""
+def _notify(cfg, text, title="A.R.I.A. needs you"):
+    """Reach the owner: a notification on their desktop, and the
+    mission-done webhook if they named one."""
+    try:
+        eng.desktop_notify(title, text)
+    except Exception:
+        pass                               # a notification is never fatal
     try:
         if "mission-done" in cfg["webhooks"]:
             eng.trigger_webhook("mission-done", text)
     except Exception:
-        pass                               # a notification is never fatal
+        pass
 
 
 # ------------------------------------------------------------ the owner's gate
@@ -1628,12 +1633,14 @@ def _commit(slug, state, cfg, paths, message, emit):
     if auto.name == "autopilot":           # her records travel with the repo
         paths = list(paths) + [
             f"autopilot/{n}" for n in ("CHANGELOG.md", "changes.jsonl",
-                                       "plan.json", "MEMORY.md",
-                                       "ASSESSMENT.md", "FINAL-REPORT.md",
+                                       "plan.json", "plan-archive.jsonl",
+                                       "MEMORY.md", "ASSESSMENT.md",
+                                       "REVIEW.md", "FINAL-REPORT.md",
                                        "STEERING.md")
         ] + [p.relative_to(proj).as_posix()
              for p in list(auto.glob("task-*.md"))
-             + list(auto.glob("reports/*.md"))] + ["STATUS.md", ".gitignore"]
+             + list(auto.glob("reports/*.md"))
+             + list(auto.glob("reviews/*.md"))] + ["STATUS.md", ".gitignore"]
     try:
         if aria_git.current_branch(proj) != aria_git.WORK_BRANCH:
             aria_git.start_work_branch(proj, state.get("git_base", ""))
@@ -2890,13 +2897,12 @@ def _finalize(slug, emit, reason, detail=""):
           "log": f"{slug}: run {state['run']} {reason} — final report "
                  f"written ({auto.name}/FINAL-REPORT.md)"
                  + (f"; pull request: {pushed}" if pushed else "")})
-    try:
-        if "mission-done" in cfg["webhooks"]:
-            eng.trigger_webhook("mission-done",
-                                f"autopilot {slug} {reason}"
-                                + (f": {detail}" if detail else ""))
-    except Exception:
-        pass
+    _notify(cfg, f"autopilot {slug} {reason}"
+            + (f": {detail}" if detail else ""),
+            title={"complete": "A.R.I.A. — run complete",
+                   "stalled": "A.R.I.A. paused herself",
+                   "budget": "A.R.I.A. — budget reached",
+                   }.get(reason, "A.R.I.A. — run stopped"))
 
 
 # ------------------------------------------------------------ for the UI
