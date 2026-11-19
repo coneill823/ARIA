@@ -8,6 +8,7 @@ vendor/
 .claude/skills/
 skills/
 system/voice-token
+system/voice.log
 skills-library/
 system/garage/
 system/config.local.yml

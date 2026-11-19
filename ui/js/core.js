@@ -56,11 +56,14 @@ export const api = {
 };
 
 // POST a request whose answer is a stream of `data: {json}` events.
-export async function stream(path, body, onEvent) {
+// `signal` (an AbortSignal) lets the caller stop waiting: the request ends
+// with an AbortError, which is passed on untouched.
+export async function stream(path, body, onEvent, signal) {
   let resp;
   try {
-    resp = await fetch(path, { method: 'POST', body: JSON.stringify(body) });
-  } catch {
+    resp = await fetch(path, { method: 'POST', body: JSON.stringify(body), signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
     throw new Error("can't reach the A.R.I.A. server");
   }
   if (!resp.ok || !resp.body) {

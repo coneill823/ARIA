@@ -15,6 +15,10 @@ It is a test double, not a model: the "work" it produces is filler.
 Steering the mock from a test: put a marker in a task title —
   [fail]         the reviewer always rejects it
   [flaky]        rejected on the first attempt, accepted on the second
+  [stubborn]     rejected on the first two attempts, accepted on the third
+— or in a chat message —
+  [slow]         the answer starts only after MOCK_SLOW_SECONDS (default 6),
+                 like a model that is busy with something else
   [syntaxerror]  the first attempt writes Python that does not parse
 Environment:
   MOCK_BATCHES   how many build batches the planner offers (default 2)
@@ -23,7 +27,11 @@ Environment:
                  one that depends on it ("all": every task of that batch
                  is marked, the way an over-cautious model plans)
   MOCK_REPEAT    the second batch proposes the first batch's work again
+  MOCK_HARD      the planner marks one first-batch task as "hard"
+  MOCK_NO_ROADMAP  the planner cannot produce a roadmap (answers nonsense)
+  MOCK_NO_REACHED  the planner never reports a milestone as reached
   MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
+  MOCK_LOADED    comma-separated models Ollama "has in memory" (/api/ps)
   MOCK_LOAD_SECONDS  /health answers 503 "Loading model" this long after
                  start, like llama-server loading a giant
   MOCK_REFINE_BREAKS  the first attempt at a refinement changes what the
@@ -39,7 +47,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODELS = [("llama3.1:8b", 4_900_000_000), ("qwen3:30b", 18_000_000_000),
           ("mock-coder:14b", 9_000_000_000)]
-STATE = {"plans": {}, "attempts": {}, "audits": {}, "calls": []}
+STATE = {"plans": {}, "attempts": {}, "audits": {}, "calls": [],
+         # MOCK_LOADED: the models "in memory", as Ollama's /api/ps reports
+         "loaded": [n for n in os.environ.get("MOCK_LOADED", "").split(",")
+                    if n], "released": []}
 DELAY = float(os.environ.get("MOCK_DELAY", "0") or 0)
 BATCHES = int(os.environ.get("MOCK_BATCHES", "2") or 2)
 LOAD_SECONDS = float(os.environ.get("MOCK_LOAD_SECONDS", "0") or 0)
@@ -306,7 +317,48 @@ def plan_batch(prompt):
             "agent": "planner", "skills": [], "model": "", "phase": "design",
             "est_hours": 1, "depends_on": [], "reads": [], "research": False,
             "done_when": "docs/design.md exists"})
-    return {"tasks": tasks, "project_complete": False}
+    if os.environ.get("MOCK_HARD") and n == 0:
+        tasks[2]["hard"] = True         # the tests: "an ordinary model slips"
+    # every task names its milestone, by the ids the ROADMAP section shows
+    ids = re.findall(r"^[✓▶○–] (m\d+) ", prompt, re.M)
+    place = {"a": 0, "b": 1, "c": 1, "d": 3, "e": 2, "f": 3, "r": 0}
+    for t in tasks:
+        at = place.get(t["id"])
+        if ids and at is not None:
+            t["milestone"] = ids[min(at, len(ids) - 1)]
+    reached = ids[:2] if n >= 1 and not os.environ.get("MOCK_NO_REACHED") \
+        else []
+    return {"reached": reached, "tasks": tasks, "project_complete": False}
+
+
+def roadmap(prompt):
+    """The road for the mock's little project: four outcomes, the last two
+    both hanging on the core."""
+    if os.environ.get("MOCK_NO_ROADMAP"):
+        return {"milestones": "I would rather not"}
+    road = [
+        {"id": "a", "title": "A design the build can follow",
+         "outcome": "docs/design.md fixes inputs, outputs and layout",
+         "depends_on": [], "est_tasks": 1},
+        {"id": "b", "title": "A working, tested core",
+         "outcome": "src/core.py runs and tests/test_core.py passes",
+         "depends_on": ["a"], "est_tasks": 2},
+        {"id": "c", "title": "Usable from the command line",
+         "outcome": "src/cli.py starts the tool",
+         "depends_on": ["b"], "est_tasks": 2},
+        {"id": "d", "title": "Documented for its user",
+         "outcome": "README.md says what it is and how to run it",
+         "depends_on": ["b", "c"], "est_tasks": 2},
+    ]
+    done = re.search(r"ALREADY REACHED[^\n]*\n((?:- .*\n?)+)", prompt)
+    have = {ln[2:].strip() for ln in (done.group(1) if done else "")
+            .splitlines()}
+    road = [m for m in road if m["title"] not in have]
+    if "AN AUDIT FOUND THESE GAPS" in prompt:
+        road.append({"id": "g", "title": "The audit's gaps closed",
+                     "outcome": "what the audit listed exists",
+                     "depends_on": [], "est_tasks": 1})
+    return {"milestones": road}
 
 
 def review(prompt):
@@ -412,6 +464,8 @@ def verdict(prompt):
                                            "criterion (mock: always fails)"}
     if "[flaky]" in title and n == 1:
         return {"pass": False, "feedback": "the usage example is missing"}
+    if "[stubborn]" in title and n <= 2:
+        return {"pass": False, "feedback": "the edge cases are not handled"}
     return {"pass": True, "feedback": "meets the done-when criterion"}
 
 
@@ -446,6 +500,8 @@ def reply_for(system, prompt):
         return json.dumps({"queries": [" ".join(words) or "idea prior art"]})
     if "lead planner, about to run a project autonomously" in s:
         return assessment(p)
+    if "Lay out the WHOLE road" in s:
+        return json.dumps(roadmap(p))
     if "You are the project planner inside A.R.I.A." in s:
         return json.dumps(plan_batch(p))
     if "verification judge" in s:
@@ -473,6 +529,8 @@ def reply_for(system, prompt):
             or p.startswith("Using the live web research"):
         return research(p)
     if "You are A.R.I.A. (Autonomous Reasoning" in s:
+        if "[slow]" in p:               # a model that is busy elsewhere
+            time.sleep(float(os.environ.get("MOCK_SLOW_SECONDS") or 6))
         return "All systems are operational and I'm ready when you are."
     if "specialist agent inside A.R.I.A." in s:
         return ("Here is my finished work on that. The main point stands "
@@ -506,10 +564,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/tags":
             self._json({"models": [{"name": n, "size": s}
                                    for n, s in MODELS]})
+        elif self.path == "/api/ps":     # what Ollama has in memory now
+            self._json({"models": [{"name": n} for n in STATE["loaded"]]})
         elif self.path == "/v1/models":
             self._json({"data": [{"id": n} for n, _ in MODELS]})
         elif self.path == "/mock/calls":
-            self._json({"calls": STATE["calls"][-200:]})
+            self._json({"calls": STATE["calls"][-200:],
+                        "released": STATE["released"],
+                        "loaded": STATE["loaded"]})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -521,6 +583,12 @@ class Handler(BaseHTTPRequestHandler):
                 STATE[key].clear()
             STATE["calls"].clear()
             return self._json({"ok": True})
+        if self.path == "/api/generate":  # keep_alive 0: "let go of it"
+            name = body.get("model", "")
+            if body.get("keep_alive") == 0 and name in STATE["loaded"]:
+                STATE["loaded"].remove(name)
+                STATE["released"].append(name)
+            return self._json({"done": True})
         messages = body.get("messages") or []
         system = " ".join(m.get("content", "") for m in messages
                           if m.get("role") == "system")

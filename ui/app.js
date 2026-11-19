@@ -5,27 +5,38 @@
 
 import { $, $$, h, clear, api, bus, title, toast } from './js/core.js';
 import { talk, submit, newChat, openChat, deleteChat, toggleVoice,
-         toggleListening, voiceInput } from './js/talk.js';
+         toggleListening, speechIn, speechOut, stopReply } from './js/talk.js';
 import * as chat from './js/chat.js';
 import * as projects from './js/projects.js';
 import * as board from './js/board.js';
 import * as agents from './js/agents.js';
-import * as orb from './js/orb.js';
 import * as settings from './js/settings.js';
 
-const VIEWS = { chat, projects, board, agents, orb, settings };
+// (The orb is no longer a page of its own: it lives behind the chat.)
+const VIEWS = { chat, projects, board, agents, settings };
 const PATHS = { chat: '/', projects: '/projects', board: '/board',
-                agents: '/agents', orb: '/orb', settings: '/settings' };
+                agents: '/agents', settings: '/settings' };
 const TITLES = { chat: 'A.R.I.A.', projects: 'A.R.I.A. — Projects',
                  board: 'A.R.I.A. — Pipeline', agents: 'A.R.I.A. — Agents',
-                 orb: 'A.R.I.A. — Orb', settings: 'A.R.I.A. — Settings' };
+                 settings: 'A.R.I.A. — Settings' };
 let current = null;
 export let appState = null;
 
 // ------------------------------------------------------------- composer
 
-// One composer, three homes (chat, orb, dock). Each instance reflects the
-// same shared state: busy, listening, voice on/off, the loaded skill.
+// One composer, two homes (chat, dock). Each instance reflects the same
+// shared state: busy, listening, voice on/off, the loaded skill.
+const MIC_SAYS = {
+  local: 'speak to her — recognised on this machine; she stops listening when you pause',
+  browser: 'speak to her — recognised by this browser\'s speech service',
+  missing: 'she cannot listen on this machine yet — click for how to fix it',
+  none: 'this window cannot record from a microphone',
+};
+const VOICE_SAYS = {
+  local: 'spoken replies, in her own voice (made on this machine)',
+  browser: 'spoken replies, in this browser\'s voice',
+  none: 'she has no voice on this machine yet — Settings → Voice',
+};
 export function makeComposer({ placeholder, hint = true } = {}) {
   const input = h('textarea', { rows: 1, placeholder: placeholder ||
     'Message A.R.I.A…  (“capture …”, “work on <project>”, “search for …”, “status”)' });
@@ -43,7 +54,8 @@ export function makeComposer({ placeholder, hint = true } = {}) {
     input.style.height = 'auto';
     submit(v);
   };
-  send.onclick = fire;
+  // while she is answering, the same button stops the wait
+  send.onclick = () => (talk.busy ? stopReply() : fire());
   input.addEventListener('input', () => {
     input.style.height = 'auto';
     input.style.height = input.scrollHeight + 'px';
@@ -51,18 +63,22 @@ export function makeComposer({ placeholder, hint = true } = {}) {
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); fire(); }
   });
-  if (voiceInput === 'none') {
-    mic.disabled = true;
-    mic.title = 'no microphone access in this browser';
-  }
   const sync = () => {
-    send.disabled = talk.busy;
+    send.textContent = talk.busy ? '■' : '↑';
+    send.title = talk.busy ? 'stop waiting for this reply' : 'send';
+    send.classList.toggle('stop', talk.busy);
+    const hears = speechIn(), speaks = speechOut();
     mic.classList.toggle('on', talk.listening);
+    mic.classList.toggle('off', hears === 'missing' || hears === 'none');
+    mic.disabled = hears === 'none';
+    mic.title = talk.listening ? 'listening — click to finish' : MIC_SAYS[hears];
     mute.textContent = talk.voiceOn ? '🔊' : '🔇';
+    mute.classList.toggle('off', talk.voiceOn && speaks === 'none');
+    mute.title = (talk.voiceOn ? VOICE_SAYS[speaks] : 'spoken replies are off') + ' — click to turn '
+      + (talk.voiceOn ? 'off' : 'on');
     clear(chips, talk.current && talk.current.skill
       ? h('span', { class: 'chip', text: 'skill: ' + talk.current.skill }) : null);
-    if (hint) hintEl.textContent = voiceInput === 'whisper'
-      ? 'voice runs locally via whisper — click 🎤, speak, click again' : '';
+    if (hint && !talk.listening) hintEl.textContent = '';
   };
   for (const ev of ['talk:busy', 'talk:listening', 'talk:voice', 'talk:skill',
                     'talk:reset'])
@@ -91,7 +107,7 @@ function parse(loc = location) {
 // reloading everything).
 export function go({ view, slug = '', tab = '', file = '' },
                    { replace = false, quiet = false } = {}) {
-  if (!VIEWS[view]) view = 'chat';
+  if (!VIEWS[view]) view = 'chat';        // also "open the orb": she is there
   const q = new URLSearchParams();
   if (view === 'projects') {
     if (slug) q.set('p', slug);
@@ -110,7 +126,7 @@ function show({ view, slug, tab, file }) {
     $('#view-' + v).hidden = v !== view;
   for (const a of $$('#nav a'))
     a.classList.toggle('here', a.dataset.view === view);
-  $('#dock').hidden = view === 'chat' || view === 'orb';
+  $('#dock').hidden = view === 'chat';
   document.title = TITLES[view];
   current = view;
   VIEWS[view].show({ slug, tab, file });
@@ -276,8 +292,8 @@ bus.on('pipeline:changed', pollBoardCount);
 })();
 
 // ------------------------------------------------------------------ dock
-// On every view except Chat and the Orb, A.R.I.A. is one line away: ask
-// or command from wherever you are; her reply floats above the dock.
+// On every view except Chat, A.R.I.A. is one line away: ask or command
+// from wherever you are; her reply floats above the dock.
 
 (function dock() {
   $('#dock-composer-slot').append(makeComposer({
@@ -287,7 +303,7 @@ bus.on('pipeline:changed', pollBoardCount);
   let timer = null, lastUser = '';
   const hide = () => { box.hidden = true; };
   const render = msg => {
-    if (current === 'chat' || current === 'orb') return;
+    if (current === 'chat') return;
     if (msg.role === 'user') { lastUser = msg.content; return; }
     if (msg.role !== 'assistant' && msg.role !== 'sys') return;
     clear(box,

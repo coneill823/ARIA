@@ -5,13 +5,23 @@
   aria voice-gateway token      print the shared secret (create it if new)
 
 A.R.I.A.'s own server has no login and must never be exposed. This is the
-only thing a tunnel should ever point at. It accepts exactly one request:
+only thing a tunnel should ever point at. It accepts exactly two requests:
 
   POST /say     X-Aria-Token: <secret>     {"text": "what are you working on"}
   ->            {"reply": "…"}
+      for anything that can send a header: a script, a phone shortcut,
+      Home Assistant, an AWS Lambda.
 
-checks the secret, and passes the text to the local server's /api/say.
-Everything else — every other path, every other method — is a 404.
+  POST /alexa/<secret>                     an Alexa skill request, as Amazon
+  ->            an Alexa response           sends it
+      so an Alexa skill's endpoint can be this machine itself — no Lambda
+      in between. The secret is part of the address you give Amazon; the
+      request must also be fresh (Alexa stamps it), and, once you have run
+      `aria alexa skill <id>`, come from your own skill.
+
+Both check the secret and pass what was said to the local server's
+/api/say. Everything else — every other path, every other method — is a
+404.
 
 What it will not do, even with the right secret: approve a plan, answer a
 task that is waiting on your decision, or push to GitHub. Those answer "do
@@ -28,10 +38,11 @@ system/voice-token (created on first run, readable only by you, ignored by
 git).
 """
 
+import datetime
 import hmac
+import importlib.util
 import json
 import os
-import secrets
 import sys
 import threading
 import time
@@ -43,13 +54,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aria_engine as eng  # noqa: E402
 
-TOKEN_FILE = eng.ROOT / "system" / "voice-token"
 UPSTREAM = os.environ.get("ARIA_URL", "http://127.0.0.1:8700").rstrip("/")
 GATED = set() if os.environ.get("ARIA_VOICE_ALLOW", "").lower() == "all" \
     else {"approve", "task-decision", "github-push"}
 MAX_TEXT = 600
 PER_MINUTE = 30
 PATIENCE = 7.0                 # Alexa gives up at about eight seconds
+FRESH = 150                    # seconds an Alexa request stays acceptable
+REFUSAL = ("That one is yours to do in the app — approving a plan, deciding "
+           "a task that waits on you and pushing to GitHub aren't things I "
+           "take by voice.")
 
 _lock = threading.Lock()
 _hits = []                     # timestamps of accepted requests
@@ -57,20 +71,53 @@ _fails = {"count": 0, "until": 0.0}
 
 
 def token():
-    value = os.environ.get("ARIA_VOICE_TOKEN", "").strip()
-    if value:
-        return value
-    if not TOKEN_FILE.is_file():
-        TOKEN_FILE.write_text(secrets.token_urlsafe(32) + "\n",
-                              encoding="utf-8")
-        os.chmod(TOKEN_FILE, 0o600)
-    return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return eng.voice_token()
+
+
+def skill():
+    """The Alexa skill logic — the same file a Lambda would run."""
+    spec = importlib.util.spec_from_file_location(
+        "aria_alexa_skill",
+        eng.ROOT / "integrations" / "alexa" / "lambda_function.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def answer(text):
+    """What she says to `text` from a voice in the room: the gate stays
+    shut, everything else goes to the local server."""
+    text = " ".join(str(text).split())[:MAX_TEXT]
+    if not text:
+        return "I didn't catch that."
+    intent = eng.detect_intent(text)
+    if intent and intent["action"] in GATED:
+        return REFUSAL
+    print(f"voice: {text[:80]!r}", flush=True)
+    return ask(text)
+
+
+def fresh(event):
+    """Is an Alexa request recent? (Amazon stamps each one; an old one is
+    a replay.)"""
+    stamp = str((event.get("request") or {}).get("timestamp") or "")
+    try:
+        sent = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - sent).total_seconds()
+    return abs(age) <= FRESH
 
 
 def ask(text):
     """Forward to the local server; never raise, never keep Alexa waiting."""
     req = urllib.request.Request(
-        UPSTREAM + "/api/say", data=json.dumps({"text": text}).encode(),
+        UPSTREAM + "/api/say",
+        # she is told how long the caller can wait, and answers "I'm busy
+        # with …" herself rather than leave the line silent
+        data=json.dumps({"text": text, "patience": PATIENCE - 2}).encode(),
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=PATIENCE) as resp:
@@ -109,13 +156,16 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_GET
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/say":
+        path = self.path.split("?")[0]
+        alexa = path.startswith("/alexa/")
+        if path != "/say" and not alexa:
             return self.reply(404, {"error": "not found"})
         now = time.time()
         with _lock:
             if _fails["until"] > now:
                 return self.reply(429, {"error": "locked — try again later"})
-        given = self.headers.get("X-Aria-Token", "")
+        given = path[len("/alexa/"):] if alexa \
+            else self.headers.get("X-Aria-Token", "")
         if not hmac.compare_digest(given.encode(), token().encode()):
             with _lock:
                 _fails["count"] += 1
@@ -130,22 +180,39 @@ class Handler(BaseHTTPRequestHandler):
             _hits.append(now)
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            if length > 4096:
+            if length > (65536 if alexa else 4096):
                 return self.reply(413, {"error": "too large"})
             body = json.loads(self.rfile.read(length) or b"{}")
-            text = " ".join(str(body.get("text", "")).split())[:MAX_TEXT]
+            if not isinstance(body, dict):
+                raise ValueError
         except (ValueError, AttributeError):
             return self.reply(400, {"error": "send JSON: {\"text\": \"…\"}"})
+        if alexa:
+            return self.alexa(body)
+        text = " ".join(str(body.get("text", "")).split())[:MAX_TEXT]
         if not text:
             return self.reply(400, {"error": "text required"})
-        intent = eng.detect_intent(text)
-        if intent and intent["action"] in GATED:
-            return self.reply(200, {"reply": (
-                "That one is yours to do in the app — approving a plan, "
-                "deciding a task that waits on you and pushing to GitHub "
-                "aren't things I take by voice.")})
-        print(f"voice: {text[:80]!r}", flush=True)
-        self.reply(200, {"reply": ask(text)})
+        self.reply(200, {"reply": answer(text)})
+
+    def alexa(self, event):
+        """An Alexa skill request, straight from Amazon."""
+        if not fresh(event):
+            return self.reply(400, {"error": "stale or unstamped request"})
+        try:
+            logic = skill()
+        except Exception as exc:        # e.g. the integrations folder is gone
+            print(f"voice: cannot load the Alexa skill logic — {exc}",
+                  flush=True)
+            return self.reply(500, {"error": "the Alexa skill logic "
+                                             "(integrations/alexa/) is missing"})
+        want = eng.config().get("alexa_skill_id", "")
+        if want and logic.skill_id_of(event) != want:
+            return self.reply(403, {"error": "not your skill"})
+        try:
+            self.reply(200, logic.handle(event, answer))
+        except Exception:
+            self.reply(200, logic.speak("Something went wrong on my side.",
+                                        end=True))
 
 
 def main():
@@ -156,9 +223,9 @@ def main():
     port = int(args[0]) if args and args[0].isdigit() else 8701
     token()                                       # create it before serving
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"A.R.I.A. voice gateway -> http://127.0.0.1:{port}/say  "
-          f"(forwards to {UPSTREAM}; secret: aria voice-gateway token)",
-          flush=True)
+    print(f"A.R.I.A. voice gateway -> http://127.0.0.1:{port}/say and "
+          f"/alexa/<secret>  (forwards to {UPSTREAM}; setting it up: "
+          "aria alexa)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

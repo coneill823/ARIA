@@ -4,18 +4,38 @@
 // own file, which updates never touch (config.yml holds the defaults).
 
 import { $, h, clear, api, bus, toast } from './core.js';
+import { sayNow } from './talk.js';
 
 let cfg = null;
 const fields = {};
-let found = null, scanning = false, garageTimer = null;
+let found = null, scanning = false, garageTimer = null, voiceTimer = null;
+const testing = {};             // role -> when its end-to-end test was asked for
 
 // ---- the giants: one GGUF model per role, swapped in on demand ----------
 
 const STATE_SAY = {
   unset: 'not set', stopped: 'ready to load', loading: 'loading…',
   ready: 'loaded', external: 'served by another llama-server',
-  incomplete: 'incomplete', failed: 'failed to load',
+  incomplete: 'incomplete', failed: 'failed to load', blocked: 'cannot start',
 };
+
+const took = s => (s < 90 ? Math.round(s) + ' s' : (s / 60).toFixed(1) + ' min');
+
+// The outcome of the last end-to-end test: the proof that this model
+// really loads and answers on this machine (or the reason it does not).
+function testLine(row) {
+  const t = row.test;
+  if (testing[row.role] && !(t && t.at * 1000 >= testing[row.role]))
+    return h('div', { class: 'hint test' }, h('span', { class: 'spin' }),
+      ' Testing: loading it, then asking it one question. This can take several minutes — the result appears here.');
+  if (!t) return null;
+  const when = new Date(t.at * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  return t.ok
+    ? h('div', { class: 'hint test ok', text: '✓ Tested ' + when + ': loaded in ' + took(t.load_seconds)
+        + ', answered in ' + took(t.seconds) + ' (' + (t.words / Math.max(t.seconds, .1)).toFixed(1)
+        + ' words a second) — “' + t.reply + '”' })
+    : h('div', { class: 'hint test bad', text: '✗ Test failed ' + when + ': ' + t.error });
+}
 
 function giantRow(row) {
   const key = 'giant_' + row.role;
@@ -29,24 +49,30 @@ function giantRow(row) {
       ? h('button', { class: 'btn small', text: row.state === 'failed' ? 'Retry' : 'Load now',
                       onclick: () => garage('load', row.role) })
       : null;
+  const test = ['stopped', 'failed', 'ready'].includes(row.state)
+    ? h('button', { class: 'btn small', text: 'Test', title: 'load it and ask it one question — proof that it works here',
+                    onclick: () => garage('test', row.role) }) : null;
   return h('div', { class: 'field giant' },
     h('label', { text: row.role }),
     input,
     h('div', { class: 'giant-state' },
       h('span', { class: 'pill ' + ({ ready: 'running', external: 'running', loading: 'waiting',
-                                       failed: 'stalled', incomplete: 'ask' }[row.state] || ''),
+                                       failed: 'stalled', blocked: 'stalled', incomplete: 'ask' }[row.state] || ''),
                   text: STATE_SAY[row.state] || row.state }),
       row.label ? h('span', { class: 'hint', text: row.label + (row.gb ? ' · ' + row.gb + ' GB' : '')
         + (row.parts > 1 ? ' · ' + row.found + ' of ' + row.parts + ' parts' : '') }) : null,
-      btn, busy ? h('span', { class: 'spin' }) : null),
-    h('div', { class: 'hint', text: 'For ' + row.says + '.' + (row.error ? ' ' + row.error : '') }));
+      btn, test, busy ? h('span', { class: 'spin' }) : null),
+    h('div', { class: 'hint', text: 'For ' + row.says + '.' + (row.error ? ' ' + row.error : '') }),
+    testLine(row));
 }
 
 async function garage(action, role) {
   try {
     await api.post('/api/garage', { action, role });
+    if (action === 'test') testing[role] = Date.now();
     toast(action === 'load' ? 'Loading the ' + role + ' giant — the first load can take several minutes.'
-                            : 'The ' + role + ' giant is unloaded.', 'good', 6000);
+        : action === 'test' ? 'Testing the ' + role + ' giant — the result will appear under it.'
+        : 'The ' + role + ' giant is unloaded.', 'good', 6000);
   } catch (e) { toast(e.message, 'bad', 8000); }
   refreshGarage();
 }
@@ -55,10 +81,79 @@ async function refreshGarage() {
   try { cfg.garage = await api.get('/api/garage'); } catch { return; }
   const host = $('#giant-rows');
   if (!host) return;
-  clear(host, Object.values(cfg.garage.roles).map(giantRow));
-  const loading = Object.values(cfg.garage.roles).some(r => r.state === 'loading');
+  const rows = Object.values(cfg.garage.roles);
+  for (const r of rows)                       // a test that has reported is over
+    if (testing[r.role] && r.test && r.test.at * 1000 >= testing[r.role]) delete testing[r.role];
+  clear(host, rows.map(giantRow));
+  const waiting = rows.some(r => r.state === 'loading') || Object.keys(testing).length;
   clearTimeout(garageTimer);
-  if (loading) garageTimer = setTimeout(refreshGarage, 3000);
+  if (waiting) garageTimer = setTimeout(refreshGarage, 3000);
+}
+
+// ---- her voice and her ears ---------------------------------------------
+
+function voiceStatus() {
+  const v = cfg.voice, t = v.tts, s = v.stt, job = v.install;
+  const line = (label, ok, textOk, why) => h('div', { class: 'vrow' },
+    h('span', { class: 'pill ' + (ok ? 'running' : 'ask'), text: label }),
+    h('span', { class: 'hint', text: ok ? textOk : why }));
+  const missing = !t.natural || !s.engine;
+  return h('div', { id: 'voice-status' },
+    line('speaking', !!t.engine, t.engine === 'piper'
+      ? 'her own voice, made on this machine (' + t.voice + ')'
+      : 'a plain synthetic voice (espeak) — set up local speech below for a natural one', t.why),
+    line('listening', !!s.engine, 'recognised on this machine (' + s.model + ' model)', s.why),
+    job.running ? h('div', { class: 'hint test' }, h('span', { class: 'spin' }), ' ' + job.step + '…') : null,
+    job.error && !job.running ? h('div', { class: 'hint test bad', text: '✗ ' + job.error }) : null,
+    missing && !job.running ? h('div', { class: 'row' },
+      h('button', { class: 'btn primary', text: 'Set up local speech', onclick: installVoice }),
+      h('span', { class: 'hint', text: 'Downloads about 700 MB into vendor/voice — a natural voice and a recogniser, in a private Python environment. Nothing is installed system-wide, and nothing you say leaves this machine.' })) : null);
+}
+
+async function installVoice() {
+  try {
+    await api.post('/api/voice', { action: 'install' });
+    toast('Setting up local speech — this takes a few minutes; progress shows here.', 'good', 7000);
+  } catch (e) { toast(e.message, 'bad', 8000); }
+  refreshVoice();
+}
+
+async function refreshVoice() {
+  try { cfg.voice = await api.get('/api/voice'); } catch { return; }
+  const host = $('#voice-status');
+  if (!host) return;
+  host.replaceWith(voiceStatus());
+  clearTimeout(voiceTimer);
+  if (cfg.voice.install.running) voiceTimer = setTimeout(refreshVoice, 2500);
+  else bus.emit('settings:changed');          // the chat learns what she has now
+}
+
+function voicePicker() {
+  const v = cfg.voice, have = new Set(v.voices);
+  const names = [...new Set([...v.voices, ...v.suggested.map(x => x.name)])];
+  const says = Object.fromEntries(v.suggested.map(x => [x.name, x.says]));
+  const current = v.tts.engine === 'piper' ? v.tts.voice : (cfg.voice_name || '');
+  const sel = h('select', {}, names.map(n => h('option', { value: n, selected: n === current,
+    text: n + (says[n] ? ' — ' + says[n] : '') + (have.has(n) ? '' : '  (download, ~65 MB)') })));
+  const use = h('button', { class: 'btn small', text: 'Use', onclick: async () => {
+    use.disabled = true;
+    toast(have.has(sel.value) ? 'Switching voice…' : 'Downloading ' + sel.value + '…', 'good', 5000);
+    try {
+      await api.post('/api/voice', { action: 'voice', voice: sel.value });
+      cfg = await api.get('/api/config');
+      render();
+      bus.emit('settings:changed');
+      setTimeout(() => sayNow('This is how I sound now.'), 400);
+    } catch (e) { toast(e.message, 'bad', 8000); use.disabled = false; }
+  } });
+  const sample = h('button', { class: 'btn small', text: '▶ Hear her',
+    onclick: () => sayNow('Good evening. All systems are operational, and I am listening.') });
+  return h('div', { class: 'field' }, h('label', { text: 'Voice' }),
+    v.set_up ? h('div', { class: 'row' }, sel, ' ', use, ' ', sample)
+             : h('div', { class: 'row' }, sample),
+    h('div', { class: 'hint', text: v.set_up
+      ? 'Voices are downloaded once and kept. Hear them all at rhasspy.github.io/piper-samples.'
+      : 'More voices become available once local speech is set up.' }));
 }
 
 async function scanModels(folder) {
@@ -143,12 +238,26 @@ function render() {
                    return [f, ' ', h('button', { class: 'btn', text: 'Scan', onclick: () => scanModels(f.value.trim()) })]; })()),
         h('div', { id: 'giant-found' })),
       choice('giants_use', 'When to use them', [
-        ['auto', 'when the work is worth the wait (the planner decides)'],
+        ['auto', 'for hard tasks, and for any task the everyday model fails twice'],
         ['always', 'always: code to coder, research to research, the rest to general'],
         ['never', 'only where I name them']],
-        'Giants answer at about 0.5–2 words a second: one task can take an hour. Planning and review stay on your fast tiers.'),
+        'Giants answer at about 0.5–2 words a second: one task can take an hour. Planning and review stay on your fast tiers. A role with no model of its own is covered by the next best giant. Every task card shows which model it runs on, and why.'),
       text('giants_loaded', 'Loaded at once', 'How many giants may be in memory together. 1 is safest on 16 GB VRAM / 64 GB RAM.'),
-      text('giants_idle_minutes', 'Unload when idle (minutes)', '0 = keep the last one loaded.')),
+      text('giants_idle_minutes', 'Unload when idle (minutes)', '0 = keep the last one loaded.'),
+      toggle('giants_free_memory', 'Free memory first', 'before a giant loads, ask Ollama to unload the everyday models so the giant gets the video memory — they load again when next needed')),
+    section('Voice', 'How she speaks and listens. In her own window there is no browser speech service to borrow, so both happen on this machine.',
+      voiceStatus(),
+      voicePicker(),
+      text('voice_speed', 'Speaking speed', '1 is natural; 0.8 slower, 1.2 quicker.'),
+      choice('voice_engine', 'Her voice comes from', [
+        ['auto', 'this machine when it has a natural voice, else the browser'],
+        ['local', 'this machine, always'],
+        ['browser', 'the browser\'s own voices']]),
+      choice('voice_input', 'She listens with', [
+        ['auto', 'this machine when it can, else the browser'],
+        ['local', 'this machine, always (nothing leaves it)'],
+        ['browser', 'the browser\'s speech service (Chrome sends audio to Google)']]),
+      text('stt_model', 'Recognition model', 'tiny, base, small or medium — bigger is more accurate and slower. base is a good start.')),
     section('Internet', 'On: “search for …” and “read <url>” work in chat and by voice, new ideas are researched on the live web, and autopilot tasks can pull in sourced material. Searches leave your machine while this is on.',
       toggle('web_access', 'Web access', cfg.web_access ? 'on — searching via ' + (cfg.web_providers.join(' → ') || 'nothing (search disabled)') : 'off — she will say plainly that she cannot browse'),
       choice('web_search', 'Search provider', [
@@ -193,8 +302,11 @@ function render() {
 }
 
 async function load() {
-  try { cfg = await api.get('/api/config'); render(); renderFound(); refreshGarage(); }
-  catch (e) { clear($('#settings-col'), h('div', { class: 'empty', text: e.message })); }
+  try {
+    cfg = await api.get('/api/config');
+    render(); renderFound(); refreshGarage();
+    if (cfg.voice.install.running) refreshVoice();
+  } catch (e) { clear($('#settings-col'), h('div', { class: 'empty', text: e.message })); }
 }
 
 async function save() {
@@ -204,6 +316,8 @@ async function save() {
                      'autopilot_max_iterations', 'giants_idle_minutes'])
     if (body[key] === '') body[key] = '0';
   if (body.giants_loaded === '') body.giants_loaded = '1';
+  if (body.voice_speed === '') body.voice_speed = '1';
+  if (!body.stt_model) delete body.stt_model;
   if (body.autopilot_stall_limit === '') delete body.autopilot_stall_limit;
   if (!body.github_base_branch) delete body.github_base_branch;
   try {
@@ -216,4 +330,4 @@ async function save() {
 
 export function init() {}
 export function show() { load(); }
-export function hide() { clearTimeout(garageTimer); }
+export function hide() { clearTimeout(garageTimer); clearTimeout(voiceTimer); }

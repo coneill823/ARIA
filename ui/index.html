@@ -21,7 +21,6 @@
     <a href="/projects" data-view="projects"><span class="ico">▣</span><span class="lbl">Projects</span><span class="pip" id="pip-projects"></span></a>
     <a href="/board" data-view="board"><span class="ico">▦</span><span class="lbl">Pipeline</span><span class="pip" id="pip-board"></span></a>
     <a href="/agents" data-view="agents"><span class="ico">⬡</span><span class="lbl">Agents</span><span class="pip" id="pip-agents"></span></a>
-    <a href="/orb" data-view="orb"><span class="ico">◉</span><span class="lbl">Orb</span></a>
     <a href="/settings" data-view="settings"><span class="ico">⚙</span><span class="lbl">Settings</span></a>
   </nav>
 
@@ -45,6 +44,9 @@
 
   <!-- ============================================================ chat -->
   <section class="view" id="view-chat" hidden>
+    <!-- her presence: the orb, behind the conversation -->
+    <canvas id="orb" aria-hidden="true"></canvas>
+    <div id="orb-state" aria-live="polite"></div>
     <div id="thread"><div id="thread-col"></div></div>
     <div class="composer-wrap" id="composer-slot"></div>
   </section>
@@ -133,21 +135,13 @@
     </div>
   </section>
 
-  <!-- ============================================================= orb -->
-  <section class="view" id="view-orb" hidden>
-    <canvas id="orb"></canvas>
-    <div id="orb-state">idle</div>
-    <div id="orb-transcript"></div>
-    <div class="composer-wrap" id="orb-composer-slot"></div>
-  </section>
-
   <!-- ======================================================== settings -->
   <section class="view" id="view-settings" hidden>
     <div class="view-body"><div id="settings-col"></div></div>
   </section>
 
-  <!-- A.R.I.A. is reachable from every view: on Chat and the Orb the
-       composer is the view itself; everywhere else it is this dock. -->
+  <!-- A.R.I.A. is reachable from every view: on Chat the composer is the
+       view itself; everywhere else it is this dock. -->
   <div id="dock" hidden>
     <div id="dock-reply" hidden></div>
     <div class="composer-wrap" id="dock-composer-slot"></div>

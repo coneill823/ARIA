@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""aria-voice-worker — her voice and her ears, kept warm.
+
+Started by aria_voice with the Python that has the speech packages: the
+private environment `aria voice install` makes (vendor/voice/venv), or the
+system's own if they are installed there. The models are loaded once and
+stay loaded, so a sentence is spoken in a fraction of a second and a clip
+is transcribed in about the time it took to say.
+
+Protocol, on stdin/stdout — one request at a time:
+
+  request   one JSON line; if it has "bytes": N, then N bytes of payload
+  response  one JSON line; if it has "bytes": N, then N bytes of payload
+
+  {"op": "hello"}
+      -> {"ok": true, "tts": bool, "stt": bool}
+  {"op": "tts", "text": "...", "voice": "/path/voice.onnx", "speed": 1.0}
+      -> {"ok": true, "bytes": N}  + a WAV file
+  {"op": "stt", "bytes": N, "model": "base", "language": "",
+   "models": "/where/the/model/is/kept"}  + audio
+      -> {"ok": true, "text": "...", "language": "en"}
+
+Audio for stt is best sent as WAV (the app converts what the microphone
+recorded to 16 kHz mono WAV itself): it is read here with the standard
+library, so no audio decoder has to be installed or to agree with the
+recogniser's version. Anything else is handed to the recogniser's own
+decoder.
+
+Everything a library prints goes to stderr; stdout carries the protocol
+and nothing else.
+"""
+
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+import wave
+
+OUT = sys.stdout.buffer
+IN = sys.stdin.buffer
+sys.stdout = sys.stderr                 # a stray print() must not break it
+
+HAVE = {"tts": bool(importlib.util.find_spec("piper")),
+        "stt": bool(importlib.util.find_spec("faster_whisper"))
+        and bool(importlib.util.find_spec("numpy"))}
+VOICES = {}                             # voice path -> loaded voice
+MODELS = {}                             # whisper model name -> loaded model
+
+
+def reply(header, payload=b""):
+    if payload:
+        header["bytes"] = len(payload)
+    OUT.write(json.dumps(header).encode() + b"\n" + payload)
+    OUT.flush()
+
+
+def tts(req):
+    from piper import PiperVoice
+    path = req["voice"]
+    voice = VOICES.get(path)
+    if voice is None:
+        VOICES.clear()                  # one voice in memory is plenty
+        voice = VOICES[path] = PiperVoice.load(path)
+    text = " ".join(str(req.get("text") or "").split())
+    if not text:
+        raise ValueError("nothing to say")
+    speed = min(2.0, max(0.5, float(req.get("speed") or 1.0)))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        if hasattr(voice, "synthesize_wav"):          # piper-tts 1.3 and up
+            config = None
+            if abs(speed - 1.0) > 0.01:
+                try:
+                    from piper import SynthesisConfig
+                    config = SynthesisConfig(length_scale=1.0 / speed)
+                except ImportError:
+                    config = None
+            if config is not None:
+                voice.synthesize_wav(text, out, syn_config=config)
+            else:
+                voice.synthesize_wav(text, out)
+        else:                                         # piper-tts 1.2
+            voice.synthesize(text, out, length_scale=1.0 / speed)
+    return {"ok": True}, buf.getvalue()
+
+
+def read_wav(data, rate=16000):
+    """A WAV file as float32 mono at `rate`, with the standard library and
+    numpy only."""
+    import numpy as np
+    with wave.open(io.BytesIO(data)) as w:
+        channels, width, native = (w.getnchannels(), w.getsampwidth(),
+                                   w.getframerate())
+        raw = w.readframes(w.getnframes())
+    if width == 2:
+        samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif width == 1:
+        samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                   - 128.0) / 128.0
+    elif width == 4:
+        samples = np.frombuffer(raw, dtype="<i4").astype(np.float32) \
+            / 2147483648.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {width}")
+    if channels > 1:
+        samples = samples[:len(samples) // channels * channels] \
+            .reshape(-1, channels).mean(axis=1)
+    if native != rate and len(samples):
+        samples = np.interp(np.arange(0, len(samples), native / rate),
+                            np.arange(len(samples)), samples) \
+            .astype(np.float32)
+    return samples
+
+
+def stt(req, data):
+    from faster_whisper import WhisperModel
+    name = str(req.get("model") or "base")
+    model = MODELS.get(name)
+    if model is None:
+        MODELS.clear()
+        kept = str(req.get("models") or "")     # '' = the library's cache
+        if kept:
+            os.makedirs(kept, exist_ok=True)
+        model = MODELS[name] = WhisperModel(
+            name, device="cpu", compute_type="int8",
+            **({"download_root": kept} if kept else {}))
+    language = str(req.get("language") or "")[:2].lower() or None
+    tmp = None
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        audio = read_wav(data)
+        if len(audio) < 1600:                       # under a tenth of a second
+            return {"ok": True, "text": "", "language": language or ""}, b""
+    else:                               # let the recogniser decode it itself
+        fd, tmp = tempfile.mkstemp(suffix=str(req.get("suffix") or ".webm"))
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        audio = tmp
+    try:
+        try:
+            segments, info = model.transcribe(audio, language=language,
+                                              vad_filter=True)
+            text = " ".join(s.text.strip() for s in segments).strip()
+        except Exception:
+            if isinstance(audio, str):
+                raise
+            segments, info = model.transcribe(audio, language=language)
+            text = " ".join(s.text.strip() for s in segments).strip()
+    finally:
+        if tmp:
+            os.unlink(tmp)
+    return {"ok": True, "text": text,
+            "language": getattr(info, "language", "") or ""}, b""
+
+
+def main():
+    while True:
+        line = IN.readline()
+        if not line:
+            return 0
+        try:
+            req = json.loads(line)
+            data = IN.read(int(req.get("bytes") or 0)) if req.get("bytes") \
+                else b""
+        except (ValueError, TypeError):
+            reply({"ok": False, "error": "bad request"})
+            continue
+        try:
+            op = req.get("op")
+            if op == "hello":
+                reply({"ok": True, **HAVE})
+            elif op == "tts":
+                if not HAVE["tts"]:
+                    raise RuntimeError("the piper package is not installed "
+                                       "for this Python")
+                reply(*tts(req))
+            elif op == "stt":
+                if not HAVE["stt"]:
+                    raise RuntimeError("the faster-whisper package is not "
+                                       "installed for this Python")
+                reply(*stt(req, data))
+            else:
+                reply({"ok": False, "error": f"unknown op: {op}"})
+        except Exception as exc:                     # the worker stays up
+            reply({"ok": False,
+                   "error": " ".join(f"{type(exc).__name__}: {exc}".split())
+                   [:400]})
+
+
+if __name__ == "__main__":
+    sys.exit(main())

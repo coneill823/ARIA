@@ -1,19 +1,21 @@
-// The Orb: A.R.I.A. as a presence. A sphere of points that idles, listens,
-// thinks and speaks — over the same conversation as the Chat view, so
-// what you say here is there when you switch back.
+// The orb: A.R.I.A. as a presence behind the conversation. A sphere of
+// points that idles, listens, thinks and speaks. It lives in the
+// background of the Chat view — bright and centred while the chat is
+// empty or she is listening or speaking, a faint glow behind the thread
+// the rest of the time, so it never competes with what is written.
+//
+//   idle       slow cyan drift
+//   listening  green, breathes with your voice
+//   thinking   amber, fast swirl
+//   speaking   cyan, moves with hers
 
-import { $, h, clear, bus } from './core.js';
-import { talk } from './talk.js';
+import { $ } from './core.js';
+import { talk, outLevel } from './talk.js';
 
-let visible = false, started = false, transcript;
-const nodes = new WeakMap();
+let visible = false, started = false;
 
-// A sphere of dots (fibonacci lattice) rotating in 3D, projected to 2D.
-// State changes speed, colour, pulse and jitter:
-//   idle slow cyan drift · listening green, breathes with your voice
-//   thinking amber, fast swirl · speaking cyan, pulses
-function startOrb() {
-  const canvas = $('#orb'), ctx = canvas.getContext('2d');
+function start(canvas) {
+  const ctx = canvas.getContext('2d');
   const DPR = Math.min(devicePixelRatio || 1, 2);
   let W = 0, H = 0;
   const resize = () => {
@@ -22,6 +24,7 @@ function startOrb() {
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   };
   new ResizeObserver(resize).observe(canvas);
+  // a sphere of dots (fibonacci lattice) rotating in 3D, projected to 2D
   const N = 520, pts = [];
   for (let i = 0; i < N; i++) {
     const y = 1 - (i / (N - 1)) * 2, r = Math.sqrt(1 - y * y), th = i * 2.399963229728653;
@@ -38,9 +41,9 @@ function startOrb() {
     idle:      { speed: .12, color: [69, 214, 255],  pulse: .015, jitter: 0 },
     listening: { speed: .25, color: [74, 222, 128],  pulse: .05,  jitter: 0 },
     thinking:  { speed: .95, color: [251, 191, 36],  pulse: .03,  jitter: .012 },
-    speaking:  { speed: .35, color: [69, 214, 255],  pulse: .09,  jitter: .004 },
+    speaking:  { speed: .35, color: [69, 214, 255],  pulse: .04,  jitter: .004 },
   };
-  const cur = { speed: .12, pulse: .015, jitter: 0, color: [69, 214, 255] };
+  const cur = { speed: .12, pulse: .015, jitter: 0, color: [69, 214, 255], glow: 1, voice: 0 };
   let a1 = 0, a2 = 0, t = 0;
   (function frame() {
     requestAnimationFrame(frame);
@@ -50,11 +53,17 @@ function startOrb() {
     cur.pulse += (tgt.pulse - cur.pulse) * .08;
     cur.jitter += (tgt.jitter - cur.jitter) * .08;
     for (let i = 0; i < 3; i++) cur.color[i] += (tgt.color[i] - cur.color[i]) * .06;
+    // behind a conversation she is a glow; with the floor to herself — an
+    // empty chat, listening, speaking — she is fully there
+    const quiet = canvas.dataset.dim === '1' && talk.state !== 'listening' && talk.state !== 'speaking';
+    cur.glow += ((quiet ? (talk.state === 'thinking' ? .34 : .2) : 1) - cur.glow) * .06;
+    const level = talk.state === 'listening' ? talk.micLevel
+                : talk.state === 'speaking' ? outLevel() : 0;
+    cur.voice += (level - cur.voice) * .35;
     t += .016; a1 += .004 * (1 + cur.speed * 6); a2 += .0017 * (1 + cur.speed * 6);
     ctx.clearRect(0, 0, W, H);
-    const cx = W / 2, cy = H / 2 - 20;
-    const R = Math.min(W, H) * .27 * (1 + Math.sin(t * 2.1) * cur.pulse
-      + (talk.state === 'listening' ? talk.micLevel * .35 : 0));
+    const cx = W / 2, cy = H / 2 - 30;
+    const R = Math.min(W, H) * .25 * (1 + Math.sin(t * 2.1) * cur.pulse + cur.voice * .4);
     const [cr, cg, cb] = cur.color.map(Math.round);
     const s1 = Math.sin(a1), c1 = Math.cos(a1), s2 = Math.sin(a2), c2 = Math.cos(a2);
     const proj = new Array(N);
@@ -70,6 +79,7 @@ function startOrb() {
       const persp = 1.6 / (1.6 + z);
       proj[i] = { px: cx + x * R * persp, py: cy + y2 * R * persp, depth: (z + 1) / 2 };
     }
+    ctx.globalAlpha = cur.glow;
     ctx.lineWidth = .6;
     for (const [i, j] of links) {
       const a = proj[i], b = proj[j], d = (a.depth + b.depth) / 2;
@@ -92,47 +102,19 @@ function startOrb() {
     g.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = g;
     ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+    ctx.globalAlpha = 1;
   })();
 }
 
-function draw(msg) {
-  if (msg.role === 'agent') return;
-  let node = nodes.get(msg);
-  if (!node) {
-    const cls = msg.role === 'user' ? 'you' : msg.role === 'assistant' ? 'aria' : 'sys';
-    node = h('div', { class: 'omsg ' + cls },
-      cls === 'sys' ? null : h('b', { text: cls === 'you' ? 'YOU' : 'A.R.I.A.' }),
-      h('span', {}));
-    nodes.set(msg, node);
-    transcript.append(node);
-    while (transcript.children.length > 14) transcript.firstChild.remove();
-  }
-  node.lastChild.textContent = msg.content || msg.status || '…';
-  transcript.scrollTop = transcript.scrollHeight;
-}
-
-function render() {
-  clear(transcript);
-  const msgs = talk.current ? talk.current.messages.slice(-10) : [];
-  if (!msgs.length)
-    transcript.append(h('div', { class: 'omsg sys', text: 'A.R.I.A. online. Click the mic and speak, or type below.' }));
-  for (const m of msgs) { nodes.delete(m); draw(m); }
-}
-
-export function init({ makeComposer }) {
-  transcript = $('#orb-transcript');
-  $('#orb-composer-slot').append(makeComposer({
-    placeholder: 'Talk to A.R.I.A…  try “work on …”, “what are you working on”, or just chat' }));
-  bus.on('talk:reset', () => { if (visible) render(); });
-  bus.on('talk:add', msg => { if (visible) draw(msg); });
-  bus.on('talk:update', msg => { if (visible && nodes.has(msg)) draw(msg); });
-  bus.on('talk:state', s => { $('#orb-state').textContent = s; });
+// `dim`: there is a conversation on top of her.
+export function setDim(dim) {
+  const canvas = $('#orb');
+  if (canvas) canvas.dataset.dim = dim ? '1' : '0';
 }
 
 export function show() {
   visible = true;
-  if (!started) { started = true; startOrb(); }
-  render();
+  if (!started) { started = true; start($('#orb')); }
 }
 
 export function hide() { visible = false; }

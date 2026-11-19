@@ -1,13 +1,18 @@
-"""Alexa skill backend for A.R.I.A. — paste this into the skill's Lambda.
+"""Alexa skill logic for A.R.I.A.
 
-Alexa turns speech into text and hands it to this function as an intent
-plus one free-text slot. All this does is rebuild the sentence you said
-and pass it, with a shared secret, to the A.R.I.A. voice gateway on your
-own machine (bin/aria-voice-gateway, reached through your tunnel). The
-gateway's reply is what Alexa speaks.
+Alexa turns speech into text and hands it over as an intent plus one
+free-text slot. All this does is rebuild the sentence you said, pass it to
+A.R.I.A., and wrap her reply in the shape Alexa speaks.
 
-Fill in the two values below — or set them as environment variables when
-you host the Lambda in your own AWS account. No libraries needed.
+It is used in two ways:
+
+  * by A.R.I.A.'s own voice gateway (bin/aria-voice-gateway), when the
+    skill's endpoint is pointed straight at your machine — the simple
+    setup: no Lambda, nothing to paste. See docs/ALEXA.md.
+  * as an AWS Lambda (or an Alexa-hosted skill's code): paste this file in
+    and fill in the two values below — or set them as environment
+    variables. The Lambda then calls the gateway's /say with the shared
+    secret. No libraries needed.
 """
 
 import json
@@ -43,8 +48,8 @@ FIXED = {
     "DevelopIntent": "develop the plans",
 }
 HELP = ("You can say: capture, followed by an idea. Work on, followed by a "
-        "project. Status of a project. Search for something. Or ask what "
-        "I'm working on.")
+        "project. Status of a project. How far along is a project. What "
+        "needs me. Search for something. Or ask what I'm working on.")
 
 
 def speak(text, end=False):
@@ -75,10 +80,18 @@ def ask_aria(text):
                 "tunnel are running.")
 
 
-def lambda_handler(event, context):
-    app = (event.get("session", {}).get("application", {})
-           .get("applicationId", ""))
-    if SKILL_ID and app != SKILL_ID:
+def skill_id_of(event):
+    """The skill a request claims to come from."""
+    return ((event.get("session") or {}).get("application") or {}).get(
+        "applicationId") or (((event.get("context") or {}).get("System")
+                              or {}).get("application") or {}).get(
+        "applicationId") or ""
+
+
+def handle(event, ask, skill_id=""):
+    """One Alexa request in, one Alexa response out. `ask(text)` is how
+    the sentence reaches A.R.I.A. and returns her reply."""
+    if skill_id and skill_id_of(event) != skill_id:
         raise ValueError("request from an unexpected skill")
     request = event.get("request", {})
     kind = request.get("type")
@@ -96,13 +109,17 @@ def lambda_handler(event, context):
     if name == "AMAZON.HelpIntent":
         return speak(HELP)
     if name in FIXED:
-        return speak(ask_aria(FIXED[name]))
+        return speak(ask(FIXED[name]))
     if name in PREFIX:
         said = (intent.get("slots", {}).get("text", {}).get("value") or "").strip()
         if not said:
             return speak("I didn't catch the rest of that. " + HELP)
-        return speak(ask_aria(PREFIX[name] + said))
+        return speak(ask(PREFIX[name] + said))
     return speak("I didn't follow that. " + HELP)
+
+
+def lambda_handler(event, context):
+    return handle(event, ask_aria, SKILL_ID)
 
 
 handler = lambda_handler      # for Lambdas configured with the older name

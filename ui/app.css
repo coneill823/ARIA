@@ -190,7 +190,88 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent-dim); }
               box-shadow: 0 0 12px rgba(74,222,128,.3); }
 .iconbtn.send { background: var(--accent-dim); color: var(--accent);
                 border-color: var(--accent-edge); }
+.iconbtn.send.stop { background: #3a1f24; color: var(--err); border-color: #6b2b33; }
 .iconbtn:disabled { opacity: .4; }
+/* --------------------------------------------- gantt options, the road */
+.gantt-opts { display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+              font-size: 12px; color: var(--dim); margin-bottom: 8px; }
+.gopt { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.gopt input { accent-color: var(--accent); }
+.road-sum { display: inline-flex; align-items: center; gap: 3px; cursor: default; }
+.road-sum i { width: 16px; height: 6px; border-radius: 3px; background: #2a3546;
+              display: inline-block; }
+.road-sum i.done { background: var(--ok); }
+.road-sum i.active { background: #8f6bc4; }
+.road-sum i.skipped { background: #2a3546; opacity: .5; }
+#gantt .g-ms:hover rect.hit { fill: rgba(143,107,196,.08); }
+.ms-tasks { display: flex; flex-direction: column; gap: 6px; margin-top: 12px;
+            align-items: flex-start; }
+.badge.model.giant { color: #c9b8ec; border-color: #5b4587;
+                     background: rgba(143,107,196,.12); }
+
+/* ------------------------------------------------ live: earlier outputs */
+.panel > h2.pager { gap: 6px; }
+.pg { width: 22px; height: 22px; border-radius: 6px; border: 1px solid var(--line);
+      background: var(--panel); color: var(--dim); font-size: 10px; line-height: 1;
+      padding: 0; flex: none; }
+.pg:hover:not(:disabled) { color: var(--accent); border-color: var(--accent-dim); }
+.pg:disabled { opacity: .3; }
+#live-title { min-width: 126px; text-align: center; color: var(--text); }
+.panel > h2 .hint { text-transform: none; letter-spacing: 0; }
+.tokens.past { max-height: none; }
+
+/* --------------------------------- files: a file's changes, side by side */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px;
+       overflow: hidden; }
+.seg button { border: 0; background: none; color: var(--dim); font-size: 12px;
+              padding: 4px 10px; }
+.seg button.on { background: var(--accent-dim); color: var(--accent); }
+.linkish { border: 0; background: none; padding: 0; color: var(--accent);
+           font: inherit; cursor: pointer; text-decoration: underline;
+           text-decoration-color: var(--accent-dim); text-underline-offset: 2px; }
+.hist { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.hlist { display: flex; flex-direction: column; border: 1px solid var(--line);
+         border-radius: 8px; overflow: hidden; max-height: 160px; overflow-y: auto;
+         flex: none; }
+.hrow { display: flex; gap: 10px; align-items: baseline; text-align: left;
+        border: 0; border-bottom: 1px solid var(--line-soft); background: none;
+        color: var(--text); padding: 6px 10px; font-size: 12.5px; }
+.hrow:last-child { border-bottom: 0; }
+.hrow:hover { background: rgba(69,214,255,.05); }
+.hrow.on { background: rgba(69,214,255,.1); }
+.hrow .tid { font-family: var(--mono); font-size: 11px; color: var(--dim); flex: none; }
+.hrow .ht { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hrow .hw { color: var(--dim); font-size: 11.5px; flex: none; }
+.plus { color: var(--ok); font-family: var(--mono); font-size: 11.5px; }
+.minus { color: var(--err); font-family: var(--mono); font-size: 11.5px; }
+.dbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dwrap { border: 1px solid var(--line); border-radius: 8px; overflow: auto; }
+table.diff { border-collapse: collapse; width: 100%; font-family: var(--mono);
+             font-size: 12px; table-layout: fixed; }
+table.diff th { text-align: left; font: 11px system-ui, sans-serif; letter-spacing: .4px;
+                color: var(--dim); padding: 6px 10px; background: #0b121b;
+                border-bottom: 1px solid var(--line); position: sticky; top: 0; }
+table.diff td { padding: 1px 8px; white-space: pre-wrap; overflow-wrap: anywhere;
+                vertical-align: top; }
+table.diff td.n { text-align: right; color: var(--faint); user-select: none;
+                  white-space: nowrap; }
+table.diff.split td.r, table.diff.split th + th { border-left: 1px solid var(--line); }
+table.diff tr.del td.l, table.diff tr.chg td.l, table.diff.unified tr.del td.u
+  { background: rgba(248,113,113,.13); color: #f3b4b4; }
+table.diff tr.add td.r, table.diff tr.chg td.r, table.diff.unified tr.add td.u
+  { background: rgba(74,222,128,.12); color: #b5ecc9; }
+table.diff td.none { background: rgba(125,143,165,.05); }
+table.diff tr.skip td { text-align: center; color: var(--faint); padding: 4px;
+                        background: #0b121b; font: 11px system-ui, sans-serif; }
+
+/* Settings: one line per speech ability, and the result of a test */
+.vrow { display: flex; align-items: center; gap: 10px; margin: 4px 0 6px; }
+.vrow .pill { flex: none; }
+.hint.test { margin-top: 6px; }
+.hint.test.ok { color: var(--ok); }
+.hint.test.bad { color: var(--err); }
+/* there, but it cannot do its job yet (no voice / no recogniser here) */
+.iconbtn.off { color: var(--warn); border-color: #57430e; opacity: .75; }
 
 /* slim variant: the dock on non-chat views */
 #dock { flex: none; border-top: 1px solid var(--line);
@@ -235,6 +316,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent-dim); }
 .turn .who { font-size: 11px; letter-spacing: 2px; color: var(--accent);
              margin-bottom: 4px; }
 .turn.aria .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.turn.aria .body .md { white-space: normal; }
+.turn.aria .body .md > :last-child { margin-bottom: 0; }
+.turn.aria .body .md pre { white-space: pre; overflow-x: auto; }
 .turn.aria .body.err { color: var(--err); }
 .turn.aria .status { color: var(--dim); font-size: 12.5px; font-style: italic; }
 .turn.aria .status::after { content: " ▋"; color: var(--accent);
@@ -486,26 +570,20 @@ pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mon
           font-size: 13.5px; }
 
 /* ----------------------------------------------------------------- orb */
-#view-orb { position: relative; background: #060a10; }
-#orb { position: absolute; inset: 0; width: 100%; height: 100%; }
-#orb-state { position: absolute; left: 50%; top: 50%; transform: translate(-50%, 23vh);
-             color: var(--dim); font-size: 12px; letter-spacing: 3px;
-             text-transform: uppercase; pointer-events: none; }
-#orb-transcript { position: absolute; left: 20px; bottom: 132px; width: min(430px, 42%);
-                  max-height: 46%; overflow-y: auto; display: flex;
-                  flex-direction: column; gap: 8px;
-                  mask-image: linear-gradient(to bottom, transparent, black 26px); }
-.omsg { border-radius: var(--radius); padding: 8px 12px; font-size: 13px;
-        background: rgba(16,24,35,.84); border: 1px solid var(--line);
-        backdrop-filter: blur(3px); overflow-wrap: anywhere; white-space: pre-wrap; }
-.omsg b { display: block; font-size: 10.5px; letter-spacing: 1.5px; color: var(--dim); }
-.omsg.aria { border-color: var(--accent-dim); }
-.omsg.aria b { color: var(--accent); }
-.omsg.sys { background: none; border: none; color: var(--dim); font-size: 12px;
-            padding: 2px 12px; }
-#view-orb .composer-wrap { position: absolute; left: 0; right: 0; bottom: 0; }
-#view-orb .composer { background: rgba(22,32,46,.9); backdrop-filter: blur(4px);
-                      max-width: 720px; }
+/* Her presence, behind the conversation: the canvas fills the Chat view
+   and everything else is drawn above it. orb.js fades it to a glow while
+   there is a thread to read. */
+#view-chat { position: relative; }
+#orb { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0;
+       pointer-events: none; }
+#view-chat > #thread, #view-chat > .composer-wrap { position: relative; z-index: 1; }
+#view-chat .composer { background: rgba(22,32,46,.9); backdrop-filter: blur(4px); }
+#orb-state { position: absolute; z-index: 1; left: 0; right: 0; top: 12px;
+             text-align: center; color: var(--dim); font-size: 11px;
+             letter-spacing: 3px; text-transform: uppercase; pointer-events: none; }
+#orb-state[data-state="listening"] { color: var(--ok); }
+#orb-state[data-state="thinking"] { color: var(--warn); }
+#orb-state[data-state="speaking"] { color: var(--accent); }
 
 /* ------------------------------------------------------------ settings */
 #settings-col { max-width: 760px; margin: 0 auto; }

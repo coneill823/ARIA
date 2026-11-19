@@ -17,7 +17,7 @@
 #   sudo pacman -S bubblewrap       # she runs each project's tests, sandboxed
 #   sudo pacman -S python-pyqt6-webengine   # a window of her own (aria app)
 #   sudo pacman -S python-pytest libnotify  # fuller tests; notifications
-#   pip install faster-whisper      # local voice input for Firefox
+#   bin/aria voice install          # her voice and ears, on this machine
 #   ollama pull qwen3:30b           # bigger 'smart' tier
 #   ollama pull gpt-oss:120b        # 'deep' tier (needs ~64GB RAM)
 #   bin/aria llama install          # llama.cpp Vulkan speed path
@@ -52,9 +52,10 @@ echo "talk to her:    'capture <idea>' -> read the plan -> 'approve <project>'"
 echo "                -> 'work on <project>' ... 'stop working on <project>'"
 echo "check it works: bin/aria test --mock   (seconds, no GPU needed)"
 echo "her reach:      Settings -> Internet, Obsidian brain, Git & GitHub"
-echo "voice (Firefox): pip install faster-whisper     Alexa: docs/ALEXA.md"
+echo "her voice:      bin/aria voice install   (speech on this machine, ~700 MB)"
+echo "from an Echo:   bin/aria alexa           (the steps: docs/ALEXA.md)"
 echo "bigger models:  ollama pull qwen3:30b   then Settings -> smart: ollama/qwen3:30b"
-echo "giant models:   bin/aria models scan     (one role each, loaded on demand)"
+echo "giant models:   bin/aria models scan     (one role each; prove one: models test general)"
 echo "worth adding:   sudo pacman -S bubblewrap python-pyqt6-webengine"
 echo "                (sandboxed tests of what she writes; a window of her own)"
 echo "what is missing: bin/aria doctor"
