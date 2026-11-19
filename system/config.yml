@@ -43,11 +43,13 @@ aria:
   giant_general:
   giant_research:
   giant_coder:
-  # auto   = the planner gives a task a giant when the work is worth the
-  #          wait (they answer at ~0.5–2 words a second)
+  # auto   = a giant gets the tasks the planner marks as hard, and the
+  #          last attempt at a task an everyday model had sent back twice
+  #          (they answer at ~0.5–2 words a second, so not everything)
   # always = every coding task to coder, research to research, the rest
   #          to general — strongest, slowest
   # never  = giants only where you name them yourself
+  # Prove a giant loads and answers:  bin/aria models test general
   giants_use: auto
   # How many giants may be loaded at once; unload one after this many
   # minutes unused (0 = keep it loaded); the first port (general uses it,
@@ -55,6 +57,10 @@ aria:
   giants_loaded: 1
   giants_idle_minutes: 0
   giants_port: 8090
+  # Before a giant loads, ask Ollama to unload the everyday models it holds
+  # so the giant gets the video memory and RAM. They load again by
+  # themselves the next time a task needs them.
+  giants_free_memory: true
   # Each giant's context window, in tokens. Prompts for a giant are sized
   # to it. Bigger costs real RAM for the whole time the giant is loaded —
   # raise it only if `free -h` shows room to spare.
@@ -94,10 +100,35 @@ aria:
     base_url: http://localhost:11434
     model: llama3.1:8b
 
-  # Whisper model for local speech-to-text (voice input on Firefox and
-  # other browsers without Web Speech API). Needs: pip install faster-whisper
-  # Sizes: tiny, base, small, medium (bigger = more accurate, slower).
+  # ---- her voice and her ears ---------------------------------------
+  # `bin/aria voice install` sets up speech on this machine: Piper for a
+  # natural voice, faster-whisper to understand you, both in a private
+  # environment under vendor/voice/. Nothing you say leaves the machine.
+  # Without it: espeak-ng (a plain voice) if installed, else whatever the
+  # browser offers — and her own desktop window offers nothing.
+  #
+  # Where her voice is made, and where yours is recognised:
+  #   auto    = on this machine when it can be, else the browser's own
+  #   local   = on this machine only
+  #   browser = the browser's own (Chrome sends audio to Google for it)
+  voice_engine: auto
+  voice_input: auto
+  # Which voice (`bin/aria voice voices` lists them; empty = the one that
+  # was installed), and how fast she speaks: 0.5 (slow) to 2 (fast).
+  voice_name:
+  voice_speed: 1.0
+  # The recognition model. Sizes: tiny, base, small, medium (bigger hears
+  # better and takes longer; it is downloaded the first time it is used).
   stt_model: base
+
+  # ---- Alexa ----------------------------------------------------------
+  # `bin/aria alexa` walks through this and says what is left; the whole
+  # story is docs/ALEXA.md. alexa_url is the public https address of your
+  # tunnel to the voice gateway (port 8701 — never 8700), and
+  # alexa_skill_id (amzn1.ask.skill.…) makes the gateway answer your
+  # skill only.
+  alexa_url:
+  alexa_skill_id:
 
   # When capturing from the web UI, automatically run triage and then
   # develop whatever became a project — idea in, proposed plan out.

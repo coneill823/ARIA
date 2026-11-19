@@ -1,8 +1,10 @@
-// The Chat view: the thread of the current conversation and its composer.
-// All behaviour lives in talk.js — this file only draws.
+// The Chat view: the thread of the current conversation and its composer,
+// with the orb — her presence — behind them. All behaviour lives in
+// talk.js; this file only draws.
 
-import { $, h, clear, api, bus, toast } from './core.js';
+import { $, h, clear, api, bus, toast, md } from './core.js';
 import { talk, submit, approveFromChat } from './talk.js';
+import * as orb from './orb.js';
 
 const nodes = new WeakMap();          // message object -> its DOM node
 let col, thread;
@@ -72,7 +74,9 @@ function draw(msg) {
     node ||= h('div', { class: 'turn aria' }, h('div', { class: 'who', text: 'A.R.I.A.' }),
                h('div', { class: 'body' }), h('div', { class: 'extras' }));
     const body = node.children[1];
-    body.textContent = msg.content;
+    // her replies are markdown (lists, code, emphasis): draw them as such
+    if (msg.error || !msg.content) body.textContent = msg.content;
+    else clear(body, md(msg.content));
     body.classList.toggle('err', !!msg.error);
     clear(node.children[2],
       msg.status ? h('div', { class: 'status', text: msg.status }) : null,
@@ -95,10 +99,13 @@ function draw(msg) {
 function render() {
   const msgs = talk.current ? talk.current.messages : [];
   clear(col);
+  orb.setDim(msgs.length > 0);
   if (!msgs.length) { col.append(greet()); return; }
   for (const m of msgs) { nodes.delete(m); draw(m); }
   scrollEnd();
 }
+
+const STATE_SAYS = { listening: 'listening…', thinking: 'thinking…', speaking: 'speaking' };
 
 export function init({ makeComposer }) {
   col = $('#thread-col');
@@ -108,8 +115,14 @@ export function init({ makeComposer }) {
   bus.on('talk:reset', render);
   bus.on('talk:add', msg => {
     col.querySelector('.greet')?.remove();
+    orb.setDim(true);
     draw(msg);
     scrollEnd();
+  });
+  bus.on('talk:state', s => {
+    const el = $('#orb-state');
+    el.textContent = STATE_SAYS[s] || '';
+    el.dataset.state = s;
   });
   bus.on('talk:update', msg => {
     if (!nodes.has(msg)) return;
@@ -122,6 +135,9 @@ export function init({ makeComposer }) {
 }
 
 export function show() {
+  orb.show();
   scrollEnd();
   init.focus?.();
 }
+
+export function hide() { orb.hide(); }

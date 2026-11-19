@@ -25,6 +25,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +35,7 @@ import aria_brain
 import aria_garage
 import aria_git
 import aria_run
+import aria_voice
 import aria_web
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -180,6 +182,18 @@ def config():
             "ARIA_OBSIDIAN_VAULT", find("obsidian_vault", "")),
         "brain_journal": flag("brain_journal", "true"),
         "stt_model": find("stt_model", "base"),
+        # her voice and her ears (aria_voice): where speech is made and
+        # recognised, which voice, how fast
+        "voice_engine": find("voice_engine", "auto").split(" #")[0].strip()
+            .lower(),
+        "voice_input": find("voice_input", "auto").split(" #")[0].strip()
+            .lower(),
+        "voice_name": find("voice_name", "").split(" #")[0].strip(),
+        "voice_speed": number("voice_speed", 1.0),
+        # Alexa (docs/ALEXA.md): where Amazon reaches the voice gateway,
+        # and the one skill it answers
+        "alexa_url": find("alexa_url", "").split(" #")[0].strip().rstrip("/"),
+        "alexa_skill_id": find("alexa_skill_id", "").split(" #")[0].strip(),
         "tiers": {"fast": find("fast", ""), "smart": find("smart", ""),
                   "deep": find("deep", "")},
         "backend_urls": {k: v.rstrip("/") for k, v in backends.items()},
@@ -221,6 +235,7 @@ def config():
         "giants_idle_minutes": number("giants_idle_minutes", 0),
         "giants_port": int(number("giants_port", 8090)),
         "giants_ctx": int(number("giants_ctx", 8192)),
+        "giants_free_memory": flag("giants_free_memory", "true"),
         "giants_flags": find("giants_flags", "").split(" #")[0].strip(),
         "editor": find("editor", "").split(" #")[0].strip(),
         "terminal": find("terminal", "").split(" #")[0].strip(),
@@ -444,6 +459,86 @@ def chat_messages(target, messages, force_json=False, on_token=None,
 
 
 GARAGE_LISTENERS = []           # callables that want giant load notices
+
+
+# ---- two model servers, one machine --------------------------------------
+#
+# Ollama serves the everyday tiers and llama.cpp the giants; they share one
+# GPU and one pool of RAM without knowing of each other. Two courtesies
+# keep them out of each other's way: before a giant loads, Ollama is asked
+# to let go of what it holds (it loads again by itself when next used); and
+# a chat message does not make Ollama throw out the model autopilot is in
+# the middle of using.
+
+def ollama_loaded(cfg=None):
+    """The models Ollama has in memory right now ([] when it cannot say)."""
+    cfg = cfg or config()
+    url = cfg["backend_urls"].get("ollama")
+    if not url:
+        return []
+    try:
+        with urllib.request.urlopen(url + "/api/ps", timeout=3) as r:
+            return [m.get("name", "") for m in json.load(r).get("models", [])
+                    if m.get("name")]
+    except Exception:
+        return []
+
+
+def ollama_release(cfg=None):
+    """Ask Ollama to unload everything it has in memory. Returns the names
+    it was asked to let go of."""
+    cfg = cfg or config()
+    url = cfg["backend_urls"].get("ollama")
+    released = []
+    for name in ollama_loaded(cfg):
+        try:
+            req = urllib.request.Request(
+                url + "/api/generate", method="POST",
+                data=json.dumps({"model": name, "keep_alive": 0}).encode(),
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=30).close()
+            released.append(name)
+        except Exception:
+            continue
+    return released
+
+
+def _free_for_giant(role, cfg, notify):
+    if not cfg.get("giants_free_memory", True):
+        return
+    released = ollama_release(cfg)
+    if released and notify:
+        notify(f"asked Ollama to unload {', '.join(released)} so the {role} "
+               "giant gets the memory — it loads again when next needed")
+
+
+aria_garage.BEFORE_START.append(_free_for_giant)
+
+
+def _in_memory(model, loaded):
+    return model in loaded or f"{model}:latest" in loaded or (
+        ":" not in model and any(n.split(":")[0] == model for n in loaded))
+
+
+def chat_target(cfg=None):
+    """The model that answers chat: the fast tier — unless autopilot is
+    mid-step on another Ollama model that is in memory while the fast one
+    is not. Then chat goes to that one: answering on the fast tier would
+    make Ollama swap autopilot's model out, and autopilot swap it back in
+    a moment later, each swap costing both of them the load time."""
+    cfg = cfg or config()
+    fast = resolve_tier("fast", cfg)
+    if fast.get("kind", "ollama") != "ollama" or fast.get("giant") \
+            or not autopilot_busy():
+        return fast
+    loaded = ollama_loaded(cfg)
+    if not loaded or _in_memory(fast["model"], loaded):
+        return fast
+    smart = resolve_tier("smart", cfg)
+    if smart.get("kind", "ollama") == "ollama" and not smart.get("giant") \
+            and _in_memory(smart["model"], loaded):
+        return smart
+    return fast
 
 
 def _garage_note(text):
@@ -1475,13 +1570,39 @@ def board_summary_text():
             mp.append("latest finished: " + done[-1]["id"]
                       + f" ({done[-1]['status']})")
         parts.append("background missions — " + "; ".join(mp))
-    running_projects = [p for p in list_projects()
-                        if p["autopilot"] == "running"]
+    projects = list_projects()
+    running_projects = [p for p in projects if p["autopilot"] == "running"]
     if running_projects:
+        def road(p):
+            try:
+                pr = _autopilot().progress(p["slug"])
+            except Exception:
+                return ""
+            return (f", {pr['reached']} of {pr['total']} milestones reached"
+                    if pr["total"] else "")
         parts.append("autopilot working on: " + ", ".join(
-            f"{p['slug']} (iteration {p['iteration']}"
-            + (f", now: {p['current']}" if p.get("current") else "") + ")"
+            f"{p['slug']} (iteration {p['iteration']}, {p['done']} of "
+            f"{p['total']} tasks done" + road(p)
+            + (f", waiting: {p['waiting']}" if p.get("waiting") else
+               f", now: {p['current']}" if p.get("current") else "") + ")"
             for p in running_projects))
+    owed = [f"{p['slug']} {g['id']} ({g['title']})"
+            for p in projects for g in p["needs_you"]]
+    if owed:
+        parts.append("tasks waiting for the user's own decision: "
+                     + "; ".join(owed[:5]))
+    try:
+        cfg = config()
+        giants = aria_garage.configured(cfg)
+        if giants:
+            loaded = aria_garage.loaded_roles(cfg)
+            parts.append("giant models: " + ", ".join(
+                f"{role} = {info['label']}"
+                + (" (loaded)" if role in loaded else "")
+                for role, info in giants.items())
+                + f" — used {cfg['giants_use']}")
+    except Exception:
+        pass
     return "; ".join(parts)
 
 
@@ -1576,6 +1697,33 @@ INTENT_STATUS_ALL = re.compile(
     r"(?:running|happening|going on)|status(?: report)?|give me (?:a |the )?"
     r"status(?: report)?|how are (?:things|the projects)(?: going)?)\s*\??\s*$",
     re.I)
+# "how far along is the meal planner", "what's left on …", "what's next
+# for …", "the roadmap for …", "when will … be done" — answered from the
+# roadmap and the measured pace, without asking a model
+INTENT_PROGRESS = re.compile(
+    r"^\s*(?:how far(?: along)?(?: is| are (?:you|we) (?:on|with))?|"
+    r"what(?:'s| is) (?:left|next|remaining|still to do)"
+    r"(?: (?:on|for|in|with))?|(?:show (?:me )?)?(?:the )?(?:road ?map|"
+    r"milestones)(?: (?:for|of|on))?|how (?:long|much longer)"
+    r"(?: (?:until|till|for|on|will))?|when will(?: you)?"
+    r"(?: (?:be done with|finish))?)\s+(.+?)"
+    r"(?:\s+(?:be (?:done|finished|ready)|finish|take|is (?:done|finished)))?"
+    r"\s*\??\s*$", re.I)
+INTENT_PROGRESS_ALL = re.compile(
+    r"^\s*(?:how far(?: along)?(?: are (?:you|we))?|what(?:'s| is) "
+    r"(?:left|next|remaining|still to do)(?: to do)?|(?:show (?:me )?)?"
+    r"(?:the )?(?:road ?map|milestones)|how (?:long|much longer)"
+    r"(?: (?:will (?:it|this|that) take|is left|to go))?|when will "
+    r"(?:you|it|this|that) (?:be (?:done|finished|ready)|finish))"
+    r"\s*\??\s*$", re.I)
+# "what needs me", "does anything need me", "what's waiting on me"
+INTENT_NEEDS = re.compile(
+    r"^\s*(?:what(?:'s| is)? (?:needs?|waiting (?:on|for)) (?:me|my "
+    r"(?:decision|approval|attention))|what needs (?:me|my (?:decision|"
+    r"approval|attention))|(?:does|is) (?:anything|something) (?:need(?:s|ing)?"
+    r"|waiting (?:on|for)) (?:me|my (?:decision|approval|attention))|"
+    r"(?:is there )?anything (?:for me|i need to do|waiting (?:on|for) me)|"
+    r"do you need (?:me|anything from me))\s*\??\s*$", re.I)
 INTENT_CHANGES = re.compile(
     r"^\s*(?:what(?:'s| has)? changed (?:in|on|with)|what did you "
     r"(?:do|change|build)(?: (?:in|on|to|for))?|(?:show (?:me )?)?(?:the )?"
@@ -1673,13 +1821,15 @@ def command_phrases(cfg=None):
            "stop working on <project>", "tell <project> to <guidance>",
            "approve task <id> in <project>: <your decision>",
            "skip task <id> in <project>",
-           "status of <project>", "what changed in <project>",
+           "what needs me", "status of <project>",
+           "how far along is <project>",
+           "what's left on <project>", "what changed in <project>",
            "where is <project>", "open the folder for <project>",
            "open <project> in my editor", "refine <project>",
            "run <project>",
            "ask the <agent> to <task>", "mission <agent> to <task>",
            "use skill <name>", "drop skill",
-           "open <chat|projects|board|agents|orb|settings>"]
+           "open <chat|projects|board|agents|settings>"]
     if cfg["webhooks"]:
         out.append("trigger <webhook>")
     if cfg["web_access"]:
@@ -1723,10 +1873,45 @@ def _nav_target(phrase):
     return None
 
 
+# "Aria, what needs me?" — being addressed by name is not part of the
+# command. A speech recogniser hears the name as "area" or "arya" often
+# enough to allow those too, but only where they can be nothing else: after
+# a greeting, or set off by punctuation.
+_GREETING = r"(?:hey|hi|hello|ok|okay)"
+_NAME_END = r"(?=[\s,.:;!?—–]|$)[\s,.:;!—–-]*"
+_ADDRESSED = re.compile(
+    rf"^\s*(?:(?:{_GREETING}[\s,]+)?(?:a\.r\.i\.a\.?|aria){_NAME_END}"
+    rf"|{_GREETING}[\s,]+(?:area|arya|ariya){_NAME_END}"
+    r"|(?:area|arya|ariya)\s*[,.:;!—–]+\s*"
+    rf"|{_GREETING}\s*[,.:;!—–]+\s*)", re.I)
+
+
+def _unaddressed(text):
+    """A sentence without the "Aria, " (or "hey Aria — ") it opens with."""
+    rest = _ADDRESSED.sub("", text, count=1)
+    return rest if rest.strip() else text
+
+
 def detect_intent(text):
-    """Deterministic spoken-command detection, checked before the LLM."""
+    """Deterministic spoken-command detection, checked before the LLM.
+
+    People do not talk in command syntax, and a speech recogniser writes
+    down what it hears as a sentence: "Aria, what needs me." So the name
+    she is addressed by is set aside first, and a sentence that is no
+    command with its full stop is tried again without it. (Tried again,
+    not stripped up front: the words of a capture or a note are the
+    owner's and stay exactly as given.)"""
     cfg = config()
-    text = (text or "").strip()
+    text = _unaddressed((text or "").strip())
+    found = _detect(text, cfg)
+    if found is None or found["action"] == "no-project":
+        bare = text.rstrip(" \t.!…")
+        if bare and bare != text:
+            found = _detect(bare, cfg) or found
+    return found
+
+
+def _detect(text, cfg):
     m = INTENT_SKILL_ON.match(text)
     if m:
         return {"action": "use-skill", "name": m.group(1).lower()}
@@ -1806,6 +1991,15 @@ def detect_intent(text):
                     "text": m.group(2).strip()}
     if INTENT_STATUS_ALL.match(text):
         return {"action": "status", "slug": ""}
+    if INTENT_NEEDS.match(text):
+        return {"action": "needs"}
+    if INTENT_PROGRESS_ALL.match(text):
+        return {"action": "progress", "slug": ""}
+    m = INTENT_PROGRESS.match(text)
+    if m:
+        slug = match_project(m.group(1))
+        if slug:
+            return {"action": "progress", "slug": slug}
     m = INTENT_CHANGES.match(text)
     if m:
         slug = match_project(m.group(1))
@@ -1997,6 +2191,12 @@ def perform(intent, source="chat"):
                    if intent.get("slug") else workspace_status_text())
         if intent.get("slug"):
             out["where"] = str(_project_dir(intent["slug"]))
+    elif action == "needs":
+        out["say"] = workspace_needs_text()
+    elif action == "progress":
+        out.update(slug=intent.get("slug", ""),
+                   say=project_progress_text(intent["slug"])
+                   if intent.get("slug") else workspace_progress_text())
     elif action == "where":
         slug = intent["slug"]
         proj = _project_dir(slug)
@@ -2030,7 +2230,7 @@ def perform(intent, source="chat"):
     elif action == "navigate":
         names = {"chat": "the chat", "projects": "Projects",
                  "board": "the pipeline board", "agents": "Agents",
-                 "orb": "the Orb", "settings": "Settings"}
+                 "settings": "Settings"}
         out.update(view=intent["view"], tab=intent.get("tab", ""),
                    slug=intent.get("slug", ""),
                    say=intent.get("say") or (
@@ -2085,10 +2285,54 @@ def perform(intent, source="chat"):
     return out
 
 
-def converse(messages, on_token=None, skill=None):
+def _busy_reply(waited, target):
+    """What to say when the chat model has not produced a word in time:
+    the truth about why, where things stand, and what still works."""
+    busy = [p for p in list_projects()
+            if p["autopilot"] == "running" and not p["waiting"]]
+    if busy:
+        p = busy[0]
+        doing = f"“{p['current']}”" if p["current"] else {
+            "reviewing": "checking a task", "planning": "planning the next "
+            "batch", "assessing": "taking stock", "reflecting": "updating "
+            "my notes", "auditing": "auditing the work"}.get(
+                p["phase"], "a step")
+        why = (f"My models are tied up — I'm in the middle of {doing} on "
+               f"{p['slug'].replace('-', ' ')} — so I can't think that one "
+               "over just now.")
+    else:
+        why = (f"The model that answers chat ({target.get('model', '?')}) "
+               f"has not said a word in {int(waited)} seconds — it may "
+               "still be loading, or the model server is stuck.")
+    return (why + " Where things stand: " + workspace_status_text()
+            + " Commands are answered without a model, so these still "
+              "work: “status”, “how far along is <project>”, “what changed "
+              "in <project>”, “stop working on <project>”.")
+
+
+def _patience():
+    """How long a chat may wait for its first word. Short while autopilot
+    holds the models (the wait would be for its whole step), longer when
+    the only reason can be a cold model loading."""
+    try:
+        forced = float(os.environ.get("ARIA_CHAT_PATIENCE") or 0)
+    except ValueError:
+        forced = 0
+    if forced:
+        return forced
+    return 25 if autopilot_busy() else 90
+
+
+def converse(messages, on_token=None, skill=None, patience=None,
+             on_status=None):
     """Persona chat (fast tier). With `skill`, that skill's instructions are
     loaded into the system prompt so any model — not just Claude — can
-    follow them."""
+    follow them.
+
+    A reply always comes back in bounded time: if the model has not begun
+    to answer within `patience` seconds (default: see _patience) — it is
+    busy with autopilot's own work, or still loading — she says so, and
+    where things stand, instead of leaving the chat hanging."""
     cfg = config()
     last = next((m.get("content", "") for m in reversed(messages)
                  if m.get("role") == "user"), "")
@@ -2111,39 +2355,99 @@ def converse(messages, on_token=None, skill=None):
                    + skill_text(skill)[:6000])
     trimmed = [m for m in messages if m.get("role") in ("user", "assistant")
                and isinstance(m.get("content"), str)][-16:]
-    return strip_think(chat_messages(
-        resolve_tier("fast", cfg),
-        [{"role": "system", "content": system}] + trimmed,
-        on_token=on_token))
+    target = chat_target(cfg)
+    patience = float(patience or _patience())
+    box = {"parts": [], "error": None, "gave_up": False}
+    first, done = threading.Event(), threading.Event()
+
+    def token(text):
+        if box["gave_up"]:
+            return                       # nobody is listening any more
+        box["parts"].append(text)
+        first.set()
+        if on_token:
+            on_token(text)
+
+    def work():
+        try:
+            box["reply"] = chat_messages(
+                target, [{"role": "system", "content": system}] + trimmed,
+                on_token=token)
+        except Exception as exc:
+            box["error"] = exc
+        first.set()
+        done.set()
+
+    threading.Thread(target=work, daemon=True).start()
+    t0 = time.time()
+    told = False
+    while not first.wait(2):
+        waited = time.time() - t0
+        if waited >= patience:
+            box["gave_up"] = True        # the call may end later, unheard
+            reply = _busy_reply(waited, target)
+            if on_token:
+                on_token(reply)
+            return reply
+        if on_status and not told and waited >= 6:
+            told = True
+            on_status("the model is busy — waiting for it to answer…"
+                      if autopilot_busy() else
+                      "waiting for the model to wake up…")
+    done.wait()
+    if box["error"] is not None:
+        raise box["error"]
+    return strip_think(box.get("reply") or "".join(box["parts"]))
 
 
-# ---------------------------------------------------------------- local STT
+# ---------------------------------------------------------------- voice
+#
+# Speaking and listening happen on this machine (bin/aria_voice.py): the
+# app's own window has no browser speech service to borrow.
 
-_WHISPER = None
+AUDIO_SUFFIXES = {"audio/wav": ".wav", "audio/x-wav": ".wav",
+                  "audio/wave": ".wav", "audio/webm": ".webm",
+                  "audio/ogg": ".ogg", "audio/mp4": ".m4a",
+                  "audio/mpeg": ".mp3"}
 
 
-def transcribe_audio(data, suffix=".webm"):
-    """Local speech-to-text via faster-whisper (optional dependency) —
-    the voice-input path for browsers without Web Speech API (Firefox)."""
-    global _WHISPER
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        raise RuntimeError(
-            "local speech-to-text needs the faster-whisper package — "
-            "install it with: pip install faster-whisper")
-    if _WHISPER is None:
-        _WHISPER = WhisperModel(config()["stt_model"],
-                                device="cpu", compute_type="int8")
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(data)
-        tmp = f.name
-    try:
-        segments, _info = _WHISPER.transcribe(tmp)
-        return " ".join(s.text.strip() for s in segments).strip()
-    finally:
-        os.unlink(tmp)
+VOICE_TOKEN_FILE = ROOT / "system" / "voice-token"
+
+
+def voice_token():
+    """The shared secret of the voice gateway (the door for Alexa and other
+    integrations): ARIA_VOICE_TOKEN, else system/voice-token — created on
+    first use, readable only by the owner, ignored by git."""
+    value = os.environ.get("ARIA_VOICE_TOKEN", "").strip()
+    if value:
+        return value
+    if not VOICE_TOKEN_FILE.is_file():
+        import secrets
+        VOICE_TOKEN_FILE.write_text(secrets.token_urlsafe(32) + "\n",
+                                    encoding="utf-8")
+        os.chmod(VOICE_TOKEN_FILE, 0o600)
+    return VOICE_TOKEN_FILE.read_text(encoding="utf-8").strip()
+
+
+def voice_status():
+    return aria_voice.status(config())
+
+
+def voice_speak(text):
+    """`text` spoken, as a WAV file (bytes). RuntimeError says what is
+    missing when she has no voice here."""
+    return aria_voice.speak(text, config())
+
+
+def transcribe_audio(data, suffix=".wav", language=""):
+    """Local speech-to-text. RuntimeError (with the command that fixes it)
+    when no recogniser is installed."""
+    return aria_voice.transcribe(data, config(), suffix=suffix,
+                                 language=language)
+
+
+def voice_install(say=print, voice=""):
+    return aria_voice.install(config(), say=say, voice=voice)
 
 
 # ---------------------------------------------------------------- skills
@@ -2987,6 +3291,16 @@ def list_projects():
 
 # ---- what a project is doing, in words ----------------------------------
 
+def _count(n, noun):
+    """'1 task', '3 tasks' — these sentences are also read aloud, where
+    "task(s)" is not a word."""
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
+
+def _is(n):
+    return "is" if n == 1 else "are"
+
+
 def project_status_text(slug):
     """One or two speakable sentences on where a project stands."""
     p = next((x for x in list_projects() if x["slug"] == slug), None)
@@ -2996,14 +3310,15 @@ def project_status_text(slug):
     gated = p["needs_you"]
     needs = ""
     if gated:
-        needs = (f" {len(gated)} task(s) need your decision: "
+        needs = (f" {_count(len(gated), 'task')} "
+                 f"{'needs' if len(gated) == 1 else 'need'} your decision: "
                  + "; ".join(f"{g['title']} ({g['id']})" for g in gated[:3])
                  + f". Say 'approve task {gated[0]['id']} in {slug}' — add "
                    "your decision after a colon — or 'skip task "
                    f"{gated[0]['id']} in {slug}'.")
     if p["autopilot"] == "running":
         say = (f"{name} is running, iteration {p['iteration']}: "
-               f"{p['done']} of {p['total']} tasks done.")
+               f"{p['done']} of {_count(p['total'], 'task')} done.")
         if p["phase"] == "waiting" and gated:
             say += " Everything that doesn't need you is done."
         elif p["waiting"]:
@@ -3019,8 +3334,9 @@ def project_status_text(slug):
                   "stalled": "paused itself because it stopped making "
                              "progress",
                   "budget": "paused at the budget you set"}[p["autopilot"]]
-        return (f"{name} {ending} after {p['iteration']} iteration(s) with "
-                f"{p['done']} tasks done"
+        return (f"{name} {ending} after "
+                f"{_count(p['iteration'], 'iteration')} with "
+                f"{_count(p['done'], 'task')} done"
                 + (f" and {p['failed']} it could not complete"
                    if p["failed"] else "")
                 + ". The final report is on the Projects page." + needs)
@@ -3030,6 +3346,100 @@ def project_status_text(slug):
                 if p["has_plan"] else
                 f"{name} is still an idea — run develop to get a plan.")
     return f"{name} is approved and idle — say 'work on {slug}' to start."
+
+
+def _spoken_time(seconds):
+    """A duration the way it is said aloud: 'about 40 minutes'."""
+    seconds = float(seconds or 0)
+    if seconds < 90:
+        return "about a minute"
+    if seconds < 3300:
+        return f"about {int(round(seconds / 60 / 5) * 5) or 5} minutes"
+    hours = seconds / 3600
+    if hours < 20:
+        half = round(hours * 2) / 2
+        return (f"about {half:g} hour" + ("" if half == 1 else "s"))
+    return f"about {round(hours / 24, 1):g} days"
+
+
+def project_progress_text(slug):
+    """Where a project stands on its road, speakable: milestones reached,
+    what is in progress, what comes next, and how much work is left."""
+    name = slug.replace("-", " ")
+    pr = _autopilot().progress(slug)
+    if not pr["total"]:
+        return (project_status_text(slug) + " It has no roadmap yet — I "
+                "lay one out when I first plan a project.")
+    say = (f"{name}: {pr['reached']} of "
+           f"{_count(pr['total'], 'milestone')} reached.")
+    if pr["current"]:
+        say += " In progress: " + "; ".join(
+            f"{m['title']} ({m['done']} of about "
+            f"{_count(max(m['est_tasks'], m['done'] + m['open']), 'task')})"
+            for m in pr["current"][:2]) + "."
+    if pr["next"]:
+        say += " Still ahead: " + ", then ".join(
+            m["title"] for m in pr["next"][:3]) \
+            + (f", and {len(pr['next']) - 3} more" if len(pr["next"]) > 3
+               else "") + "."
+    if pr["reached"] == pr["total"]:
+        say += " The whole road is behind me."
+    elif pr["eta"] and pr["remaining_tasks"]:
+        say += (f" That is roughly {_count(pr['remaining_tasks'], 'task')} "
+                f"— {_spoken_time(pr['eta'])} of work at the pace so far.")
+    if pr["status"] == "running" and pr["now"]:
+        say += f" Right now I'm on: {pr['now']['title']}."
+    elif pr["status"] != "running":
+        say += (" Autopilot is not running on it."
+                if pr["status"] in ("idle", "stopped") else
+                f" It is {pr['status']}.")
+    if pr["needs_you"]:
+        owed = len(pr["needs_you"])
+        say += f" {_count(owed, 'task')} {_is(owed)} waiting for your decision."
+    return say
+
+
+def workspace_needs_text():
+    """Everything that is waiting on the owner, speakable."""
+    projects = list_projects()
+    parts = []
+    plans = [p for p in projects if not p["approved"] and p["has_plan"]]
+    if plans:
+        parts.append(f"{_count(len(plans), 'plan')} {_is(len(plans))} "
+                     "waiting for your approval: "
+                     + ", ".join(p["slug"].replace("-", " ") for p in plans)
+                     + ".")
+    for p in projects:
+        if p["needs_you"]:
+            parts.append(
+                f"{p['slug'].replace('-', ' ')} has "
+                f"{_count(len(p['needs_you']), 'task')} waiting for your "
+                "decision: "
+                + "; ".join(g["title"] for g in p["needs_you"][:3]) + ".")
+        if p["autopilot"] in ("stalled", "budget"):
+            parts.append(f"{p['slug'].replace('-', ' ')} has paused itself — "
+                         + ("it stopped making progress" if p["autopilot"]
+                            == "stalled" else "it reached the budget you set")
+                         + "; it resumes when you say so.")
+    unclear = [n for n in board()["inbox"] if n["type"] == "unclear"]
+    if unclear:
+        parts.append(f"{_count(len(unclear), 'note')} in the inbox "
+                     f"{'has' if len(unclear) == 1 else 'have'} questions "
+                     "for you.")
+    if not parts:
+        return "Nothing needs you right now."
+    return " ".join(parts) + (" Approvals and decisions are yours to make "
+                              "in the app.")
+
+
+def workspace_progress_text():
+    running = [p for p in list_projects() if p["autopilot"] == "running"]
+    if not running:
+        started = [p for p in list_projects() if p["iteration"]]
+        if not started:
+            return "Nothing has been started yet, so there is no road to report on."
+        running = started[:2]
+    return " ".join(project_progress_text(p["slug"]) for p in running[:3])
 
 
 def workspace_status_text():
@@ -3042,17 +3452,19 @@ def workspace_status_text():
     else:
         parts.append("Nothing is running on autopilot right now.")
     if waiting:
-        parts.append(f"{len(waiting)} plan(s) are waiting for your approval: "
+        parts.append(f"{_count(len(waiting), 'plan')} {_is(len(waiting))} "
+                     "waiting for your approval: "
                      + ", ".join(p["slug"].replace("-", " ") for p in waiting)
                      + ".")
     for p in projects:              # decisions owed on projects not running
         if p["needs_you"] and p["autopilot"] != "running":
             parts.append(f"{p['slug'].replace('-', ' ')} has "
-                         f"{len(p['needs_you'])} task(s) waiting for your "
-                         "decision.")
+                         f"{_count(len(p['needs_you']), 'task')} waiting for "
+                         "your decision.")
     b = board()
     if b["inbox"]:
-        parts.append(f"{len(b['inbox'])} note(s) are in the inbox.")
+        parts.append(f"{_count(len(b['inbox']), 'note')} "
+                     f"{_is(len(b['inbox']))} in the inbox.")
     return " ".join(parts)
 
 
@@ -3081,7 +3493,8 @@ def project_changes_text(slug, limit=4):
         files = [f["path"] for f in r.get("files", [])]
         bits.append(r["title"] + (f" — {', '.join(files[:3])}"
                                   if files else ""))
-    return (f"{len(rows)} completed change(s) in {name}. Most recent: "
+    return (f"{_count(len(rows), 'completed change')} in {name}. Most "
+            "recent: "
             + "; ".join(bits) + ". The full list with reasoning is on the "
             "Projects page under Changes.")
 
@@ -3365,6 +3778,43 @@ def garage_load(role, notify=None, retry=True):
     return aria_garage.load(role, config(), notify=notify, retry=retry)
 
 
+def garage_test(role, notify=None):
+    """Prove a giant end to end — the answer to "can she really load it?":
+    load it, ask it one short question, time both. The outcome (also a
+    failure) is kept for the Settings page. Returns
+    {ok, label, load_seconds, seconds, words, reply | error}."""
+    if role not in aria_garage.ROLES:
+        raise ValueError(f"no such role: {role} (general, research, coder)")
+    cfg = config()
+    label = (aria_garage.configured(cfg).get(role) or {}).get("label", "")
+    result = {"ok": False, "label": label}
+    try:
+        t0 = time.time()
+        aria_garage.load(role, cfg, notify=notify, retry=True)
+        result["load_seconds"] = round(time.time() - t0, 1)
+        target = _giant_target(role, cfg)
+        if target.get("fallback"):
+            raise aria_garage.GarageError(target["fallback"])
+        if notify:
+            notify(f"the {role} giant is loaded — asking it a question")
+        t1 = time.time()
+        with aria_garage.serving(role, cfg, notify=notify):
+            reply = _chat_call(target, [{"role": "user", "content":
+                               "In one short sentence: which model are you, "
+                               "and are you ready to work?"}],
+                               False, None, 7 * 24 * 3600, 0)
+        reply = " ".join(strip_think(reply).split())
+        if not reply:
+            raise aria_garage.GarageError("it loaded but answered nothing")
+        took = time.time() - t1
+        result.update(ok=True, seconds=round(took, 1),
+                      words=len(reply.split()), reply=clip(reply, 240))
+    except Exception as exc:
+        result["error"] = " ".join(str(exc).split())[:400]
+    aria_garage.note_test(role, cfg, result)
+    return result
+
+
 def garage_unload(role=""):
     if role and role not in aria_garage.ROLES:
         raise ValueError(f"no such role: {role} (general, research, coder)")
@@ -3416,6 +3866,29 @@ def autopilot_plan(slug, emit):
 
 def project_view(slug):
     return _autopilot().view(slug)
+
+
+def project_outputs(slug):
+    """What she wrote before: the finished live streams, newest first."""
+    _project_dir(slug)
+    return _autopilot().outputs(slug)
+
+
+def project_output(slug, n):
+    _project_dir(slug)
+    return _autopilot().output(slug, n)
+
+
+def file_history(slug, path):
+    """Every verified change to one of a project's files, newest first."""
+    _project_dir(slug)
+    return _autopilot().file_history(slug, path)
+
+
+def file_diff(slug, path, task):
+    """One change to one file as rows of (previous line, modified line)."""
+    _project_dir(slug)
+    return _autopilot().file_diff(slug, path, task)
 
 
 # ---------------------------------------------------------------- version
@@ -3540,7 +4013,7 @@ def autopilot_busy():
 
 _BOOL_KEYS = {"auto_pipeline", "web_access", "github_access",
               "brain_journal", "autopilot_git", "autopilot_refine",
-              "desktop_notifications"}
+              "desktop_notifications", "giants_free_memory"}
 _CHOICE_KEYS = {
     "web_search": {"auto", "duckduckgo", "brave", "searxng", "wikipedia",
                    "none"},
@@ -3548,18 +4021,21 @@ _CHOICE_KEYS = {
     "giants_use": {"auto", "always", "never"},
     "autopilot_checks": {"sandbox", "direct", "off"},
     "engine": {"ollama", "claude"},
+    "voice_engine": {"auto", "local", "browser"},
+    "voice_input": {"auto", "local", "browser"},
 }
 _NUMBER_KEYS = {"context_tokens", "autopilot_max_tasks",
                 "autopilot_max_iterations", "autopilot_max_hours",
                 "autopilot_stall_limit", "autopilot_idle_minutes",
                 "giants_loaded", "giants_idle_minutes", "giants_ctx",
                 "giants_port", "autopilot_check_seconds",
-                "triage_confidence_threshold"}
+                "triage_confidence_threshold", "voice_speed"}
 _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "web_search_url", "web_allowlist", "github_base_branch",
               "promotion_target", "giant_general", "giant_research",
               "giant_coder", "giants_flags", "editor", "terminal",
-              "heartbeat_url"}
+              "heartbeat_url", "voice_name", "alexa_url",
+              "alexa_skill_id"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 
@@ -3594,6 +4070,8 @@ def _config_clean(key, value):
                              "0.7 means 70%")
         if key == "giants_port" and not 1024 <= number <= 65000:
             raise ValueError("giants_port must be between 1024 and 65000")
+        if key == "voice_speed" and not 0.5 <= number <= 2:
+            raise ValueError("voice_speed is between 0.5 (slow) and 2 (fast)")
         if key in ("autopilot_max_tasks", "autopilot_max_iterations",
                    "autopilot_stall_limit", "giants_loaded", "giants_ctx",
                    "giants_port"):
@@ -3601,6 +4079,16 @@ def _config_clean(key, value):
         value = str(int(number)) if number == int(number) else str(number)
     elif "#" in value:
         raise ValueError(f"{key} cannot contain '#'")
+    elif key == "alexa_url" and value and not re.fullmatch(
+            r"https://[\w.-]+(?::\d+)?/?", value):
+        raise ValueError("alexa_url is the tunnel's own address, like "
+                         "https://my-machine.my-tailnet.ts.net — https, "
+                         "and nothing after the host")
+    elif key == "alexa_skill_id" and value and not value.startswith(
+            "amzn1.ask.skill."):
+        raise ValueError("a skill id looks like amzn1.ask.skill.… — it is "
+                         "on the skill's page in the Alexa developer "
+                         "console")
     elif key.startswith("giant_") and value:
         path = Path(os.path.expanduser(value))
         if not path.is_absolute():

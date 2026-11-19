@@ -11,6 +11,7 @@ what would help most next, in rough order of value for effort.
 | Failure it prevents | What she does |
 |---|---|
 | **Forgetting** — the context fills up and early decisions vanish | Working memory (`MEMORY.md`) rewritten after every batch; prompts budgeted to the context window; the window requested from the model server explicitly rather than left to a silent default |
+| **Planning one batch at a time** — each plan is sensible and the sum goes nowhere | A roadmap of milestones from where the project is to its goal, each an outcome that can be checked, with what it waits for. Every batch is planned against it, every task belongs to a milestone and is told where it fits, and the road is redrawn when you steer or an audit finds gaps |
 | **Re-doing finished work** | The planner sees memory, the file list and recent results; a task that repeats one already done, one you declined, or one that has failed twice is dropped — also long after the original has left the board |
 | **Spinning on a failing task** | Three attempts, then the task is failed and the planner routes around it |
 | **Hammering a dead model server** | Outages are waited out with a growing pause and cost the task nothing |
@@ -25,8 +26,11 @@ what would help most next, in rough order of value for effort.
 | **Running forever** | Optional budgets in hours, batches and tasks; at one she writes the report and pauses |
 | **Deciding what is yours to decide** | A task the planner marks `needs_human` waits for your answer — approve it with your decision, or skip it — while everything that does not depend on it carries on |
 | **Nobody noticing** | A desktop notification and the `mission-done` webhook when a run ends, for whatever reason, and when a task starts waiting on you |
-| **The wrong model for the job** | Giants get a role each and are loaded on demand, one at a time; the planner is told what each costs; work is grouped by the model already loaded |
+| **The wrong model for the job** | Giants get a role each and are loaded on demand, one at a time, with Ollama asked to free the memory first; the planner marks the hard tasks and those go to a giant; a task an everyday model had sent back twice gets its last attempt on one; work is grouped by the model already loaded |
+| **A big model that was never really usable** | `aria models test <role>` loads a giant, asks it a question and times both; a model with nothing to run it is shown as unable to start, not as ready |
 | **Losing the thread of a long run** | The Gantt, the board and the reports keep everything the project ever did; times are measured, and predictions come from them |
+| **Not being able to see what she did** | Her last forty outputs are kept in full and can be paged through; every verified change keeps the file as it was, so any change can be read as before and after |
+| **A question that waits behind the work** | Progress, what needs you and status are answered from her records without a model; anything else gets a reply in bounded time — if the model is busy she says so, and where things stand |
 | **Unreadable history** | A structured change record, and a final report built from it — complete however long the run |
 | **Being unsteerable** | Guidance mid-run replans unstarted work without stopping anything |
 | **A hung generation** | Fast and smart tiers are abandoned after a silent spell and retried |
@@ -55,12 +59,14 @@ what would help most next, in rough order of value for effort.
    realises it needs instead of relying on what the planner packed.
 6. **A morning digest, and a nudge on your phone.** A desktop
    notification and the webhook already fire when a run ends or a task
-   needs you. Next: a daily summary of what happened overnight, a push
-   when she has waited an hour on the model server, and the same through
-   the Echo.
-7. **Trace every task to a requirement.** Each task names the requirement
-   it serves; the audit then reports coverage per requirement instead of
-   an overall verdict, and orphan work stands out.
+   needs you, and an Echo answers when you ask it how things stand.
+   Next: a daily summary of what happened overnight, a push when she has
+   waited an hour on the model server, and the Echo speaking first
+   (Amazon's proactive events).
+7. **Trace every milestone to a requirement.** Each task names its
+   milestone today. Next, each milestone names the requirements it
+   covers; the audit then reports coverage per requirement instead of an
+   overall verdict, and orphan work stands out.
 8. **Memory across projects.** Lessons that keep recurring ("this model
    writes better tests when shown one first", "you prefer SQLite")
    promoted to a store every planner reads.

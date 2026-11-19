@@ -23,6 +23,12 @@ let filesInfo = null, fileSet = new Set(), filesSig = '', fileSel = '';
 let fileView = null, showRecords = false, openDirs = new Set();
 // history: which report is shown, the full change record, open Gantt bands
 let reportSel = '', reportCache = {}, allChanges = null, ganttOpen = new Set();
+// live: her earlier outputs (newest first), the one being looked at (null =
+// right now), and those already fetched in full
+let liveOuts = [], liveSel = null, liveOut = {};
+// files: a file's history, and the change being compared (null = the file)
+let fileHist = null, fileDiff = null, fileMode = 'file';
+let diffSplit = store.get('aria_diff_split', true);
 // run: how the project is started, the program you started, its output
 let runInfo = null, runText = '', runNext = 0, runTimer = null, runStamp = 0;
 let checkRes = null, checking = false;
@@ -38,6 +44,14 @@ const fmtDur = s => {
 };
 const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB'
   : (n / 1048576).toFixed(1) + ' MB';
+// a model spec the way a person would say it: "giant/coder" and "coder"
+// are the coder giant, "ollama/qwen3:30b" is qwen3:30b
+const GIANT = /^(?:giant\/)?(general|research|coder)$/;
+const isGiant = spec => GIANT.test(spec || '');
+const modelName = spec => {
+  const g = GIANT.exec(spec || '');
+  return g ? g[1] + ' giant' : (spec || '').replace(/^ollama\//, '');
+};
 // how long a task takes on the chart: measured, else predicted from the
 // measured pace, else (nothing has finished yet) the planner's own guess
 const taskSecs = t => t.took || (['inprogress', 'reviewing'].includes(t.status)
@@ -86,6 +100,8 @@ async function loadFiles(force = false) {
     if (got.slug !== cur) return;
     filesInfo = got; filesSig = want;
     fileSet = new Set(got.files.map(f => f.path));
+    // something changed: the selected file's history may have grown
+    if (fileHist && !fileHist.loading) fileHist = null;
     if (visible) render(true);            // paths in what is shown become links
   } catch { /* the page still works without the list */ }
 }
@@ -122,6 +138,7 @@ async function pollLive() {
   data.state = lv.state;
   data.activity = lv.activity;
   data.live = lv.live;
+  liveOuts = lv.outputs || [];
   if (before !== after) { await refresh(); bus.emit('projects:changed'); return; }
   renderBar();
   if (tab === 'live') updateLive();
@@ -254,6 +271,7 @@ function forget() {                 // everything that belongs to one project
   data = null; sig = ''; filesInfo = null; fileSet = new Set(); filesSig = '';
   fileSel = ''; fileView = null; reportSel = ''; reportCache = {};
   allChanges = null; ganttOpen = new Set(); openDirs = new Set();
+  liveOuts = []; liveSel = null; fileHist = null; fileDiff = null; fileMode = 'file';
   runInfo = null; runText = ''; runNext = 0; checkRes = null; checking = false;
   clearTimeout(runTimer);
 }
@@ -411,7 +429,11 @@ function taskCard(t) {
     h('div', { class: 't', text: t.title }),
     h('div', { class: 'm', text: meta.join(' · ') }),
     badge(t.agent, 'who'),
-    model ? badge(model.replace(/^ollama\//, ''), 'model') : null,
+    model ? h('span', { class: 'badge model' + (isGiant(model) ? ' giant' : ''),
+      title: t.model_why ? modelName(model) + ' — ' + t.model_why : 'the model this task runs on',
+      text: modelName(model) }) : null,
+    t.hard && !isGiant(model) ? h('span', { class: 'badge', text: 'hard',
+      title: 'the planner marked this as hard — no giant could take it' }) : null,
     (t.skills || []).map(sk => badge(sk, 'skill')),
     t.research ? badge('web', 'web') : null,
     t.refine ? badge('refine', 'skill') : null,
@@ -467,28 +489,80 @@ function kanban() {
 
 // ---- gantt
 //
-// Everything the project has ever planned — finished work that has left
-// the board included — in measured time: a finished task is as long as it
-// took, a pending one as long as tasks of its size have been taking here.
-// Older batches fold into one line each; click a band to open it.
+// Everything the project has planned, in measured time — and the road
+// still ahead. The newest work is at the top: first the milestones not
+// yet reached (the furthest highest), then the current batch, then older
+// batches folded to a line each. A finished task is as long as it took, a
+// pending one as long as tasks of its size have been taking here, and a
+// milestone ahead as long as its estimated number of tasks would take.
+// Arrows are dependencies: a bar cannot start before what points at it.
+
+let ganttRun = store.get('aria_gantt_run', false);     // only the current run
+let ganttRoad = store.get('aria_gantt_road', true);    // the road ahead
+
+function ganttOptions(road, hidden) {
+  const opt = (label, on, set, tip) => {
+    const cb = h('input', { type: 'checkbox' });
+    cb.checked = on;
+    cb.onchange = () => { set(cb.checked); render(true); };
+    return h('label', { class: 'gopt', title: tip }, cb, ' ' + label);
+  };
+  const reached = road.filter(m => m.status === 'done').length;
+  return h('div', { class: 'gantt-opts' },
+    opt('Current run only', ganttRun, v => { ganttRun = v; store.set('aria_gantt_run', v); },
+        'hide everything from earlier runs'),
+    opt('Road ahead', ganttRoad, v => { ganttRoad = v; store.set('aria_gantt_road', v); },
+        'the milestones not yet reached, and what each one waits for'),
+    ganttRun && hidden ? h('span', { class: 'hint', text: hidden + ' earlier task' + (hidden === 1 ? '' : 's') + ' hidden' }) : null,
+    h('span', { class: 'grow' }),
+    road.length ? h('span', { class: 'road-sum', title: 'the road to the goal — click a milestone in the chart for what it needs' },
+      road.map(m => h('i', { class: m.status, title: m.id + ' — ' + m.title + ' (' + ROAD_SAY[m.status] + ')' })),
+      ' ' + reached + ' of ' + road.length + ' milestones reached') : null);
+}
+
+const ROAD_SAY = { done: 'reached', active: 'in progress', todo: 'ahead', skipped: 'not needed' };
+
+function openMilestone(m, road) {
+  const title = id => { const x = road.find(r => r.id === id); return x ? id + ' — ' + x.title : id; };
+  const mine = [...(data.plan.tasks || []), ...(data.history || [])].filter(t => t.milestone === m.id);
+  const after = road.filter(r => r.depends_on.includes(m.id));
+  modal(m.id + ' — ' + m.title, h('div', {},
+    h('dl', { class: 'kv' },
+      h('dt', { text: 'status' }), h('dd', { text: ROAD_SAY[m.status] || m.status }),
+      h('dt', { text: 'reached when' }), h('dd', { text: m.outcome || '—' }),
+      h('dt', { text: 'waits for' }), h('dd', { text: m.depends_on.map(title).join('; ') || 'nothing — it can start at any time' }),
+      h('dt', { text: 'unlocks' }), h('dd', { text: after.map(r => r.id + ' — ' + r.title).join('; ') || '—' }),
+      h('dt', { text: 'work' }), h('dd', { text: m.done + ' task(s) done' + (m.open ? ', ' + m.open + ' open' : '')
+        + (m.failed ? ', ' + m.failed + ' failed' : '') + ' — estimated about ' + (m.est_tasks || 3) + ' in all' })),
+    mine.length ? h('div', { class: 'ms-tasks' }, mine.map(t =>
+      h('button', { class: 'btn small', text: t.id + ' — ' + t.title + ' (' + t.status + ')', onclick: () => openTask(t) }))) : null));
+}
 
 function gantt() {
-  const tasks = [...(data.history || []), ...(data.plan.tasks || [])]
+  const st = data.state;
+  const firstIt = st.run_first_iteration || 0;
+  const all = [...(data.history || []), ...(data.plan.tasks || [])]
     .filter(t => t.status !== 'skipped');
-  if (!tasks.length)
-    return h('div', { class: 'empty' }, h('div', { class: 'big', text: 'No plan to chart yet' }),
-      'The Gantt chart is drawn from the plan: what depends on what, and how long each task takes.');
+  const tasks = ganttRun ? all.filter(t => (t.iteration || 0) > firstIt) : all;
+  const road = (data.roadmap || {}).milestones || [];
+  const ahead = ganttRoad ? road.filter(m => m.status === 'todo' || m.status === 'active') : [];
+  const options = ganttOptions(road, all.length - tasks.length);
+  if (!tasks.length && !ahead.length)
+    return h('div', { id: 'gantt' }, options,
+      h('div', { class: 'empty' }, h('div', { class: 'big', text: all.length ? 'Nothing in this run yet' : 'No plan to chart yet' }),
+        all.length ? 'Untick “Current run only” to see the earlier runs.'
+                   : 'The Gantt chart is drawn from the plan: what depends on what, and how long each task takes.'));
   const by = Object.fromEntries(tasks.map(t => [t.id, t]));
   const iters = [...new Set(tasks.map(t => t.iteration || 0))].sort((a, b) => a - b);
   const open = it => {                    // recent or unfinished batches start open
     const batch = tasks.filter(t => (t.iteration || 0) === it);
     const live = batch.some(t => !['done', 'failed'].includes(t.status));
-    const dflt = live || iters.indexOf(it) >= iters.length - 2;
+    const dflt = live || iters.indexOf(it) >= iters.length - 1;
     return ganttOpen.has(it) ? !dflt : dflt;
   };
   const start = {}, end = {};
   let offset = 0, spent = 0, left = 0;
-  const rows = [];
+  const bands = [];
   for (const it of iters) {              // batches run one after another
     const batch = tasks.filter(t => (t.iteration || 0) === it);
     const from = offset;
@@ -509,17 +583,51 @@ function gantt() {
     offset = Math.max(offset, ...batch.map(t => end[t.id]));
     const done = batch.filter(t => t.status === 'done').length;
     const failed = batch.filter(t => t.status === 'failed').length;
-    rows.push({ header: it, from, to: offset, open: open(it),
+    bands.push({ it, from, to: offset, open: open(it),
+      tasks: batch.sort((a, b) => start[a.id] - start[b.id]),
       note: batch.length + ' task' + (batch.length === 1 ? '' : 's') + ' · ' +
         fmtDur(batch.reduce((n, t) => n + (t.took || 0), 0) || offset - from) +
         (done ? ' · ✓ ' + done : '') + (failed ? ' · ✗ ' + failed : '') });
-    if (open(it))
-      batch.sort((a, b) => start[a.id] - start[b.id]).forEach(t => rows.push({ task: t }));
   }
-  const total = Math.max(1, offset);
+  // The road ahead: a milestone in progress runs from its first task to
+  // the end of what is planned plus what is still unplanned; one not yet
+  // started begins when everything it waits for has ended.
+  const finished = all.filter(t => t.status === 'done' && t.took);
+  const perTask = finished.length ? finished.reduce((n, t) => n + t.took, 0) / finished.length
+                                  : (data.pace || 3600);
+  let roadLeft = 0;
+  for (const m of ahead) {               // roadmap order: what it waits for comes first
+    const key = 'ms:' + m.id;
+    const mine = tasks.filter(t => t.milestone === m.id && end[t.id] !== undefined);
+    const waits = m.depends_on.map(d => end['ms:' + d]).filter(v => v !== undefined);
+    const unplanned = Math.max(mine.length ? 0 : 1, (m.est_tasks || 3) - m.done - m.open) * perTask;
+    if (mine.length) {
+      start[key] = Math.min(...mine.map(t => start[t.id]));
+      end[key] = Math.max(offset, ...mine.map(t => end[t.id])) + unplanned;
+    } else {
+      start[key] = Math.max(offset, ...waits);
+      end[key] = start[key] + unplanned;
+    }
+    roadLeft += unplanned;
+  }
+  const total = Math.max(1, offset, ...ahead.map(m => end['ms:' + m.id]));
+  const roadOpen = !ganttOpen.has('road');
+  // rows, top to bottom: the furthest future first, the oldest past last
+  const rows = [];
+  if (ahead.length) {
+    rows.push({ band: 'road', open: roadOpen, from: Math.min(...ahead.map(m => start['ms:' + m.id])), to: total,
+      label: 'THE ROAD AHEAD', note: ahead.length + ' milestone' + (ahead.length === 1 ? '' : 's') + ' to go'
+        + (roadLeft ? ' · about ' + fmtDur(roadLeft) + ' not yet planned' : '') });
+    if (roadOpen) [...ahead].reverse().forEach(m => rows.push({ ms: m }));
+  }
+  for (const b of [...bands].reverse()) {
+    rows.push({ band: b.it, open: b.open, from: b.from, to: b.to, note: b.note,
+      label: 'ITERATION ' + b.it + (b.it > firstIt && st.status === 'running' && b === bands[bands.length - 1] ? ' · NOW' : '') });
+    if (b.open) [...b.tasks].reverse().forEach(t => rows.push({ task: t }));
+  }
   const host = h('div', { id: 'gantt' });
   const W = Math.max(760, ($('#proj-body').clientWidth || 1100) - 70);
-  const LAB = Math.min(300, Math.round(W * .3)), PADR = 190, ROW = 30, TOP = 30;
+  const LAB = Math.min(300, Math.round(W * .3)), PADR = 200, ROW = 26, TOP = 28;
   const plotW = W - LAB - PADR;
   const X = s => LAB + (s / total) * plotW;
   const H = TOP + rows.length * ROW + 10;
@@ -532,13 +640,16 @@ function gantt() {
   };
   const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
   const defs = el('defs');
-  const marker = el('marker', { id: 'arr', viewBox: '0 0 8 8', refX: 7, refY: 4,
-                                markerWidth: 7, markerHeight: 7, orient: 'auto' });
-  marker.append(el('path', { d: 'M0,0 L8,4 L0,8 z', fill: '#4a6690' }));
+  const arrow = (id, fill) => {
+    const marker = el('marker', { id, viewBox: '0 0 8 8', refX: 7, refY: 4,
+                                  markerWidth: 7, markerHeight: 7, orient: 'auto' });
+    marker.append(el('path', { d: 'M0,0 L8,4 L0,8 z', fill }));
+    return marker;
+  };
   const stripes = el('pattern', { id: 'work', width: 8, height: 8,
     patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
   stripes.append(el('rect', { width: 4, height: 8, fill: 'rgba(255,255,255,.28)' }));
-  defs.append(marker, stripes);
+  defs.append(arrow('arr', '#4a6690'), arrow('arr-ms', '#8f6bc4'), stripes);
   svg.append(defs);
   // time axis: a step that gives about ten marks
   const step = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400,
@@ -549,42 +660,81 @@ function gantt() {
     svg.append(el('text', { x: X(s), y: 14, fill: '#4d5f77', 'font-size': 10.5,
                             'text-anchor': 'middle' }, s ? fmtDur(s) : '0'));
   }
+  if (offset > 0 && offset < total)       // where the plan ends and the road begins
+    svg.append(el('line', { x1: X(offset), y1: TOP - 8, x2: X(offset), y2: H - 6,
+                            stroke: '#8f6bc4', 'stroke-width': 1, 'stroke-dasharray': '3 4', opacity: .7 }));
   const colors = {};
   let ci = 0;
   const yOf = {};
-  rows.forEach((r, i) => { if (r.task) yOf[r.task.id] = TOP + i * ROW; });
-  // dependency connectors first, so bars sit on top of them
+  rows.forEach((r, i) => {
+    if (r.task) yOf[r.task.id] = TOP + i * ROW;
+    if (r.ms) yOf['ms:' + r.ms.id] = TOP + i * ROW;
+  });
+  // dependency connectors first, so bars sit on top of them: leave from
+  // the end of what is waited for, run to this row, arrive at the bar's
+  // start — clear of the labels beside the bars
+  const connect = (from, to, stroke, mark) => {
+    if (yOf[from] === undefined || yOf[to] === undefined || end[from] === undefined) return;
+    const x2 = X(start[to]), y2 = yOf[to] + ROW / 2;
+    const x1 = Math.min(X(end[from]) - 5, x2 - 9);
+    const y1 = yOf[from] + (yOf[from] < yOf[to] ? ROW - 6 : 6);
+    // work can run out of order: a milestone begun before the one it waits
+    // for. Then come back from that one's bar, so the line starts at
+    // something instead of in the empty part of its row.
+    const late = start[from] !== undefined && X(start[from]) > x1;
+    const d = late ? `M${X(start[from])},${yOf[from] + ROW / 2} H${x1} V${y2} H${x2 - 1}`
+                   : `M${x1},${y1} V${y2} H${x2 - 1}`;
+    svg.append(el('path', { d, fill: 'none', stroke, 'stroke-width': 1.3,
+                            'marker-end': `url(#${mark})` }));
+  };
   for (const r of rows) {
-    const t = r.task;
-    if (!t) continue;
-    for (const d of t.depends_on) {
-      if (yOf[d] === undefined || end[d] === undefined) continue;
-      // leave from under the end of the dependency's bar, drop to this
-      // row, arrive at the bar's start — clear of the labels beside bars
-      const x2 = X(start[t.id]), y2 = yOf[t.id] + ROW / 2;
-      const x1 = Math.min(X(end[d]) - 5, x2 - 9);
-      const y1 = yOf[d] + (yOf[d] < yOf[t.id] ? 23 : 7);
-      svg.append(el('path', { d: `M${x1},${y1} V${y2} H${x2 - 1}`,
-        fill: 'none', stroke: '#4a6690', 'stroke-width': 1.3, 'marker-end': 'url(#arr)' }));
-    }
+    if (r.task) for (const d of r.task.depends_on) connect(d, r.task.id, '#4a6690', 'arr');
+    if (r.ms) for (const d of r.ms.depends_on) connect('ms:' + d, 'ms:' + r.ms.id, '#8f6bc4', 'arr-ms');
   }
+  const titleOf = id => { const m = road.find(r => r.id === id); return m ? m.title : ''; };
   rows.forEach((r, i) => {
     const y = TOP + i * ROW;
-    if (r.header !== undefined) {
+    if (r.band !== undefined) {
       const g = el('g', { class: 'g-band', style: 'cursor:pointer' });
       g.append(el('rect', { x: 0, y: y + 1, width: W, height: ROW - 2, fill: 'transparent' }));
-      g.append(el('text', { x: 2, y: y + 19, fill: '#7d8fa5', 'font-size': 10.5,
-        'letter-spacing': 1.5 }, (r.open ? '▾ ' : '▸ ') + 'ITERATION ' + r.header));
-      g.append(el('text', { x: 118, y: y + 19, fill: '#4d5f77', 'font-size': 10.5 }, r.note));
-      if (!r.open)                         // folded: the whole batch as one bar
-        g.append(el('rect', { x: X(r.from), y: y + 9, width: Math.max(7, X(r.to) - X(r.from)),
-                              height: 12, rx: 4, fill: '#7d8fa5', opacity: .45 }));
-      g.append(el('line', { x1: 2, y1: y + 25, x2: W - 4, y2: y + 25, stroke: '#1a2638' }));
-      g.append(el('title', {}, r.open ? 'click to fold this batch' : 'click to show its tasks'));
+      g.append(el('text', { x: 2, y: y + 17, fill: r.band === 'road' ? '#a78bda' : '#7d8fa5', 'font-size': 10.5,
+        'letter-spacing': 1.5 }, (r.open ? '▾ ' : '▸ ') + r.label));
+      // (the label is letter-spaced: about 8 px a character, marker included)
+      g.append(el('text', { x: 10 + (r.label.length + 2) * 8.1, y: y + 17, fill: '#4d5f77', 'font-size': 10.5 }, r.note));
+      if (!r.open)                         // folded: the whole band as one bar
+        g.append(el('rect', { x: X(r.from), y: y + 8, width: Math.max(7, X(r.to) - X(r.from)),
+                              height: 10, rx: 4, fill: r.band === 'road' ? '#8f6bc4' : '#7d8fa5', opacity: .4 }));
+      g.append(el('line', { x1: 2, y1: y + ROW - 3, x2: W - 4, y2: y + ROW - 3, stroke: '#1a2638' }));
+      g.append(el('title', {}, r.open ? 'click to fold' : 'click to unfold'));
       g.addEventListener('click', () => {
-        ganttOpen.has(r.header) ? ganttOpen.delete(r.header) : ganttOpen.add(r.header);
+        ganttOpen.has(r.band) ? ganttOpen.delete(r.band) : ganttOpen.add(r.band);
         render(true);
       });
+      svg.append(g);
+      return;
+    }
+    const max = Math.floor((LAB - 44) / 6.1);
+    const clip = s => (s.length > max ? s.slice(0, max - 1) + '…' : s);
+    if (r.ms) {                            // a milestone still ahead
+      const m = r.ms, key = 'ms:' + m.id;
+      const x = X(start[key]), w = Math.max(9, X(end[key]) - x);
+      const g = el('g', { class: 'g-row g-ms', style: 'cursor:pointer' });
+      g.append(el('rect', { class: 'hit', x: 0, y: y + 1, width: W, height: ROW - 2, fill: 'transparent' }));
+      g.append(el('text', { x: 4, y: y + 17, fill: '#8f6bc4', 'font-size': 10.5, 'font-family': 'monospace' }, m.id));
+      g.append(el('text', { x: 38, y: y + 17, fill: '#c9b8ec', 'font-size': 12 }, clip(m.title)));
+      const bar = { x, y: y + 7, width: w, height: 12, rx: 6 };
+      g.append(el('rect', { ...bar, fill: '#8f6bc4', 'fill-opacity': m.status === 'active' ? .3 : .1,
+                            stroke: '#8f6bc4', 'stroke-width': 1.2, 'stroke-dasharray': m.status === 'active' ? '' : '5 3' }));
+      if (m.status === 'active') g.append(el('rect', { ...bar, fill: 'url(#work)', opacity: .7 }));
+      const size = end[key] - start[key];
+      g.append(el('text', { x: x + w + 7, y: y + 17, fill: '#7d8fa5', 'font-size': 10.5 },
+        (m.status === 'active' ? '▶ ' + m.done + ' of ~' + Math.max(m.est_tasks || 3, m.done + m.open) + ' tasks'
+                               : '○ ~' + (m.est_tasks || 3) + ' tasks') + ' · ≈ ' + fmtDur(size)
+        + (m.depends_on.length ? ' · after ' + m.depends_on.join(', ') : '')));
+      g.append(el('title', {}, `${m.id} — ${m.title}\n${ROAD_SAY[m.status]}` +
+        (m.outcome ? '\nreached when: ' + m.outcome : '') +
+        (m.depends_on.length ? '\nwaits for: ' + m.depends_on.map(d => d + ' ' + titleOf(d)).join('; ') : '')));
+      g.addEventListener('click', () => openMilestone(m, road));
       svg.append(g);
       return;
     }
@@ -594,12 +744,11 @@ function gantt() {
     const x = X(start[t.id]), w = Math.max(7, X(end[t.id]) - x);
     const g = el('g', { class: 'g-row', style: 'cursor:pointer' });
     g.append(el('rect', { class: 'hit', x: 0, y: y + 1, width: W, height: ROW - 2, fill: 'transparent' }));
-    const max = Math.floor((LAB - 44) / 6.1);
-    g.append(el('text', { x: 4, y: y + 19, fill: '#4d5f77', 'font-size': 10.5,
+    g.append(el('text', { x: 4, y: y + 17, fill: '#4d5f77', 'font-size': 10.5,
                           'font-family': 'monospace' }, t.id));
-    g.append(el('text', { x: 38, y: y + 19, fill: t.status === 'done' ? '#7d8fa5' : '#d7e2ee',
-      'font-size': 12 }, t.title.length > max ? t.title.slice(0, max - 1) + '…' : t.title));
-    const bar = { x, y: y + 8, width: w, height: 14, rx: 4 };
+    g.append(el('text', { x: 38, y: y + 17, fill: t.status === 'done' ? '#7d8fa5' : '#d7e2ee',
+      'font-size': 12 }, clip(t.title)));
+    const bar = { x, y: y + 7, width: w, height: 12, rx: 4 };
     if (t.status === 'done') g.append(el('rect', { ...bar, fill: col }));
     else if (t.status === 'failed') g.append(el('rect', { ...bar, fill: col, opacity: .55 }));
     else if (t.needs_human)          // waiting on the owner: amber, dashed
@@ -614,11 +763,13 @@ function gantt() {
     const mark = { done: '✓', failed: '✗', inprogress: '● working',
                    reviewing: '◐ reviewing' }[t.status]
       || (t.needs_human ? '⚑ needs you' : t.held ? 'behind a decision' : '');
-    g.append(el('text', { x: x + w + 7, y: y + 19, fill: '#7d8fa5', 'font-size': 10.5 },
-      [t.agent, timeNote(t), mark].filter(Boolean).join(' · ')));
+    g.append(el('text', { x: x + w + 7, y: y + 17, fill: '#7d8fa5', 'font-size': 10.5 },
+      [t.agent, timeNote(t), mark, t.milestone].filter(Boolean).join(' · ')));
     g.append(el('title', {}, `${t.id} — ${t.title}\n${t.agent}` +
-      (t.model_used || t.model ? ' on ' + (t.model_used || t.model) : '') +
+      (t.model_used || t.model ? ' on ' + modelName(t.model_used || t.model) : '') +
+      (t.model_why ? ' — ' + t.model_why : '') +
       `\nstatus: ${t.status}` + (timeNote(t) ? ' · ' + timeNote(t) : '') +
+      (t.milestone ? '\ntowards: ' + t.milestone + ' ' + titleOf(t.milestone) : '') +
       (t.first_started || t.started ? '\nstarted ' + (t.first_started || t.started).replace('T', ' ') : '') +
       (t.finished ? '\nfinished ' + t.finished.replace('T', ' ') : '') +
       (t.needs_human ? '\nwaiting for your decision' : '') +
@@ -632,22 +783,64 @@ function gantt() {
     h('span', {}, h('i', { style: { background: '#7d8fa5' } }), 'done'),
     h('span', {}, h('i', { style: { background: 'repeating-linear-gradient(45deg,#7d8fa5 0 3px,#3a4658 3px 6px)' } }), 'in progress'),
     h('span', {}, h('i', { style: { background: 'transparent', border: '1px solid #7d8fa5' } }), 'to do'),
-    tasks.some(t => t.needs_human) ? h('span', {}, h('i', { style: { background: 'rgba(251,191,36,.14)', border: '1px dashed #fbbf24' } }), 'needs you') : null);
+    ahead.length ? h('span', {}, h('i', { style: { background: 'rgba(143,107,196,.12)', border: '1px dashed #8f6bc4', borderRadius: '6px' } }), 'milestone ahead') : null,
+    tasks.some(t => t.needs_human) ? h('span', {}, h('i', { style: { background: 'rgba(251,191,36,.14)', border: '1px dashed #fbbf24' } }), 'needs you') : null,
+    h('span', {}, '→ waits for'));
   const pace = h('div', { class: 'gantt-pace' }, data.pace
     ? [h('b', { text: fmtDur(spent) }), ' of work done',
-       left > 0 ? [' · about ', h('b', { text: fmtDur(left) }), ' left at the pace measured so far'] : null,
-       h('span', { class: 'hint', text: ' — a finished bar is as long as the task took; the rest are predicted from that.' })]
-    : h('span', { class: 'hint', text: 'Nothing has finished yet, so these lengths are the planner\'s own guess. Measured times replace them as tasks complete.' }));
-  host.append(legend, pace, svg);
+       left + roadLeft > 0 ? [' · about ', h('b', { text: fmtDur(left + roadLeft) }), ' to the goal at the pace measured so far'] : null,
+       h('span', { class: 'hint', text: ' — newest on top; a finished bar is as long as the task took, the rest are predicted from that.' })]
+    : h('span', { class: 'hint', text: 'Newest on top. Nothing has finished yet, so these lengths are the planner\'s own guess — measured times replace them as tasks complete.' }));
+  host.append(options, legend, pace, svg);
   return host;
 }
 
 // ---- live
 
+// "Right now" is what she is writing as she writes it. The arrows beside
+// it step back through what she wrote before — every draft, plan and
+// verdict, whole — and forward again to the present.
+
 function live() {
   return h('div', { id: 'live' },
-    h('div', { class: 'panel' }, h('h2', {}, 'Right now'), h('div', { class: 'p-body', id: 'live-now' })),
+    h('div', { class: 'panel' },
+      h('h2', { class: 'pager' },
+        h('button', { class: 'pg', id: 'live-older', text: '◀', title: 'the output before this one', onclick: () => stepLive(1) }),
+        h('span', { id: 'live-title', text: 'Right now' }),
+        h('button', { class: 'pg', id: 'live-newer', text: '▶', title: 'the output after this one', onclick: () => stepLive(-1) }),
+        h('span', { class: 'grow' }),
+        h('span', { class: 'hint', id: 'live-pos' })),
+      h('div', { class: 'p-body', id: 'live-now' })),
     h('div', { class: 'panel' }, h('h2', {}, 'Activity'), h('div', { class: 'p-body feed', id: 'live-feed' })));
+}
+
+// Step to an older (+1) or newer (-1) output. The one being looked at is
+// remembered by its number, so it stays put while new ones arrive.
+function stepLive(by) {
+  const at = liveSel == null ? -1 : liveOuts.findIndex(o => o.n === liveSel);
+  const to = Math.max(-1, Math.min(liveOuts.length - 1, at + by));
+  liveSel = to < 0 ? null : liveOuts[to].n;
+  updateLive();
+}
+
+// One earlier output, in full.
+function pastOutput(o) {
+  const full = liveOut[cur + '/' + o.n];
+  if (!full) {
+    api.get('/api/project/output?slug=' + encodeURIComponent(cur) + '&n=' + o.n)
+      .then(got => { liveOut[cur + '/' + o.n] = got; if (liveSel === o.n) updateLive(); })
+      .catch(e => { liveOut[cur + '/' + o.n] = { text: '', error: e.message }; if (liveSel === o.n) updateLive(); });
+  }
+  // the same clock as the activity log beside it
+  const when = new Date(o.ended * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  return [
+    h('div', { class: 'now', text: o.title ? o.task + ' — ' + o.title : o.label }),
+    h('div', { class: 'now-sub' }, o.title ? badge(o.label, 'who') : null,
+      o.attempt > 1 ? badge('attempt ' + o.attempt) : null,
+      ' finished ' + when + ' · took ' + fmtDur(o.ended - o.started) + ' · ' + o.chars.toLocaleString() + ' characters'),
+    !full ? h('div', { class: 'hint', text: 'fetching it…' })
+      : full.error ? h('div', { class: 'hint', text: full.error })
+      : h('div', { class: 'tokens past', text: full.text })];
 }
 
 function updateLive() {
@@ -655,6 +848,20 @@ function updateLive() {
   if (!now || !data) return;
   const st = data.state, lv = data.live || {}, c = st.current;
   const kids = [];
+  let at = liveSel == null ? -1 : liveOuts.findIndex(o => o.n === liveSel);
+  if (liveSel != null && at < 0) liveSel = null;         // no longer kept
+  $('#live-title').textContent = at < 0 ? 'Right now' : at === 0 ? 'The output before' : (at + 1) + ' outputs back';
+  $('#live-older').disabled = at >= liveOuts.length - 1;
+  $('#live-newer').disabled = at < 0;
+  $('#live-pos').textContent = !liveOuts.length ? ''
+    : at < 0 ? '◀ ' + liveOuts.length + ' earlier output' + (liveOuts.length === 1 ? '' : 's')
+    : (at + 1) + ' of ' + liveOuts.length;
+  if (at >= 0) {
+    const shown = now.dataset.shown === String(liveSel) && now.querySelector('.tokens.past');
+    if (!shown) { clear(now, pastOutput(liveOuts[at])); now.scrollTop = 0; }
+    now.dataset.shown = now.querySelector('.tokens.past') ? String(liveSel) : '';
+  } else {
+  now.dataset.shown = '';
   if (st.status !== 'running') {
     kids.push(h('div', { class: 'now', text: { idle: 'Autopilot is not running.',
       stopped: 'Stopped at your request.', complete: 'Run complete.',
@@ -674,7 +881,7 @@ function updateLive() {
     kids.push(h('div', { class: 'now-sub', text: st.waiting }));
   } else if (c) {
     kids.push(h('div', { class: 'now', text: c.title }));
-    kids.push(h('div', { class: 'now-sub' }, badge(c.agent, 'who'), badge(c.model, 'model'),
+    kids.push(h('div', { class: 'now-sub' }, badge(c.agent, 'who'), badge(modelName(c.model), 'model'),
       c.attempt > 1 ? badge('attempt ' + c.attempt) : null,
       ' ' + (st.phase === 'reviewing' ? 'being verified' : 'in progress') + ' · started ' + ago(c.started)));
   } else {
@@ -685,11 +892,12 @@ function updateLive() {
     kids.push(h('div', { class: 'hint', text: (lv.label || '') + (lv.text ? '' : ' …') }));
     if (lv.text) kids.push(h('div', { class: 'tokens live', text: lv.text }));
   }
-  const tok = now.querySelector('.tokens');
-  const pinned = !tok || tok.scrollHeight - tok.scrollTop - tok.clientHeight < 60;
+  if (st.status !== 'running' && liveOuts.length)
+    kids.push(h('div', { class: 'hint', text: '◀ steps back through what she wrote — the most recent output is one click away.' }));
+  const pinned = now.scrollHeight - now.scrollTop - now.clientHeight < 60;
   clear(now, kids);
-  const tok2 = now.querySelector('.tokens');
-  if (tok2 && pinned) now.scrollTop = now.scrollHeight;
+  if (now.querySelector('.tokens') && pinned) now.scrollTop = now.scrollHeight;
+  }
   const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
   const own = cur + ': ';              // every line here is about this project
   clear(feed, (data.activity || []).map(ev =>
@@ -736,6 +944,7 @@ function fileTree(rows) {
 }
 
 function pickFile(path) {
+  if (path !== fileSel) { fileHist = null; fileDiff = null; fileMode = 'file'; }
   fileSel = path; fileView = null;
   // make sure the file can be seen in the tree: folders below the top
   // level are shut unless opened, top-level ones are open unless shut
@@ -777,15 +986,124 @@ function fileBody(v) {
     h('pre', { class: 'src', text: lines.join('\n') }));
 }
 
+// A file's history: every verified change to it, and each change as
+// GitHub would show it — the previous version beside the modified one.
+
+async function loadFileHistory() {
+  const path = fileSel;
+  fileHist = { path, loading: true, changes: [] };
+  try {
+    const r = await api.get('/api/file/history?slug=' + encodeURIComponent(cur) + '&path=' + encodeURIComponent(path));
+    if (path !== fileSel) return;
+    fileHist = r;
+  } catch {
+    if (path !== fileSel) return;
+    fileHist = { path, changes: [] };
+  }
+  render(true);
+}
+
+async function loadDiff(task) {
+  const path = fileSel;
+  fileDiff = { task, loading: true };
+  render(true);
+  let got;
+  try {
+    got = { task, data: await api.get('/api/file/diff?slug=' + encodeURIComponent(cur)
+      + '&path=' + encodeURIComponent(path) + '&task=' + encodeURIComponent(task)) };
+  } catch (e) { got = { task, error: e.message }; }
+  if (path !== fileSel || !fileDiff || fileDiff.task !== task) return;
+  fileDiff = got;
+  render(true);
+}
+
+// Open one change to one file, from anywhere (the Changes tab, a task).
+function openDiff(path, task) {
+  pickFile(path);
+  fileMode = 'history';
+  loadDiff(task);
+}
+
+function diffTable(d) {
+  const cell = (cls, text) => h('td', { class: cls, text: text == null ? '' : text });
+  const body = h('tbody');
+  for (const r of d.rows) {
+    if (r.k === 'skip') {
+      body.append(h('tr', { class: 'skip' }, h('td', { colSpan: diffSplit ? 4 : 3,
+        text: '⋯ ' + r.n + ' unchanged line' + (r.n === 1 ? '' : 's') })));
+    } else if (diffSplit) {
+      body.append(h('tr', { class: r.k },
+        cell('n', r.ln), cell('l' + (r.l == null ? ' none' : ''), r.l),
+        cell('n', r.rn), cell('r' + (r.r == null ? ' none' : ''), r.r)));
+    } else {
+      if (r.k === 'same')
+        body.append(h('tr', { class: 'same' }, cell('n', r.ln), cell('n', r.rn), cell('u', '  ' + r.l)));
+      if (r.l != null && r.k !== 'same')
+        body.append(h('tr', { class: 'del' }, cell('n', r.ln), cell('n', ''), cell('u l', '− ' + r.l)));
+      if (r.r != null && r.k !== 'same')
+        body.append(h('tr', { class: 'add' }, cell('n', ''), cell('n', r.rn), cell('u r', '+ ' + r.r)));
+    }
+  }
+  const col = w => h('col', w ? { style: { width: w } } : {});
+  return h('table', { class: 'diff' + (diffSplit ? ' split' : ' unified') },
+    // (a fixed-layout table takes its column widths from here, not from
+    // the two wide header cells)
+    h('colgroup', {}, diffSplit ? [col('46px'), col(), col('46px'), col()]
+                                : [col('46px'), col('46px'), col()]),
+    diffSplit ? h('thead', {}, h('tr', {},
+      h('th', { colSpan: 2, text: d.before ? 'Previous version' : 'Previous version — the file did not exist' }),
+      h('th', { colSpan: 2, text: d.latest ? 'Modified version — as it is now' : 'Modified version' }))) : null,
+    body);
+}
+
+function historyView() {
+  const changes = (fileHist && fileHist.path === fileSel && fileHist.changes) || [];
+  if (fileHist && fileHist.loading) return h('div', { class: 'dim', text: 'Reading its history…' });
+  if (!changes.length)
+    return h('div', { class: 'dim', text: 'No recorded changes to this file — it was here before she started, or was written by hand.' });
+  const sel = fileDiff ? fileDiff.task : changes[0].task;
+  if (!fileDiff) loadDiff(sel);
+  const at = changes.findIndex(c => c.task === sel);
+  const list = h('div', { class: 'hlist' }, changes.map(c =>
+    h('button', { class: 'hrow' + (c.task === sel ? ' on' : ''), onclick: () => loadDiff(c.task),
+      title: (c.why ? 'why: ' + c.why + '\n' : '') + c.agent + ' on ' + modelName(c.model) },
+      h('span', { class: 'tid', text: c.task }),
+      h('span', { class: 'ht', text: c.title }),
+      h('span', { class: 'plus', text: '+' + c.added }), h('span', { class: 'minus', text: '−' + c.removed }),
+      h('span', { class: 'hw', text: c.action === 'created' ? 'created' : ago(c.t) }))));
+  const d = fileDiff && fileDiff.task === sel ? fileDiff : null;
+  return h('div', { class: 'hist' }, list,
+    h('div', { class: 'dbar' },
+      h('button', { class: 'btn small', text: '◀ older', disabled: at >= changes.length - 1,
+        onclick: () => loadDiff(changes[at + 1].task) }),
+      h('button', { class: 'btn small', text: 'newer ▶', disabled: at <= 0,
+        onclick: () => loadDiff(changes[at - 1].task) }),
+      d && d.data ? h('span', { class: 'hint' }, h('span', { class: 'plus', text: '+' + d.data.added }), ' ',
+        h('span', { class: 'minus', text: '−' + d.data.removed }), ' in ',
+        h('button', { class: 'linkish', text: sel + ' — ' + d.data.title, onclick: () => openTask(findTask(sel)) })) : null,
+      h('span', { class: 'grow' }),
+      h('button', { class: 'btn small', text: diffSplit ? 'Unified' : 'Side by side',
+        onclick: () => { diffSplit = !diffSplit; store.set('aria_diff_split', diffSplit); render(true); } })),
+    !d || d.loading ? h('div', { class: 'dim', text: 'Comparing…' })
+      : d.error ? h('div', { class: 'dim', text: d.error })
+      : d.data.rows.length ? h('div', { class: 'dwrap' }, diffTable(d.data))
+      : h('div', { class: 'dim', text: 'This change left the file exactly as it was.' }));
+}
+
 function files() {
   if (!filesInfo) { loadFiles(true); return h('div', { class: 'empty', text: 'Reading the project folder…' }); }
   const tools = filesInfo.tools || {};
   const rows = filesInfo.files.filter(f => showRecords || !f.record);
   const hidden = filesInfo.files.length - rows.length;
   if (fileSel && (!fileView || fileView.path !== fileSel)) loadFileView();
+  if (fileSel && (!fileHist || fileHist.path !== fileSel)) loadFileHistory();
   const sel = filesInfo.files.find(f => f.path === fileSel);
   const v = fileView && fileView.path === fileSel ? fileView : null;
   const isMd = sel && /\.md$/i.test(sel.path);
+  const nChanges = fileHist && fileHist.path === fileSel ? fileHist.changes.length : 0;
+  const mode = fileMode === 'history' ? 'history' : 'file';
+  const seg = (name, label) => h('button', { class: mode === name ? 'on' : '', text: label,
+    onclick: () => { fileMode = name; if (name === 'file') fileDiff = null; render(true); } });
   return h('div', { id: 'files' },
     h('div', { class: 'fbar' },
       h('span', { class: 'fwhere', title: 'where this project lives on your machine' }, '📁 ', h('code', { text: filesInfo.path })),
@@ -805,7 +1123,7 @@ function files() {
         : h('div', { class: 'dim', text: 'No files yet — they appear here as she writes them.' })),
       h('div', { class: 'fview' }, !sel && !fileSel
         ? h('div', { class: 'empty' }, h('div', { class: 'big', text: rows.length + ' file' + (rows.length === 1 ? '' : 's') }),
-            'Pick a file on the left. Files she has changed carry the task that last touched them.')
+            'Pick a file on the left. Files she has changed carry the task that last touched them — and keep their earlier versions.')
         : [h('div', { class: 'fhead' },
             h('code', { class: 'fpath', text: fileSel }),
             sel ? h('span', { class: 'hint', text: (sel.lines ? sel.lines + ' lines · ' : '') + fmtSize(sel.size) }) : null,
@@ -813,13 +1131,16 @@ function files() {
               text: sel.by.task + ' — ' + (sel.by.title.length > 40 ? sel.by.title.slice(0, 39) + '…' : sel.by.title),
               onclick: () => openTask(findTask(sel.by.task)) }) : null,
             h('span', { class: 'grow' }),
-            isMd ? h('button', { class: 'btn small', text: store.get('files-raw', false) ? 'Rendered' : 'Source',
+            h('span', { class: 'seg', title: 'the file as it is, or what each change did to it' },
+              seg('file', 'File'), seg('history', 'Changes' + (nChanges ? ' (' + nChanges + ')' : ''))),
+            isMd && mode === 'file' ? h('button', { class: 'btn small', text: store.get('files-raw', false) ? 'Rendered' : 'Source',
               onclick: () => { store.set('files-raw', !store.get('files-raw', false)); render(true); } }) : null,
             h('button', { class: 'btn small', text: 'Copy path',
               onclick: () => copyText(filesInfo.path + '/' + fileSel, 'Path') }),
             h('button', { class: 'btn small', text: 'Open in ' + (tools.editor || 'editor'), disabled: !tools.editor || !sel,
               onclick: () => openOnDesktop('editor', fileSel) })),
-           h('div', { class: 'fbody' }, v ? fileBody(v) : h('div', { class: 'dim', text: 'Loading…' }))])));
+           h('div', { class: 'fbody' }, mode === 'history' ? historyView()
+             : v ? fileBody(v) : h('div', { class: 'dim', text: 'Loading…' }))])));
 }
 
 const findTask = id => (data.plan.tasks || []).find(t => t.id === id)
@@ -1047,7 +1368,11 @@ function changeCard(r) {
   const files = (r.files || []).map(f => h('div', {}, fileLink(f.path), ' ',
     h('span', { class: 'delta' }, f.action + ' ',
       h('span', { class: 'add', text: '+' + f.added }), ' ',
-      h('span', { class: 'del', text: '−' + f.removed }))));
+      h('span', { class: 'del', text: '−' + f.removed })),
+    // what this change did to the file: the previous version beside the new
+    r.status === 'done' && (f.kept || r.commit) ? [' ', h('button', { class: 'linkish',
+      text: 'see the change', title: 'previous version | modified version',
+      onclick: () => openDiff(f.path, r.task) })] : null));
   const refs = [fileLink(r.output)];
   if (r.commit) refs.push(' · commit ', h('code', { text: r.commit }));
   for (const s of r.sources || [])
@@ -1204,7 +1529,10 @@ async function openTask(t) {
     h('dl', { class: 'kv' },
       h('dt', { text: 'status' }), h('dd', { text: t.status + (t.attempts > 1 ? ' · attempt ' + t.attempts : '') }),
       h('dt', { text: 'agent' }), h('dd', { text: t.agent }),
-      h('dt', { text: 'model' }), h('dd', { text: model }),
+      h('dt', { text: 'model' }), h('dd', { text: (model === 'agent default' ? model : modelName(model))
+        + (t.model_why ? ' — ' + t.model_why : '') }),
+      t.milestone ? [h('dt', { text: 'towards' }), h('dd', { text: t.milestone + ' — '
+        + ((((data.roadmap || {}).milestones || []).find(m => m.id === t.milestone) || {}).title || '') })] : null,
       h('dt', { text: 'skills' }), h('dd', { text: (t.skills || []).join(', ') || '—' }),
       h('dt', { text: 'depends on' }), h('dd', { text: t.depends_on.join(', ') || '—' }),
       h('dt', { text: 'done when' }), h('dd', { text: t.done_when }),

@@ -87,7 +87,11 @@ TEXT_SUFFIXES = {
     ".svelte", ".tf", ".dockerfile", ".gd", ".dart", ".ex", ".exs", ""}
 
 LIVE = {}                   # slug -> what is being generated right now
+LIVE_NOTE = {}              # slug -> what that stream belongs to (a task…)
 _LIVE_LOCK = threading.Lock()
+LIVE_TAIL = 6000            # of the current stream, what every poll carries
+LIVE_FULL = 240_000         # of a stream, what is kept once it is over
+KEEP_OUTPUTS = 40           # finished streams kept per project
 
 
 class Busy(RuntimeError):
@@ -216,8 +220,80 @@ def activity(slug, limit=150):
 
 
 def live(slug):
+    """What is being generated right now (the tail of it — a poll every
+    second and a half should stay small)."""
     with _LIVE_LOCK:
-        return dict(LIVE.get(slug) or {})
+        cur = dict(LIVE.get(slug) or {})
+    if cur:
+        cur["chars"] = len(cur.get("text", ""))
+        cur["text"] = cur.get("text", "")[-LIVE_TAIL:]
+    return cur
+
+
+def _keep_output(slug, cur):
+    """A stream that is over goes on record, whole: the Live tab can step
+    back through what she wrote before — every draft, plan and verdict.
+    Kept as <n>.json (what it was) beside <n>.txt (what was written), so
+    listing them never reads the text."""
+    text = (cur or {}).get("text", "")
+    if not text.strip():
+        return
+    try:
+        folder = _auto(slug) / "live"
+        folder.mkdir(exist_ok=True)
+        have = sorted(int(f.stem) for f in folder.glob("*.json")
+                      if f.stem.isdigit())
+        n = (have[-1] if have else 0) + 1
+        text = text[-LIVE_FULL:]
+        (folder / f"{n}.txt").write_text(text, encoding="utf-8")
+        _write_json(folder / f"{n}.json", {
+            "n": n, "label": cur.get("label", ""), "chars": len(text),
+            "started": cur.get("at", 0), "ended": time.time(),
+            **{k: cur[k] for k in ("task", "title", "attempt", "agent")
+               if cur.get(k)}})
+        for old in have[:max(0, len(have) + 1 - KEEP_OUTPUTS)]:
+            (folder / f"{old}.json").unlink(missing_ok=True)
+            (folder / f"{old}.txt").unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass                            # a record of output, never a blocker
+
+
+def _close_live(slug):
+    """The stream in hand is over (a new one starts, or the run ends)."""
+    with _LIVE_LOCK:
+        cur = LIVE.get(slug)
+        if cur is not None:
+            cur, LIVE[slug] = dict(cur), dict(cur, text="", kept=True)
+    if cur and not cur.get("kept"):
+        _keep_output(slug, cur)
+
+
+def outputs(slug, limit=KEEP_OUTPUTS):
+    """The finished streams on record, newest first — what each was, not
+    its text."""
+    folder = eng._auto_dir(slug, create=False) / "live"
+    rows = []
+    for f in sorted(folder.glob("*.json") if folder.is_dir() else [],
+                    key=lambda f: int(f.stem) if f.stem.isdigit() else 0,
+                    reverse=True)[:limit]:
+        row = _read_json(f, None)
+        if isinstance(row, dict) and row.get("n"):
+            rows.append(row)
+    return rows
+
+
+def output(slug, n):
+    """One finished stream, whole."""
+    folder = eng._auto_dir(slug, create=False) / "live"
+    row = _read_json(folder / f"{int(n)}.json", None)
+    if not isinstance(row, dict):
+        raise ValueError("that output is no longer kept")
+    try:
+        row["text"] = (folder / f"{int(n)}.txt").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        row["text"] = ""
+    return row
 
 
 def _emitter(slug, emit):
@@ -227,12 +303,17 @@ def _emitter(slug, emit):
         kind = ev.get("event")
         if kind == "token":
             with _LIVE_LOCK:
-                cur = LIVE.setdefault(slug, {"label": "", "text": ""})
-                cur["text"] = (cur["text"] + ev.get("text", ""))[-6000:]
+                cur = LIVE.setdefault(slug, {"label": "", "text": "",
+                                             "at": time.time()})
+                if cur.pop("kept", None):       # tokens after a close: a
+                    cur.update(text="", at=time.time())   # stream of its own
+                cur["text"] = (cur["text"] + ev.get("text", ""))[-LIVE_FULL:]
         elif kind == "thinking":
+            _close_live(slug)
             with _LIVE_LOCK:
                 LIVE[slug] = {"label": ev.get("label", ""), "text": "",
-                              "at": time.time()}
+                              "at": time.time(),
+                              **(LIVE_NOTE.get(slug) or {})}
         if ev.get("log") and kind != "token" and ev.get("stage") != "agent":
             _activity(slug, "error" if kind == "error" else
                       ("file" if kind == "file_written" else "info"),
@@ -662,12 +743,14 @@ def capabilities_text(cap, budget=3200):
               for m in cap["models"]]
     usable = [g for g in cap.get("giants", []) if g["ok"]]
     if usable:
-        lines.append("GIANTS — the strongest models here and by far the "
-                     "slowest (about 0.5–2 words a second: one task can "
-                     "take an hour). Assign one by its role name only when "
-                     "the work is worth that wait"
-                     + (" — they are assigned automatically to matching "
-                        "work" if cap.get("use") == "always" else "") + ":")
+        lines.append(
+            "GIANTS — far stronger than the models above, and far slower "
+            "(about 0.5–2 words a second: one task can take an hour). "
+            + ("Every task is given the one that fits its work."
+               if cap.get("use") == "always" else
+               'A task you mark "hard": true is given the one that fits '
+               "its work, and so is a task the everyday model fails twice. "
+               "You may also name one in \"model\" by its role.") + "")
         lines += [f"- {g['role']} = {g['label']}  (best for "
                   f"{aria_garage.ROLE_SAYS[g['role']]})" for g in usable]
     lines.append("\nTOOLS:")
@@ -699,29 +782,62 @@ The order of attack, 3 to 6 steps.
 
 Be specific to THIS project. No preamble, no closing remarks."""
 
+ROADMAP_SYSTEM = """You draw the roadmap for a project that A.R.I.A. runs
+on her own. Lay out the WHOLE road from where this project is now to its
+goal, as milestones.
+A milestone is an outcome — something that exists and can be checked when
+it is reached — not an activity. Respond with ONLY a JSON object:
+
+{"milestones": [{"id": "a", "title": "short name of the outcome",
+  "outcome": "what exists, and can be checked, when this is reached",
+  "depends_on": ["<id of an earlier milestone it cannot start without>"],
+  "est_tasks": 3}]}
+
+Rules:
+- 4 to 12 milestones, in the order they will be reached, covering
+  everything the goal and requirements ask for — the last one is the goal
+  itself, met.
+- "depends_on": only real dependencies. Milestones that do not depend on
+  each other can be worked on in either order.
+- "est_tasks": roughly how many single-file tasks it will take (1 to 12).
+- Leave out what is already done unless the list below says to keep it.
+- Be specific to THIS project: name the modules, documents and features."""
+
 PLAN_SYSTEM = """You are the project planner inside A.R.I.A. Plan the next
 batch of work as tasks that an AI agent completes by writing documents,
 designs or code files. Respond with ONLY a JSON object:
 
-{"tasks": [{"id": "a", "title": "short imperative title",
+{"reached": ["<id of a ROADMAP milestone whose outcome now exists>"],
+ "tasks": [{"id": "a", "title": "short imperative title",
+  "milestone": "<id of the ROADMAP milestone this task works towards>",
   "detail": "exactly what to produce, naming the file paths",
   "why": "why this task matters now, and why this agent and model",
   "agent": "<name from AGENTS>", "skills": ["<name from SKILLS>"],
   "model": "", "phase": "<short phase name>", "est_hours": 2,
   "depends_on": ["<id of an earlier task in this list>"],
   "reads": ["<existing project file this task must see>"],
-  "research": false, "needs_human": false,
+  "research": false, "needs_human": false, "hard": false,
   "done_when": "<observable criterion a reviewer can check>"}],
  "project_complete": false}
 
 Rules:
 - 3 to 8 tasks. Each is concrete, self-contained, and produces one thing.
+- Follow the ROADMAP: plan the work of the earliest milestones whose
+  dependencies are reached — one or two milestones a batch — and give
+  every task the id of its milestone. "reached": the milestones whose
+  outcome exists now, judging by FILES and RECENT RESULTS.
 - "agent": pick the specialist that fits the task from AGENTS.
 - "skills": up to 3 names from SKILLS that genuinely help; otherwise [].
 - "model": "" uses the agent's default. Set "fast", "smart" or "deep" (or a
   listed backend/model, or a GIANT's role name) only when the task clearly
   needs less or more than the default — fast for simple drafting, deep or
   a giant for the hardest work.
+- "hard": true for the few tasks an ordinary model is likely to get
+  wrong — a design the rest of the project hangs on, an intricate
+  algorithm, a change that has to stay consistent across several files,
+  subtle debugging, weighing a lot of research. A hard task is given the
+  strongest model there is, which is slow: most tasks are not hard, but do
+  not be shy about the ones that are.
 - "depends_on": ids from THIS list whose output the task builds on.
 - "reads": files from FILES that the task must see to do its work.
 - "research": true only for tasks that need facts from the live web%s
@@ -1008,6 +1124,260 @@ def assess(slug, emit):
     return text
 
 
+# ------------------------------------------------------------ roadmap
+#
+# A batch is planned a few tasks at a time, which is the right grain for
+# doing the work and the wrong one for seeing where it is going. The
+# roadmap is the long view: the whole road to the goal as milestones with
+# their dependencies, laid out once after the assessment. Every batch is
+# planned against it and every task names the milestone it serves, so the
+# planner, the agents and the owner all look at the same road — and the
+# Gantt chart can draw what is still ahead.
+
+MAX_MILESTONES = 14
+
+
+def _roadmap(slug):
+    road = _read_json(_auto(slug) / "roadmap.json", {})
+    road.setdefault("milestones", [])
+    for m in road["milestones"]:
+        m.setdefault("depends_on", [])
+        m.setdefault("status", "todo")
+        m.setdefault("outcome", "")
+        m.setdefault("est_tasks", 3)
+    return road
+
+
+def _save_roadmap(slug, road):
+    road["updated"] = _stamp()
+    auto = _auto(slug)
+    _write_json(auto / "roadmap.json", road)
+    marks = {"done": "✓", "active": "▶", "skipped": "–"}
+    lines = [f"# Roadmap — {slug}", "",
+             "*The whole road to the goal, as she sees it. ✓ reached · "
+             "▶ in progress · ○ ahead.*", ""]
+    for m in road["milestones"]:
+        needs = ", ".join(m["depends_on"])
+        lines.append(f"- {marks.get(m['status'], '○')} **{m['id']} — "
+                     f"{m['title']}**" + (f" (after {needs})" if needs else "")
+                     + (f"  \n  {m['outcome']}" if m["outcome"] else "")
+                     + (f"  \n  *{m['note']}*" if m.get("note") else ""))
+    if road.get("why"):
+        lines += ["", f"*Last revised: {road['why']}.*"]
+    (auto / "ROADMAP.md").write_text("\n".join(lines) + "\n",
+                                     encoding="utf-8")
+
+
+def _milestone_ready(m, road):
+    done = {x["id"] for x in road["milestones"]
+            if x["status"] in ("done", "skipped")}
+    return all(d in done for d in m["depends_on"])
+
+
+def _roadmap_text(road, budget=1800):
+    """The roadmap as the planner and the agents read it."""
+    marks = {"done": "✓", "active": "▶", "skipped": "–"}
+    lines = []
+    for m in road["milestones"]:
+        needs = ", ".join(m["depends_on"])
+        lines.append(
+            f"{marks.get(m['status'], '○')} {m['id']} {m['title']}"
+            + (f" — {eng.clip(m['outcome'], 150)}" if m["outcome"]
+               and m["status"] not in ("done", "skipped") else "")
+            + (f" [after {needs}]" if needs
+               and m["status"] not in ("done", "skipped") else ""))
+    return eng.clip("\n".join(lines), budget)
+
+
+def _roadmap_due(slug, state):
+    """Does the road need laying out (or laying out again) before the next
+    plan? Not while she is improving or refining: the goal is behind her."""
+    if state.get("mode") in ("improve", "refine"):
+        return ""
+    if state.get("remap"):
+        return state["remap"]
+    return "" if (_auto(slug) / "roadmap.json").is_file() else "first plan"
+
+
+def _roadmap_make(slug, state, emit, cfg, why):
+    """Lay out the road to the goal (or revise it: what is reached stays).
+    A planner that cannot produce one does not stop the run — the road is
+    then a single milestone, the goal itself."""
+    old = _roadmap(slug)
+    kept = [m for m in old["milestones"] if m["status"] in ("done", "skipped")]
+    open_old = [m for m in old["milestones"] if m not in kept]
+    goal = eng._project_goal(slug, 3000)
+    rows = inventory(_proj(slug))
+    auto = _auto(slug)
+    sections = [f"PROJECT: {slug}", f"GOAL / REQUIREMENTS\n{goal}"]
+    memory = _memory(slug)
+    if memory:
+        sections.append("PROJECT MEMORY (what has happened so far)\n"
+                        + eng.clip(memory, 2200))
+    elif (auto / "ASSESSMENT.md").is_file():
+        sections.append("YOUR ASSESSMENT\n" + eng.clip(
+            (auto / "ASSESSMENT.md").read_text(encoding="utf-8"), 2400))
+    sections.append("FILES (what exists now)\n" + _inventory_text(rows, 1400))
+    if kept:
+        sections.append("ALREADY REACHED (do not list these again)\n"
+                        + "\n".join(f"- {m['title']}" for m in kept))
+    if open_old:
+        sections.append(
+            "THE ROAD SO FAR, NOT YET REACHED (keep, change or drop these — "
+            "your answer replaces them)\n" + "\n".join(
+                f"- {m['title']}: {eng.clip(m['outcome'], 120)}"
+                for m in open_old))
+    if state.get("audit_gaps"):
+        sections.append("AN AUDIT FOUND THESE GAPS — the road must close "
+                        "them:\n" + "\n".join(
+                            f"- {g}" for g in state["audit_gaps"]))
+    steering = _steering_text(slug)
+    if steering:
+        sections.append(steering.strip())
+    emit({"event": "thinking", "label": f"laying out the road for {slug}"})
+    note = ""
+    try:
+        data = eng.ask_json(
+            eng.resolve_tier("smart", cfg), "\n\n".join(sections),
+            ROADMAP_SYSTEM,
+            on_token=lambda t: emit({"event": "token", "text": t}),
+            timeout=_idle_timeout(cfg, "smart"))
+        state["stats"]["calls"] += 1
+        if isinstance(data, list):
+            data = {"milestones": data}
+        raw = [m for m in (data or {}).get("milestones") or []
+               if isinstance(m, dict)]
+    except Exception as exc:
+        if eng.backend_trouble(exc):
+            raise                       # the server is away: wait, retry
+        raw, note = [], f"the planner could not lay out a roadmap ({exc})"
+    nxt = int(state.get("next_ms") or 1)
+    fresh, idmap, seen = [], {}, {_norm_title(m["title"]) for m in kept}
+    # a milestone that survives a revision keeps its id — and with it the
+    # tasks already planned and done for it
+    before = {_norm_title(m["title"]): m for m in open_old}
+    for m in raw[:MAX_MILESTONES]:
+        title = " ".join(str(m.get("title") or "").split())[:110]
+        if not title or _norm_title(title) in seen:
+            continue
+        seen.add(_norm_title(title))
+        try:
+            est = int(min(12, max(1, float(m.get("est_tasks") or 3))))
+        except (TypeError, ValueError):
+            est = 3
+        same = before.get(_norm_title(title))
+        if same:
+            mid = same["id"]
+        else:
+            mid = f"m{nxt}"
+            nxt += 1
+        idmap[str(m.get("id", mid))] = mid
+        fresh.append({"id": mid, "title": title,
+                      "status": same["status"] if same else "todo",
+                      "outcome": " ".join(str(m.get("outcome") or "")
+                                          .split())[:400],
+                      "depends_on": [str(d) for d in m.get("depends_on") or []
+                                     if isinstance(d, (str, int))],
+                      "est_tasks": est})
+    if not fresh:                       # still a road: the goal, in one step
+        fresh = [{"id": f"m{nxt}", "title": "Reach the goal", "status": "todo",
+                  "outcome": "everything the requirements ask for exists "
+                             "and is complete",
+                  "depends_on": [], "est_tasks": 6}]
+        nxt += 1
+        note = note or "the planner returned no milestones"
+    order = {m["id"]: i for i, m in enumerate(fresh)}
+    for m in fresh:                     # only backward edges: never a cycle
+        m["depends_on"] = list(dict.fromkeys(
+            idmap[d] for d in m["depends_on"]
+            if d in idmap and order[idmap[d]] < order[m["id"]]))
+    state["next_ms"] = nxt
+    state.pop("remap", None)
+    road = {"milestones": kept + fresh, "why": why,
+            "revision": int(old.get("revision") or 0) + 1,
+            "made": old.get("made") or _stamp()}
+    if note:
+        road["note"] = note
+    _save_roadmap(slug, road)
+    _save_state(slug, state)
+    emit({"event": "stage_done", "stage": "plan",
+          "log": f"{slug}: " + (f"{note} — carrying on with the goal as one "
+                                "milestone" if note else
+                                f"roadmap laid out — {len(fresh)} milestone(s) "
+                                "to the goal: " + "; ".join(
+                                    m["title"] for m in fresh[:8]))})
+    return road
+
+
+def _roadmap_update(slug, plan, reached=(), fresh=()):
+    """Bring the milestones' states in line with the plan: what has tasks
+    is in progress; what the planner reports reached — or has plainly been
+    left behind, its work done and the plan moved on to what depends on it
+    — is reached."""
+    road = _roadmap(slug)
+    if not road["milestones"]:
+        return road
+    tasks = list(plan["tasks"]) + _archived(_auto(slug))
+    by = {}
+    for t in tasks:
+        if t.get("milestone"):
+            by.setdefault(t["milestone"], []).append(t)
+    moved_on = {t.get("milestone") for t in fresh}
+    changed = False
+    for m in road["milestones"]:
+        if m["status"] in ("done", "skipped"):
+            continue
+        mine = by.get(m["id"], [])
+        open_ = [t for t in mine if t["status"] in ("todo", "inprogress",
+                                                   "reviewing")]
+        done = [t for t in mine if t["status"] == "done"]
+        behind = any(m["id"] in x["depends_on"] and x["id"] in moved_on
+                     for x in road["milestones"])
+        if not open_ and (m["id"] in reached or (done and behind)) \
+                and (done or m["id"] in reached):
+            m.update(status="done", reached=_stamp())
+            changed = True
+        elif mine and m["status"] != "active":
+            m["status"] = "active"
+            changed = True
+    if changed:
+        _save_roadmap(slug, road)
+    return road
+
+
+def _roadmap_close(slug, note):
+    """The goal is met: whatever was still ahead was not needed for it."""
+    road = _roadmap(slug)
+    changed = False
+    for m in road["milestones"]:
+        if m["status"] == "active":
+            m.update(status="done", reached=_stamp())
+            changed = True
+        elif m["status"] == "todo":
+            m.update(status="skipped", note=note)
+            changed = True
+    if changed:
+        _save_roadmap(slug, road)
+
+
+def _milestone_for(task, road):
+    """Where a task fits, for its prompt: its milestone and what comes
+    after it."""
+    by = {m["id"]: m for m in road["milestones"]}
+    m = by.get(task.get("milestone") or "")
+    if not m:
+        return ""
+    after = [x for x in road["milestones"] if m["id"] in x["depends_on"]
+             and x["status"] not in ("done", "skipped")][:3]
+    reached = sum(1 for x in road["milestones"] if x["status"] == "done")
+    return ("WHERE THIS FITS — the road to the goal has "
+            f"{len(road['milestones'])} milestones, {reached} reached.\n"
+            f"This task works towards: {m['title']}"
+            + (f" — {m['outcome']}" if m["outcome"] else "")
+            + ("\nWhat it unlocks next: " + "; ".join(
+                x["title"] for x in after) if after else ""))
+
+
 def _steering_text(slug, limit=8):
     f = _auto(slug) / "STEERING.md"
     if not f.is_file():
@@ -1107,18 +1477,50 @@ _CODE_WORDS = re.compile(
     r"refactor|bug|test|script|api|endpoint|module)\b", re.I)
 
 
-def _matching_giant(task, cfg):
-    """With giants_use: always — the giant whose role fits the work."""
-    have = aria_garage.configured(cfg)
+# When the giant for a kind of work is not there (not set, still
+# downloading, failed to load) the next best one stands in: any giant is
+# stronger than the everyday tiers.
+_GIANT_ORDER = {"coder": ("coder", "general", "research"),
+                "research": ("research", "general"),
+                "general": ("general", "research", "coder")}
+
+
+def _giant_kind(task):
+    """The kind of work a task is, in the giants' terms."""
     if task.get("research") or task["agent"] == "researcher":
-        role = "research"
-    elif task["agent"] == "coder" or _CODE_WORDS.search(
+        return "research"
+    if task["agent"] == "coder" or _CODE_WORDS.search(
             task["title"] + " " + task["detail"]):
-        role = "coder"
-    else:
-        role = "general"
-    return role if role in have and aria_garage.available(role, cfg)[0] \
-        else ""
+        return "coder"
+    return "general"
+
+
+def _matching_giant(task, cfg):
+    """The giant that fits a task's work and can be used right now — the
+    one for its kind, else the next best the owner has set up; '' when
+    none can."""
+    for role in _GIANT_ORDER[_giant_kind(task)]:
+        if aria_garage.available(role, cfg)[0]:
+            return role
+    return ""
+
+
+def _assign_giants(tasks, cfg):
+    """Give new tasks their giant, and say why: every task with
+    giants_use: always; with auto, the ones the planner marked as hard."""
+    use = cfg["giants_use"]
+    for t in tasks:
+        if t["model"] not in ("", "fast", "smart"):   # a deliberate choice
+            if eng.giant_role(t["model"]):
+                t["model_why"] = "the planner chose it for this task"
+            continue
+        if use == "always" or (use == "auto" and t.get("hard")):
+            role = _matching_giant(t, cfg)
+            if role:
+                t["model"] = role
+                t["model_why"] = (
+                    "every task goes to a giant (your setting)"
+                    if use == "always" else "the planner marked it as hard")
 
 
 def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
@@ -1145,6 +1547,11 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
         sections.append("YOUR ASSESSMENT\n" + eng.clip(
             (auto / "ASSESSMENT.md").read_text(encoding="utf-8"), 2600))
     sections.append("FILES (what exists now)\n" + _inventory_text(rows, 1500))
+    road = _roadmap(slug)
+    if road["milestones"] and state.get("mode") != "improve":
+        sections.append(
+            "ROADMAP — the whole road to the goal (✓ reached · ▶ in "
+            "progress · ○ ahead)\n" + _roadmap_text(road))
     declined = [t for t in plan["tasks"]
                 if (t.get("decision") or {}).get("answer") == "declined"]
     finished = [t for t in plan["tasks"]
@@ -1234,6 +1641,13 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             if re.fullmatch(r"t\d+", str(t.get("id", "")))]
     state["next_id"] = max(state["next_id"], max(used, default=0) + 1)
     fresh, idmap, by_title, dropped = [], {}, {}, []
+    open_ms = [m for m in road["milestones"]
+               if m["status"] not in ("done", "skipped")]
+    ms_ids = {m["id"] for m in open_ms}
+    # a task the planner did not place belongs to the milestone in hand
+    ms_default = next((m["id"] for m in open_ms
+                       if _milestone_ready(m, road)), "") \
+        if state.get("mode") != "improve" else ""
     for raw in raw_tasks[:10]:
         title = " ".join(str(raw.get("title") or "").split())[:140]
         norm = _norm_title(title)
@@ -1285,14 +1699,15 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
                       and str(p).lstrip("./") in existing_files][:6],
             "research": bool(raw.get("research")) and eng.web_ready(cfg),
             "needs_human": _truthy(raw.get("needs_human")),
+            "hard": _truthy(raw.get("hard")),
+            "milestone": (str(raw.get("milestone") or "").strip()
+                          if str(raw.get("milestone") or "").strip() in ms_ids
+                          else ms_default),
             "done_when": str(raw.get("done_when") or "the work product "
                              "exists and is complete").strip()[:400],
             "status": "todo", "attempts": 0, "iteration": iteration,
         })
-    if cfg["giants_use"] == "always":
-        for t in fresh:
-            if not t["model"]:
-                t["model"] = _matching_giant(t, cfg)
+    _assign_giants(fresh, cfg)
     for t in fresh:
         t["depends_on"] = list(dict.fromkeys(
             idmap[d] for d in t["depends_on"]
@@ -1322,13 +1737,17 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     plan["iteration"] = state["iteration"]
     plan["updated"] = _stamp()
     _save_plan(slug, plan)
+    reached = {str(r) for r in data.get("reached") or []
+               if isinstance(r, (str, int))} & ms_ids
+    _roadmap_update(slug, plan, reached, fresh)
     complete = bool(data.get("project_complete")) and not fresh
     emit({"event": "stage_done", "stage": "plan",
           "log": f"{slug}: " + (
               f"iteration {state['iteration']} planned — {len(fresh)} "
               "task(s): " + "; ".join(
                   f"{t['title']} → {t['agent']}"
-                  + (f" on {t['model']}" if t["model"] else "")
+                  + (f" on {_model_name(t['model'], cfg)}"
+                     if t["model"] else "")
                   + (" (needs you)" if t["needs_human"] else "")
                   for t in fresh[:8])
               if fresh else "the planner has nothing more to add")})
@@ -1372,6 +1791,16 @@ def _task_model(task):
         return task["model"]
     agent = eng.get_agent(task["agent"])
     return (agent or {}).get("model") or "smart"
+
+
+def _model_name(spec, cfg):
+    """A model spec the way a person would say it: 'the coder giant
+    (Qwen3-Coder…)', else the spec itself."""
+    role = eng.giant_role(spec)
+    if not role:
+        return spec
+    info = aria_garage.configured(cfg).get(role)
+    return f"the {role} giant" + (f" ({info['label']})" if info else "")
 
 
 def _runnable(plan):
@@ -1424,6 +1853,9 @@ def _task_prompt(slug, task, plan, cfg):
             parts.append(f"OUTPUT OF EARLIER TASK “{d['title']}”\n"
                          + eng.clip(f.read_text(encoding="utf-8"),
                                     int(budget * 0.2)))
+    fits = _milestone_for(task, _roadmap(slug))
+    if fits:
+        parts.append(fits)
     memory = _memory(slug)
     if memory:
         parts.append("PROJECT MEMORY\n" + eng.clip(memory, 1400))
@@ -1571,6 +2003,12 @@ def _record(slug, state, task, records, info, verdict, output, commit="",
     auto = _auto(slug)
     files = [{k: r[k] for k in ("path", "action", "lines", "added", "removed")}
              for r in records if r["action"] != "unchanged"]
+    if task["status"] == "done":
+        # what each file was before this change: the Files tab shows a
+        # change as "previous | modified", with or without git
+        for r, f in zip([r for r in records if r["action"] != "unchanged"],
+                        files):
+            f["kept"] = _keep_version(slug, task["id"], r)
     row = {
         "t": _stamp(), "run": state["run"], "iteration": task["iteration"],
         "task": task["id"], "title": task["title"], "status": task["status"],
@@ -1621,6 +2059,141 @@ def _record(slug, state, task, records, info, verdict, output, commit="",
     return row
 
 
+def _keep_version(slug, task_id, record):
+    """Keep what a file was before a verified change (nothing to keep for
+    a new file). True when the change can be shown as before | after."""
+    if record.get("old") is None:
+        return True                     # created: "before" is nothing
+    try:
+        dest = _auto(slug) / "versions" / task_id / record["path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(record["old"], encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def file_history(slug, path):
+    """Every verified change to one file, newest first:
+    [{task, title, t, action, added, removed, run, iteration, agent, model,
+    why, kept}]."""
+    rows = []
+    for r in eng.project_changes(slug):
+        if r.get("status") != "done":
+            continue
+        for f in r.get("files", []):
+            if f.get("path") == path:
+                rows.append({
+                    "task": r["task"], "title": r.get("title", ""),
+                    "t": r.get("t", ""), "action": f.get("action", ""),
+                    "added": f.get("added", 0), "removed": f.get("removed", 0),
+                    "run": r.get("run", 0), "iteration": r.get("iteration", 0),
+                    "agent": r.get("agent", ""), "model": r.get("model", ""),
+                    "why": r.get("why", ""), "commit": r.get("commit", ""),
+                    "kept": bool(f.get("kept")) or bool(r.get("commit"))})
+    return rows[::-1]
+
+
+def _version_before(slug, change, path):
+    """A file as it was before `change` — None when it did not exist, and
+    ValueError when no earlier version was kept."""
+    entry = next((f for f in change.get("files", [])
+                  if f.get("path") == path), None)
+    if entry is None:
+        raise ValueError("that change did not touch this file")
+    if entry.get("action") == "created":
+        return None
+    kept = _auto(slug) / "versions" / change["task"] / path
+    if kept.is_file():
+        return kept.read_text(encoding="utf-8", errors="replace")
+    if change.get("commit"):            # a project that is its own repository
+        try:
+            return aria_git.run(["show", f"{change['commit']}^:{path}"],
+                                _proj(slug))
+        except aria_git.GitError:
+            pass
+    raise ValueError("the earlier version of this file was not kept (the "
+                     "change was made before versions were)")
+
+
+DIFF_CONTEXT = 3
+DIFF_MAX_LINES = 6000
+
+
+def file_diff(slug, path, task_id):
+    """One change to one file, as GitHub would show it: rows of
+    (left line, right line), unchanged stretches folded.
+
+    Returns {path, task, title, before: bool, rows, added, removed} where a
+    row is {"k": "same" | "del" | "add" | "chg", "ln", "l", "rn", "r"}
+    (ln/rn: line numbers, l/r: text; a side that has no line is null) or
+    {"k": "skip", "n": lines folded}."""
+    changes = [r for r in eng.project_changes(slug)
+               if r.get("status") == "done"
+               and any(f.get("path") == path for f in r.get("files", []))]
+    at = next((i for i, r in enumerate(changes) if r["task"] == task_id), None)
+    if at is None:
+        raise ValueError("no such change to that file")
+    change = changes[at]
+    before = _version_before(slug, change, path)
+    # "after" is what the next change found there — or the file as it is
+    after = None
+    if at + 1 < len(changes):
+        try:
+            after = _version_before(slug, changes[at + 1], path)
+        except ValueError:
+            after = None
+    if after is None:
+        proj = _proj(slug).resolve()
+        target = (proj / path).resolve()
+        if proj not in target.parents:
+            raise ValueError("outside the project")
+        after = target.read_text(encoding="utf-8", errors="replace") \
+            if target.is_file() else ""
+    a = (before or "").splitlines()
+    b = after.splitlines()
+    rows, added, removed = [], 0, 0
+    if len(a) + len(b) > DIFF_MAX_LINES:
+        raise ValueError("this file is too long to compare here")
+    ops = difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+    for n, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag == "equal":
+            size = i2 - i1
+            head = 0 if n == 0 else DIFF_CONTEXT
+            tail = 0 if n == len(ops) - 1 else DIFF_CONTEXT
+            if size > head + tail + 1:
+                for k in range(head):
+                    rows.append({"k": "same", "ln": i1 + k + 1, "l": a[i1 + k],
+                                 "rn": j1 + k + 1, "r": b[j1 + k]})
+                rows.append({"k": "skip", "n": size - head - tail})
+                for k in range(size - tail, size):
+                    rows.append({"k": "same", "ln": i1 + k + 1, "l": a[i1 + k],
+                                 "rn": j1 + k + 1, "r": b[j1 + k]})
+            else:
+                for k in range(size):
+                    rows.append({"k": "same", "ln": i1 + k + 1, "l": a[i1 + k],
+                                 "rn": j1 + k + 1, "r": b[j1 + k]})
+            continue
+        left, right = list(range(i1, i2)), list(range(j1, j2))
+        removed += len(left)
+        added += len(right)
+        for k in range(max(len(left), len(right))):
+            li = left[k] if k < len(left) else None
+            ri = right[k] if k < len(right) else None
+            rows.append({
+                "k": "chg" if li is not None and ri is not None
+                else "del" if li is not None else "add",
+                "ln": li + 1 if li is not None else None,
+                "l": a[li] if li is not None else None,
+                "rn": ri + 1 if ri is not None else None,
+                "r": b[ri] if ri is not None else None})
+    return {"path": path, "task": change["task"],
+            "title": change.get("title", ""), "t": change.get("t", ""),
+            "before": before is not None, "rows": rows,
+            "added": added, "removed": removed,
+            "latest": at == len(changes) - 1}
+
+
 def _commit(slug, state, cfg, paths, message, emit):
     """A commit on the work branch — only when the project is its own
     repository and git has not been stood down for this run."""
@@ -1636,7 +2209,8 @@ def _commit(slug, state, cfg, paths, message, emit):
                                        "plan.json", "plan-archive.jsonl",
                                        "MEMORY.md", "ASSESSMENT.md",
                                        "REVIEW.md", "FINAL-REPORT.md",
-                                       "STEERING.md")
+                                       "STEERING.md", "ROADMAP.md",
+                                       "roadmap.json")
         ] + [p.relative_to(proj).as_posix()
              for p in list(auto.glob("task-*.md"))
              + list(auto.glob("reports/*.md"))
@@ -1670,7 +2244,9 @@ def _run_task(slug, state, plan, task, cfg, emit):
     _save_state(slug, state)
     emit({"event": "start", "stage": "autopilot",
           "log": f"{slug}: {task['id']} — {task['title']} → {task['agent']}"
-                 + (f" on {task['model']}" if task["model"] else "")
+                 + (f" on {_model_name(task['model'], cfg)}"
+                    + (f" — {task['model_why']}" if task.get("model_why")
+                       else "") if task["model"] else "")
                  + (f" (attempt {task['attempts']})"
                     if task["attempts"] > 1 else "")})
     t0 = time.time()
@@ -1692,6 +2268,8 @@ def _run_task(slug, state, plan, task, cfg, emit):
                      "loading it (others are unloaded first; this can take "
                      "several minutes)"})
     checks = None
+    LIVE_NOTE[slug] = {"task": task["id"], "title": task["title"],
+                       "attempt": task["attempts"], "agent": task["agent"]}
     try:
         before = _baseline(slug, state, cfg, emit)
         output = eng.run_agent(
@@ -1736,6 +2314,8 @@ def _run_task(slug, state, plan, task, cfg, emit):
                    "feedback": f"the attempt errored: {exc}"}
         if "HTTP 404" in str(exc) or "not found" in str(exc).lower():
             task["model"] = ""                 # the assigned model is gone
+    _close_live(slug)                   # the judge's verdict is on record
+    LIVE_NOTE.pop(slug, None)
     task["seconds"] = round(task.get("seconds", 0) + time.time() - t0, 1)
     with (auto / f"task-{task['id']}.md").open("a", encoding="utf-8") as fh:
         fh.write(f"# {task['title']} — attempt {task['attempts']}\n\n"
@@ -1798,6 +2378,21 @@ def _run_task(slug, state, plan, task, cfg, emit):
                   "log": f"{slug}: {task['id']} rejected (attempt "
                          f"{task['attempts']} of {MAX_ATTEMPTS}), rolled "
                          f"back — {verdict['feedback']}"})
+            # The everyday model has had its tries: the last one goes to
+            # the giant that fits the work, if the owner has one.
+            if task["attempts"] == MAX_ATTEMPTS - 1 \
+                    and cfg["giants_use"] != "never" \
+                    and not eng.task_role(model_spec, cfg):
+                role = _matching_giant(task, cfg)
+                if role:
+                    was = info.get("model") or model_spec
+                    task.update(model=role, escalated=True, model_why=(
+                        f"sent back {task['attempts']} times on {was}"))
+                    emit({"event": "stage_done", "stage": "garage",
+                          "log": f"{slug}: {task['id']} was sent back "
+                                 f"{task['attempts']} times on {was} — its "
+                                 f"last attempt goes to "
+                                 f"{_model_name(role, cfg)}"})
         _save_plan(slug, plan)
     state["errors"] = 0
     _save_state(slug, state)
@@ -1965,6 +2560,9 @@ def _advance(slug, state, cfg, emit):
         state["audits"] += 1
         if gaps:
             state["audit_gaps"] = gaps
+            # the road said "there" and the audit says "not yet": lay it
+            # out again from here, gaps included
+            state["remap"] = "an audit found gaps against the requirements"
             _save_state(slug, state)
             emit({"event": "stage_done", "stage": "audit",
                   "log": f"{slug}: audit found {len(gaps)} gap(s) against "
@@ -1972,6 +2570,7 @@ def _advance(slug, state, cfg, emit):
                          + "; ".join(gaps[:3])})
             return "audited"
         state.pop("audit_gaps", None)
+        _roadmap_close(slug, "the goal was met without it")
         emit({"event": "stage_done", "stage": "audit",
               "log": f"{slug}: audit passed — the requirements are met"})
     state["audits"] = 0
@@ -2222,8 +2821,7 @@ def _refine_plan(slug, state, cfg, emit):
             "done_when": f"every listed point is addressed in {path} and "
                          "what the code does is unchanged",
             "status": "todo", "attempts": 0, "iteration": iteration}
-        if cfg["giants_use"] == "always":
-            task["model"] = _matching_giant(task, cfg)
+        _assign_giants([task], cfg)
         fresh.append(task)
     _write_review(slug, state, findings, planned)
     if not fresh:
@@ -2317,8 +2915,9 @@ def refine(slug, via="app"):
 
 def tick(slug, emit):
     """Run ONE step for a project. Returns what happened: 'task',
-    'assessed', 'replanned', 'reflected', 'audited', 'improving',
-    'recovered', 'finalized', 'complete', 'waiting', 'busy' or 'idle'."""
+    'assessed', 'mapped' (the roadmap was laid out), 'replanned',
+    'reflected', 'audited', 'improving', 'recovered', 'finalized',
+    'complete', 'waiting', 'busy' or 'idle'."""
     if _state(slug)["status"] != "running":
         return "idle"
     try:
@@ -2432,6 +3031,17 @@ def _step(slug, state, cfg, emit):
         state["errors"] = 0
         _save_state(slug, state)
         return "assessed"
+    if steered and state.get("remap_seen") != steered:
+        # new guidance may move the road itself, not just the next batch
+        state.update(remap="you gave new guidance", remap_seen=steered)
+    remap = _roadmap_due(slug, state)
+    if remap:
+        state["phase"] = "planning"
+        _save_state(slug, state)
+        _roadmap_make(slug, state, emit, cfg, remap)
+        state["errors"] = 0
+        _save_state(slug, state)
+        return "mapped"
     plan = _plan(slug)
     if steered:
         held = _held(plan)
@@ -2614,8 +3224,12 @@ def _update_status_file(slug, state):
     text = re.sub(r"^\*\*Phase:\*\*.*$", f"**Phase:** {phase}", text, 1, re.M)
     text = re.sub(r"^\*\*Last updated:\*\*.*$",
                   f"**Last updated:** {_stamp()[:10]}", text, 1, re.M)
+    road = _roadmap(slug)["milestones"]
+    reached = sum(1 for m in road if m["status"] == "done")
     text = re.sub(r"^\*\*Overall:\*\*.*$",
-                  f"**Overall:** {bar} {pct}% ({done} task(s) verified)",
+                  f"**Overall:** {bar} {pct}% ({done} task(s) verified"
+                  + (f" · {reached} of {len(road)} milestones reached"
+                     if road else "") + ")",
                   text, 1, re.M)
     text = re.sub(r"(^## Current focus\n\n).*?(?=\n## )",
                   lambda m: m.group(1) + focus + "\n", text, 1, re.S | re.M)
@@ -2741,6 +3355,23 @@ def build_report(slug, state, reason, detail="", summary=""):
         out += ["## What to look at first", ""] + [f"- {x}" for x in look] \
             + [""]
 
+    road = roadmap_view(slug)
+    if road["milestones"]:
+        marks = {"done": "✓ reached", "active": "▶ in progress",
+                 "skipped": "– not needed", "todo": "○ ahead"}
+        out += ["## The road to the goal", "",
+                f"{road['reached']} of {len(road['milestones'])} milestones "
+                "reached.", ""]
+        for m in road["milestones"]:
+            out.append(
+                f"- **{m['title']}** — {marks.get(m['status'], m['status'])}"
+                + (f" ({m['done']} task(s) done"
+                   + (f", {m['open']} open" if m["open"] else "") + ")"
+                   if m["done"] or m["open"] else "")
+                + (f": {m['outcome']}" if m["outcome"]
+                   and m["status"] in ("todo", "active") else ""))
+        out.append("")
+
     out += ["## Every change made in this run", ""]
     if not done:
         out += ["No changes were completed in this run.", ""]
@@ -2841,6 +3472,8 @@ def _finalize(slug, emit, reason, detail=""):
     state.update(phase="reporting", current=None, waiting="",
                  backoff_until=0)
     _save_state(slug, state)
+    _close_live(slug)
+    LIVE_NOTE.pop(slug, None)
     mine = [r for r in eng.project_changes(slug)
             if r.get("run") == state["run"]]
     summary = ""
@@ -2933,7 +3566,8 @@ def _brief_task(t):
             "model_used", "phase", "est_hours", "seconds", "started",
             "first_started", "finished", "depends_on", "attempts", "files",
             "skills", "why", "detail", "done_when", "feedback", "decision",
-            "research")
+            "research", "hard", "escalated", "model_why", "milestone",
+            "needs_human", "refine")
     row = {k: t[k] for k in keep if k in t}
     row.setdefault("depends_on", [])
     row["took"] = t.get("seconds", 0)
@@ -3000,6 +3634,60 @@ def reports(slug):
     return out
 
 
+def roadmap_view(slug, plan=None):
+    """The roadmap as the app draws it: each milestone with how much of
+    its work is done, and whether it could start now."""
+    auto = eng._auto_dir(slug, create=False)
+    if not (auto / "roadmap.json").is_file():
+        return {"milestones": []}
+    road = _roadmap(slug)
+    plan = plan if plan is not None else _plan(slug)
+    count = {}
+    for t in list(plan["tasks"]) + _archived(auto):
+        c = count.setdefault(t.get("milestone") or "", {"done": 0, "open": 0,
+                                                        "failed": 0})
+        if t["status"] == "done":
+            c["done"] += 1
+        elif t["status"] in ("todo", "inprogress", "reviewing"):
+            c["open"] += 1
+        elif t["status"] == "failed":
+            c["failed"] += 1
+    for m in road["milestones"]:
+        m.update(count.get(m["id"], {"done": 0, "open": 0, "failed": 0}))
+        m["ready"] = m["status"] in ("todo", "active") \
+            and _milestone_ready(m, road)
+    road["reached"] = sum(1 for m in road["milestones"]
+                          if m["status"] == "done")
+    return road
+
+
+def progress(slug):
+    """Where a project stands on its road, in numbers: milestones reached,
+    what is in progress and what comes next, and how much work is left at
+    the pace measured in this project."""
+    road = roadmap_view(slug)
+    ms = road["milestones"]
+    state = _state(slug)
+    took = [r["seconds"] for r in eng.project_changes(slug)
+            if r.get("status") == "done" and r.get("seconds")]
+    per_task = sum(took) / len(took) if took else 0
+    plan = _plan(slug) if (eng._auto_dir(slug, create=False)
+                           / "plan.json").is_file() else {"tasks": []}
+    open_tasks = [t for t in plan["tasks"]
+                  if t["status"] in ("todo", "inprogress", "reviewing")]
+    unplanned = sum(max(0, m["est_tasks"] - m["done"] - m["open"])
+                    for m in ms if m["status"] in ("todo", "active"))
+    remaining = len(open_tasks) + unplanned
+    return {"status": state["status"], "reached": road.get("reached", 0),
+            "total": len(ms),
+            "current": [m for m in ms if m["status"] == "active"],
+            "next": [m for m in ms if m["status"] == "todo"],
+            "remaining_tasks": remaining, "per_task": per_task,
+            "eta": remaining * per_task,
+            "now": state.get("current") or None,
+            "needs_you": _gated(plan)}
+
+
 def view(slug):
     """Everything the Projects page shows for one project."""
     proj = eng._project_dir(slug)
@@ -3039,6 +3727,7 @@ def view(slug):
         "needs_you": [{"id": t["id"], "title": t["title"],
                        "why": t.get("why", "")} for t in _gated(plan)],
         "assessment": text("ASSESSMENT.md"),
+        "roadmap": roadmap_view(slug, plan),
         "review": text("REVIEW.md"),
         "memory": text("MEMORY.md") or text("lessons.md"),
         "steering": text("STEERING.md"),

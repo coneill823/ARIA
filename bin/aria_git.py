@@ -27,7 +27,10 @@ IGNORE_LINES = ("autopilot/state.json", "autopilot/STOP", "autopilot/LOCK",
                 "autopilot/STEER", "autopilot/REFINE",
                 "autopilot/decision-*.json", "autopilot/run.log",
                 "autopilot/run.json", "autopilot/activity-archive.jsonl",
-                "autopilot/*.tmp")
+                "autopilot/*.tmp",
+                # what she keeps so the app can show the past: git has the
+                # files' history already, and live output is not history
+                "autopilot/versions/", "autopilot/live/")
 
 
 class GitError(RuntimeError):

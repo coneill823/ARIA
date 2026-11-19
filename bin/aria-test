@@ -132,6 +132,42 @@ def write_gguf(path, data_offset=0):
     os.utime(path, (old, old))
 
 
+VOICE_STANDIN = '''"""A stand-in for bin/aria-voice-worker: same protocol, no models."""
+import io, json, sys, wave
+OUT, IN = sys.stdout.buffer, sys.stdin.buffer
+
+
+def reply(head, payload=b""):
+    if payload:
+        head["bytes"] = len(payload)
+    OUT.write(json.dumps(head).encode() + b"\\n" + payload)
+    OUT.flush()
+
+
+while True:
+    line = IN.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    data = IN.read(req["bytes"]) if req.get("bytes") else b""
+    if req["op"] == "hello":
+        reply({"ok": True, "tts": True, "stt": True})
+    elif req["op"] == "tts":
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\\0\\0" * 1600)
+        reply({"ok": True}, buf.getvalue())
+    elif req["op"] == "stt":
+        reply({"ok": True, "text": "heard %d bytes" % len(data),
+               "language": "en"})
+    else:
+        reply({"ok": False, "error": "unknown op"})
+'''
+
+
 def wait_http(url, tries=60):
     for _ in range(tries):
         try:
@@ -215,6 +251,20 @@ def main():
                autopilot_check_seconds="60", editor="", terminal="",
                # …and it stays off your screen
                desktop_notifications="false")
+
+    # Her voice and her ears are exercised with a stand-in for the speech
+    # worker (the real one needs the packages `aria voice install` adds):
+    # it speaks the same protocol and answers with a short, valid WAV.
+    standin = os.path.join(sandbox, "_voice-worker.py")
+    with open(standin, "w") as f:
+        f.write(VOICE_STANDIN)
+    voices = os.path.join(sandbox, "vendor", "voice", "voices")
+    os.makedirs(voices)
+    for name in ("en_GB-selftest-medium.onnx",
+                 "en_GB-selftest-medium.onnx.json"):
+        open(os.path.join(voices, name), "w").write("{}")
+    os.environ["ARIA_VOICE_WORKER"] = standin
+    os.environ.pop("ARIA_CHAT_PATIENCE", None)
 
     if MOCK:
         port = free_port()
@@ -379,6 +429,23 @@ def main():
                  ("approve task t3", "task-decision"),
                  ("skip task 7 because there is no budget", "task-decision"),
                  ("approve t2 in a project that does not exist", "no-project"),
+                 ("how far along are you", "progress"),
+                 ("what's left?", "progress"),
+                 ("show me the roadmap", "progress"),
+                 ("what needs me", "needs"),
+                 ("does anything need me?", "needs"),
+                 # the way it is spoken, and the way a recogniser writes
+                 # it down: her name first, a full stop at the end
+                 ("Aria, what needs me?", "needs"),
+                 ("Hey Aria, what are you working on?", "status"),
+                 ("Area, what needs me.", "needs"),
+                 ("Okay, open settings.", "navigate"),
+                 ("Status.", "status"),
+                 ("Show me the roadmap.", "progress"),
+                 ("Aria's voice is too quiet", None),
+                 ("area 51 documentary idea", None),
+                 ("Aria", None),
+                 ("what's next on the list of french novels", None),
                  ("how is your day going", None),
                  ("what is triage, exactly?", None),
                  ("where is the nearest pizza place", None),
@@ -392,6 +459,9 @@ def main():
         got = eng.detect_intent("decline t9, too expensive")
         assert (got["task"], got["approve"], got["note"]) == \
             ("t9", False, "too expensive"), got
+        # a capture keeps the owner's words exactly, full stop included
+        got = eng.detect_intent("Aria, capture a quieter kettle.")
+        assert got == {"action": "capture", "text": "a quieter kettle."}, got
         agents = {a["name"] for a in eng.list_agents()}
         if "critic" in agents:
             got = (eng.detect_intent("ask the critic to review it") or {})
@@ -862,6 +932,25 @@ def main():
             finally:
                 release.set()
                 worker.join()
+            # "can she really load it?" — load it, ask it, keep the answer
+            proof = eng.garage_test("research")
+            assert proof["ok"] and proof["reply"] and \
+                eng.garage_status()["roles"]["research"]["test"]["ok"], proof
+            # no llama-server anywhere: "cannot start", with the fix — not
+            # "ready to load"
+            eng.garage_unload()
+            command = os.environ.pop("ARIA_GARAGE_COMMAND")
+            path, nowhere = os.environ["PATH"], os.path.join(sandbox, "_nopath")
+            os.makedirs(nowhere, exist_ok=True)
+            os.environ["PATH"] = nowhere
+            try:
+                usable, why = garage.available("general", eng.config())
+                row = eng.garage_status()["roles"]["general"]
+            finally:
+                os.environ["PATH"] = path
+                os.environ["ARIA_GARAGE_COMMAND"] = command
+            assert not usable and "aria llama install" in why, why
+            assert row["state"] == "blocked", row
             # a load that fails is reported once, then stepped around
             os.environ["ARIA_GARAGE_COMMAND"] = (
                 f"{sys.executable} -c \"import sys; "
@@ -882,9 +971,110 @@ def main():
                        giant_coder="")
         assert not garage.loaded_roles(eng.config())
         return ("3 models found (a half-downloaded one flagged), swapped "
-                "one at a time on demand, held while answering, a failed "
-                "load reported and stepped around")
+                "one at a time on demand, held while answering, proved end "
+                "to end by a test question, 'cannot start' without "
+                "llama-server, a failed load reported and stepped around")
     check("giant models — one per role, on demand", c_garage)
+
+    def c_giants_used():
+        """The giants are actually chosen: a task the planner marks as hard
+        goes to one, and so does a task the everyday model has had sent
+        back twice — here with general standing in for a coder that is not
+        set, which is the owner's own setup."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script a hard task and a "
+                           "stubborn one")
+        import aria_garage as garage
+        models = os.path.join(sandbox, "_models")
+        if not os.path.isdir(models):
+            raise SkipTest("the garage check did not run")
+        set_config(
+            sandbox, giants_port=str(free_ports(3)),
+            giant_general=os.path.join(
+                models, "DeepSeek-R1-UD-Q2_K_XL-00001-of-00003.gguf"),
+            giant_research=os.path.join(
+                models, "Kimi-K2-Instruct-UD-IQ1_M-00001-of-00002.gguf"))
+        os.environ["ARIA_GARAGE_COMMAND"] = (
+            f"{sys.executable} "
+            f"{os.path.join(sandbox, 'bin', 'aria-mock-llm')} {{port}}")
+        slug, logs = "selftest-giants", []
+        for memo in ("general.failed.json", "research.failed.json"):
+            garage._file(memo).unlink(missing_ok=True)   # from the check above
+        try:
+            with scripted_model(MOCK_HARD="1", MOCK_TITLE_MARKER="[stubborn]",
+                                MOCK_LOADED="qwen3:30b"):
+                everyday = os.environ["ARIA_OLLAMA_URL"]
+                started_project(slug)
+                for _ in range(120):
+                    if ap.tick(slug, lambda ev: logs.append(
+                            ev.get("log") or "")) in ("idle", "finalized",
+                                                      "complete"):
+                        break
+                with urllib.request.urlopen(everyday + "/mock/calls",
+                                            timeout=10) as r:
+                    released = json.load(r)["released"]
+            st = ap._state(slug)
+            assert st["status"] == "complete", st["status"]
+            tasks = {t["title"]: t for t in ap._plan(slug)["tasks"]}
+            hard = tasks["Write tests for the core module"]
+            stubborn = next(t for title, t in tasks.items()
+                            if "[stubborn]" in title)
+            assert hard["model"] == "general" and hard["model_used"] == \
+                "giant/general" and "hard" in hard["model_why"], hard
+            assert stubborn["status"] == "done" and stubborn["attempts"] == 3 \
+                and stubborn.get("escalated") and stubborn["model_used"] == \
+                "giant/general" and "sent back 2 times" in \
+                stubborn["model_why"], stubborn
+            others = [t for t in tasks.values()
+                      if t not in (hard, stubborn) and t["status"] == "done"]
+            assert others and not any(
+                (t.get("model_used") or "").startswith("giant/")
+                for t in others), "an ordinary task was given a giant"
+            assert any("the planner marked it as hard" in ln for ln in logs)
+            assert any("its last attempt goes to the general giant" in ln
+                       for ln in logs)
+            # before the giant loaded, Ollama was asked to make room
+            assert released == ["qwen3:30b"], released
+            # with "only where I name them", none is chosen
+            set_config(sandbox, giants_use="never")
+            plain = [{"id": "x", "title": "Write tests", "detail": "",
+                      "agent": "coder", "model": "", "hard": True}]
+            ap._assign_giants(plain, eng.config())
+            assert plain[0]["model"] == ""
+        finally:
+            eng.garage_unload()
+            os.environ.pop("ARIA_GARAGE_COMMAND", None)
+            set_config(sandbox, giant_general="", giant_research="",
+                       giants_use="auto")
+        assert not garage.loaded_roles(eng.config())
+        return ("a task marked hard and a task sent back twice both went to "
+                "a giant (general standing in for the missing coder), each "
+                "saying why; ordinary tasks stayed on the everyday models; "
+                "Ollama made room first")
+    check("giant models — chosen when the work calls for it", c_giants_used)
+
+    def c_chat_wait():
+        """A chat is never left hanging: when the model does not begin to
+        answer in time she says so, and where things stand."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script a model that is busy")
+        os.environ["ARIA_CHAT_PATIENCE"] = "2"
+        try:
+            t0, said = time.time(), []
+            reply = eng.converse([{"role": "user",
+                                   "content": "tell me a story [slow]"}],
+                                 on_token=said.append)
+            took = time.time() - t0
+        finally:
+            os.environ.pop("ARIA_CHAT_PATIENCE")
+        assert took < 5, f"she kept the chat waiting {took:.1f}s"
+        assert "has not said a word" in reply and "status" in reply, reply
+        assert "".join(said) == reply, "the fallback was not streamed"
+        answer = eng.converse([{"role": "user", "content": "hello"}])
+        assert answer and "has not said a word" not in answer
+        return (f"a model that stayed silent got an honest answer after "
+                f"{took:.1f}s; an ordinary chat is answered as before")
+    check("chat — never left hanging", c_chat_wait)
 
     def c_gate():
         slug = state.get("slug") or fixture_project("selftest-gate-approve")
@@ -956,6 +1146,16 @@ def main():
         assert (auto / "ASSESSMENT.md").is_file()
         plan = json.load(open(auto / "plan.json"))
         assert plan["tasks"], "planner produced no tasks"
+        # the long view: the road to the goal is laid out before the first
+        # batch, and every task says which milestone it serves
+        assert "mapped" in seq, f"no roadmap step: {seq}"
+        road = ap.roadmap_view(slug)
+        ids = {m["id"] for m in road["milestones"]}
+        assert ids and (auto / "ROADMAP.md").is_file(), "no roadmap written"
+        assert all(t.get("milestone") in ids for t in plan["tasks"]), \
+            [(t["id"], t.get("milestone")) for t in plan["tasks"]]
+        assert all(set(m["depends_on"]) <= ids for m in road["milestones"])
+        state["milestones"] = len(ids)
         for t in plan["tasks"]:
             assert eng.get_agent(t["agent"]), f"unknown agent {t['agent']}"
         ap.steer(slug, "selftest guidance: keep every file short")
@@ -975,7 +1175,8 @@ def main():
         assert ap.tick(slug, quiet) == "idle"
         state["active"] = slug
         tried = seq.count("task")
-        return (f"promoted, assessed, planned {len(plan['tasks'])} task(s), "
+        return (f"promoted, assessed, a road of {state['milestones']} "
+                f"milestone(s) laid out, planned {len(plan['tasks'])} task(s), "
                 f"{len(done)} verified in {tried} attempt(s), "
                 + (f"{len(answered)} decision(s) given, " if answered else "")
                 + "steered, stopped; report lists every change"
@@ -1026,9 +1227,25 @@ def main():
         assert any(f["record"] for f in listed.values())
         where = eng.perform(eng.detect_intent(f"where is {slug}"))
         assert where["where"] == str(proj) and str(proj) in where["say"], where
+        # the road: every milestone reached, and it is in the report
+        road = ap.roadmap_view(slug)
+        assert road["milestones"] and all(
+            m["status"] in ("done", "skipped") for m in road["milestones"]), \
+            [(m["id"], m["status"]) for m in road["milestones"]]
+        assert "## The road to the goal" in report
+        said = eng.perform(eng.detect_intent(f"how far along is {slug}"))["say"]
+        assert "milestones reached" in said, said
+        # what she wrote is kept: the Live tab can step back through it
+        outs = eng.project_outputs(slug)
+        assert len(outs) >= 6 and outs[0]["n"] > outs[-1]["n"], outs[:2]
+        assert all("text" not in o for o in outs)
+        work = next(o for o in outs if o.get("task"))
+        assert eng.project_output(slug, work["n"])["text"].strip()
         return (f"resumed as run 2 and ran to completion: "
                 f"{st['stats']['done']} tasks over {st['iteration']} "
-                "iterations, memory rewritten each batch, both reports kept")
+                f"iterations, all {len(road['milestones'])} milestones "
+                "reached, memory rewritten each batch, both reports kept, "
+                f"{len(outs)} earlier outputs on record")
     check("autopilot — full recursive run", c_autopilot_full)
 
     def c_autopilot_rejects():
@@ -1114,8 +1331,25 @@ def main():
         assert "pace" in view and view["changes_total"] == len(board) + len(past)
         archive = (proj / "autopilot" / "plan-archive.jsonl").read_text()
         assert len(archive.splitlines()) == len(past)
+        # a file's earlier versions are kept too: each change can be shown
+        # as the previous version beside the modified one
+        hist = eng.file_history(slug, "README.md")
+        assert len(hist) == 2 and all(h["kept"] for h in hist), hist
+        newest = eng.file_diff(slug, "README.md", hist[0]["task"])
+        first = eng.file_diff(slug, "README.md", hist[1]["task"])
+        assert newest["before"] and newest["latest"] and not first["before"]
+        assert newest["added"] == hist[0]["added"] \
+            and newest["removed"] == hist[0]["removed"], (newest, hist[0])
+        assert {r["k"] for r in newest["rows"]} >= {"same", "add"}, \
+            sorted({r["k"] for r in newest["rows"]})
+        assert all(r["k"] == "add" for r in first["rows"])
+        assert (proj / "autopilot" / "versions" / hist[0]["task"]
+                / "README.md").is_file()
+        state["diff"] = (slug, "README.md", hist[0]["task"])
         return (f"{len(past)} task(s) left the board and stayed in the "
-                f"history; every finished task carries its measured time")
+                "history; every finished task carries its measured time; "
+                "a file changed twice shows each change as previous | "
+                "modified")
     check("autopilot — history is kept", c_history)
 
     def c_run_sandbox():
@@ -1337,7 +1571,8 @@ def test_escape():
                 "waiting on the owner cost model calls"
             mine = next(p for p in eng.list_projects() if p["slug"] == slug)
             assert [g["id"] for g in mine["needs_you"]] == [gate["id"]]
-            assert "need your decision" in eng.project_status_text(slug)
+            said = eng.project_status_text(slug)
+            assert "1 task needs your decision" in said, said
             try:
                 eng.autopilot_decide(slug, behind["id"])
                 raise AssertionError("answered a task that was not waiting")
@@ -1637,6 +1872,40 @@ def test_escape():
                 raise AssertionError("another skill was accepted")
             except ValueError:
                 pass
+            # …and the same skill with no Lambda: Amazon's request sent
+            # straight to the gateway, at an address that holds the secret
+            import datetime
+
+            def amazon(path, said="what needs me", age=0,
+                       app="amzn1.ask.skill.selftest"):
+                stamp = (datetime.datetime.now(datetime.timezone.utc)
+                         - datetime.timedelta(seconds=age))
+                return call(path, body={
+                    "version": "1.0",
+                    "session": {"application": {"applicationId": app}},
+                    "request": {
+                        "type": "IntentRequest",
+                        "timestamp": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "intent": {"name": "SayIntent", "slots": {
+                            "text": {"name": "text", "value": said}}}}})
+            code, out = amazon("/alexa/selftest-secret")
+            assert code == 200 and "approval" in \
+                out["response"]["outputSpeech"]["text"], (code, out)
+            code, out = amazon("/alexa/selftest-secret",
+                               said=f"approve {gated}")
+            assert "in the app" in out["response"]["outputSpeech"]["text"]
+            assert not eng.project_approved(gated), "Alexa opened the gate"
+            assert amazon("/alexa/selftest-secret", age=900)[0] == 400, \
+                "a stale (replayed) request was accepted"
+            assert amazon("/alexa/not-the-secret")[0] == 403
+            set_config(sandbox, alexa_skill_id="amzn1.ask.skill.selftest")
+            try:
+                assert amazon("/alexa/selftest-secret",
+                              app="amzn1.ask.skill.other")[0] == 403, \
+                    "another skill was answered"
+                assert amazon("/alexa/selftest-secret")[0] == 200
+            finally:
+                set_config(sandbox, alexa_skill_id="")
             model = json.load(open(os.path.join(
                 sandbox, "integrations", "alexa", "interaction-model.json")))
             names = {i["name"] for i in model["interactionModel"]
@@ -1649,8 +1918,10 @@ def test_escape():
             gw.terminate()
             for key in ("ARIA_GATEWAY_URL", "ARIA_TOKEN", "ARIA_SKILL_ID"):
                 os.environ.pop(key, None)
-        return ("secret required, one route only, the gate stays shut by "
-                "voice; the Alexa Lambda round-trips simulated requests")
+        return ("secret required, two routes only, the gate stays shut "
+                "by voice; simulated Alexa requests round-trip through the "
+                "Lambda and straight to the gateway — where a stale "
+                "request, a wrong address and another skill are refused")
     check("voice gateway (Alexa door)", c_voice_gateway)
 
     def c_skills():
@@ -1689,13 +1960,88 @@ def test_escape():
         return "openhands.sh generated (review before running)"
     check("openhands handoff", c_handoff)
 
-    def c_stt():
+    def c_voice():
+        """Speaking and listening happen on this machine, through a worker
+        that keeps the models loaded. (Stand-in engines here; the real ones
+        have a check of their own below.)"""
+        import io
+        import wave
+        import aria_voice
+        st = eng.voice_status()
+        assert st["tts"]["engine"] == "piper" \
+            and st["stt"]["engine"] == "faster-whisper", st
+        spoken = eng.voice_speak("All systems are operational.")
+        with wave.open(io.BytesIO(spoken)) as w:
+            assert w.getnframes() > 0, "her voice came back empty"
+        heard = eng.transcribe_audio(spoken)
+        assert heard.startswith("heard "), heard
+        # a worker that dies is started again without the caller noticing
+        aria_voice._PROC.kill()
+        aria_voice._PROC.wait()
+        assert eng.voice_speak("And again.")[:4] == b"RIFF"
+        # a WAV written to a pipe carries placeholder sizes (espeak does
+        # this): they are put right before a browser has to decode it
+        piped = (b"RIFF" + (0x7fffffff).to_bytes(4, "little") + b"WAVEfmt "
+                 + (16).to_bytes(4, "little") + b"\x01\x00\x01\x00"
+                 + (22050).to_bytes(4, "little") + (44100).to_bytes(4, "little")
+                 + b"\x02\x00\x10\x00" + b"data"
+                 + (0x7fffffff).to_bytes(4, "little") + b"\0\0" * 100)
+        with wave.open(io.BytesIO(aria_voice._fix_wav(piped))) as w:
+            assert w.getnframes() == 100
+        # with no engine at all she says what to do — not nothing
+        keep = os.environ["ARIA_VOICE_WORKER"], os.environ["PATH"]
+        nothing = os.path.join(sandbox, "_nothing")
+        os.makedirs(nothing, exist_ok=True)
+        os.environ["ARIA_VOICE_WORKER"] = os.path.join(nothing, "no-worker")
+        aria_voice.reset()
         try:
-            import faster_whisper  # noqa: F401
-            return "faster-whisper installed (Firefox voice input ready)"
-        except ImportError:
-            raise SkipTest("optional — pip install faster-whisper")
-    check("local speech-to-text", c_stt, required=False)
+            os.environ["PATH"] = nothing            # …and no espeak either
+            st = eng.voice_status()
+            assert not st["tts"]["engine"] and not st["stt"]["engine"]
+            assert "aria voice install" in st["tts"]["why"], st
+            for call in (lambda: eng.voice_speak("hello"),
+                         lambda: eng.transcribe_audio(spoken)):
+                try:
+                    call()
+                    raise AssertionError("spoke or listened with no engine")
+                except RuntimeError as exc:
+                    assert "aria voice install" in str(exc), exc
+        finally:
+            os.environ["ARIA_VOICE_WORKER"], os.environ["PATH"] = keep
+            aria_voice.reset()
+        assert eng.voice_status()["tts"]["engine"] == "piper"
+        return ("she speaks and listens through a worker kept warm, a dead "
+                "worker is restarted, piped audio is repaired, and with no "
+                "engine she says how to get one")
+    check("voice — her own voice and ears", c_voice)
+
+    def c_voice_real():
+        """The real thing, where `aria voice install` has been run: she
+        says a sentence and has to hear it back."""
+        import aria_voice
+        real = os.path.join(REAL_ROOT, "vendor", "voice")
+        if not os.path.isfile(os.path.join(real, "venv", "bin", "python")):
+            raise SkipTest("optional — bin/aria voice install (a natural "
+                           "voice and local recognition)")
+        keep = (aria_voice.VENV, aria_voice.VOICES,
+                os.environ.pop("ARIA_VOICE_WORKER"))
+        aria_voice.VENV = aria_voice.Path(real) / "venv"
+        aria_voice.VOICES = aria_voice.Path(real) / "voices"
+        aria_voice.reset()
+        try:
+            said = "Voice check. A.R.I.A. is online and ready."
+            st = eng.voice_status()
+            assert st["tts"]["engine"] == "piper", st["tts"]
+            heard = eng.transcribe_audio(eng.voice_speak(said),
+                                         language="en")
+            assert heard, "she spoke but heard nothing back"
+        finally:
+            aria_voice.VENV, aria_voice.VOICES = keep[0], keep[1]
+            os.environ["ARIA_VOICE_WORKER"] = keep[2]
+            aria_voice.reset()
+        return (f"{st['tts']['voice']} said “{said}” and "
+                f"{st['stt']['engine']} heard “{heard}”")
+    check("voice — the real engines", c_voice_real, required=False)
 
     # ---- server-level checks ----------------------------------------
     port = free_port()
@@ -1764,11 +2110,56 @@ def test_escape():
             assert open(shipped).read() == default, \
                 "Settings wrote into the shipped config.yml"
             eng.config_unset("stt_model")
+            # her voice and ears over HTTP (stand-in engines)
+            with urllib.request.urlopen(base + "/api/voice", timeout=15) as r:
+                voice = json.load(r)
+            assert voice["tts"]["engine"] and voice["stt"]["engine"], voice
+            req = urllib.request.Request(
+                base + "/api/tts", method="POST",
+                data=json.dumps({"text": "Good evening."}).encode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                spoken = r.read()
+                assert r.headers["Content-Type"] == "audio/wav"
+            assert spoken[:4] == b"RIFF", "her voice is not a WAV file"
+            req = urllib.request.Request(
+                base + "/api/stt?lang=en", method="POST", data=spoken,
+                headers={"Content-Type": "audio/wav"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                assert json.load(r)["text"].startswith("heard ")
             slug = state.get("active")
             if slug:
                 with urllib.request.urlopen(
                         f"{base}/api/project?slug={slug}", timeout=15) as r:
                     view = json.load(r)
+                assert "roadmap" in view and "milestones" in view["roadmap"]
+                with urllib.request.urlopen(
+                        f"{base}/api/project/live?slug={slug}",
+                        timeout=15) as r:
+                    kept = json.load(r)["outputs"]
+                if kept:                       # one earlier output, whole
+                    with urllib.request.urlopen(
+                            f"{base}/api/project/output?slug={slug}&n="
+                            f"{kept[0]['n']}", timeout=15) as r:
+                        assert "text" in json.load(r)
+                with urllib.request.urlopen(
+                        f"{base}/api/file/history?slug={slug}"
+                        "&path=STATUS.md", timeout=15) as r:
+                    assert isinstance(json.load(r)["changes"], list)
+            if state.get("diff"):              # previous beside modified
+                dslug, dpath, dtask = state["diff"]
+                with urllib.request.urlopen(
+                        f"{base}/api/file/diff?slug={dslug}&path={dpath}"
+                        f"&task={dtask}", timeout=15) as r:
+                    diff = json.load(r)
+                assert diff["rows"] and diff["before"], diff
+                try:
+                    urllib.request.urlopen(
+                        f"{base}/api/file/diff?slug={dslug}&path=../../"
+                        f"system/config.yml&task={dtask}", timeout=15)
+                    raise AssertionError("a diff left the project")
+                except urllib.error.HTTPError as exc:
+                    assert exc.code in (400, 404), exc.code
+            if slug:
                 for key in ("state", "plan", "assessment", "changes",
                             "report", "activity", "git", "approved"):
                     assert key in view, f"project view lacks {key}"
@@ -1868,9 +2259,10 @@ def test_escape():
             with urllib.request.urlopen(req, timeout=10) as r:
                 assert r.status == 200
             return "state, board, health, config, agents, skills, " \
-                   "projects, project view, files, runner; settings " \
-                   "saved to your own file; task answers, path " \
-                   "traversal and requests from other sites refused"
+                   "projects, project view, files, runner, voice, kept " \
+                   "outputs, a file's changes; settings saved to your " \
+                   "own file; task answers, path traversal and requests " \
+                   "from other sites refused"
         check("api endpoints", c_api)
 
         def c_chat_http():

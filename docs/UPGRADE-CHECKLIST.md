@@ -31,6 +31,12 @@ tell you what success looks like before moving on.
       in a window of her own instead of a browser
 - [ ] `sudo pacman -S python-pytest libnotify` → full test support for
       Python projects; desktop notifications when she needs you
+- [ ] `bin/aria voice install` → her voice and her ears, on this machine
+      (a private environment under `vendor/voice/`, about 700 MB; ends
+      with her saying a sentence and understanding it again). The
+      desktop window has no speech of its own, so this is what makes 🎙
+      and 🔊 work there. `bin/aria voice test` plays it through your
+      speakers
 
 ## Stage 1 — smart tier: qwen3:30b (~19GB download)
 - [ ] `ollama pull qwen3:30b`
@@ -63,25 +69,38 @@ tell you what success looks like before moving on.
 - [ ] `bin/aria models scan` → lists what it found, flags a model that is
       still downloading, and prints one `bin/aria models use …` line per
       model. Run those (or: ⚙ Settings → Giant models → Scan → Use)
-- [ ] `bin/aria models` → each role shows its model and "ready to load"
-- [ ] That is all. She starts the right one when a task needs it, unloads
-      the others first (one in memory at a time), and skips one that is
-      still downloading. Watch it happen: the sidebar says which giant is
-      loaded or loading; logs are in `system/garage/<role>.log`
-- [ ] Try one by hand: `bin/aria models load general` (first load: minutes)
-      then in chat `ask the strategist to <hard question>` with
-      `model: general` in `system/agents/strategist.md`
+- [ ] `bin/aria models` → each role shows its model and "ready to load".
+      "cannot start" means `llama-server` is missing: `bin/aria llama
+      install`
+- [ ] **Prove each one:** `bin/aria models test general` (then `research`,
+      `coder`) → loads it, asks it a question, prints the load time, the
+      answer time and the answer — or the server's own error. First
+      load: minutes. The **Test** button in Settings does the same
+- [ ] That is all. She starts the right one when a task needs it, asks
+      Ollama to free its memory and unloads the other giants first (one
+      in memory at a time), and skips one that is still downloading.
+      Watch it happen: the sidebar says which giant is loaded or loading,
+      the task's card shows the giant and why; logs are in
+      `system/garage/<role>.log`
+- [ ] Use one by hand: in chat `ask the strategist to <hard question>`
+      with `model: general` in `system/agents/strategist.md`
 - [ ] If you made the old per-model services, stop them — the roles
       replace them: `systemctl --user disable --now aria-llama-deepseek
       aria-llama-kimi aria-llama-coder`
 - [ ] Too slow for everyday tasks? That is expected (~0.5–2 words a
-      second). `giants_use: auto` leaves the choice to her per task;
-      `never` keeps them for agents you pin yourself
+      second). `giants_use: auto` gives a giant the tasks the planner
+      marks as hard and the last attempt at anything sent back twice;
+      `always` sends them everything; `never` keeps them for agents you
+      pin yourself
 - [ ] NEVER run giants through Ollama (it disables mmap → OOM); details in
       docs/BIG-MODELS.md and docs/MODEL-GARAGE.md
 
 ## Stage 5 — finishing touches
-- [ ] `pip install faster-whisper` → voice input in Firefox (last SKIP)
+- [ ] Voice not installed in stage 0.5? `bin/aria voice install` (the
+      last SKIP in the self-test). `sudo pacman -S espeak-ng` alone gives
+      her a plain voice with no download
+- [ ] Talk to her from an Echo: `bin/aria alexa` says what is set up and
+      what is left — the steps are in docs/ALEXA.md
 - [ ] ⚙ Settings → Obsidian vault path → "→ Obsidian" export goes live
 - [ ] n8n flows: `bin/aria settings set webhooks.<name> <url>` → "trigger
       <name>" in chat does real things

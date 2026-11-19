@@ -62,6 +62,8 @@ talk to her:
 | `approve <project>` | **Your gate.** The plan becomes the requirements; the project gets its own workspace. |
 | `work on <project>` | Autopilot: she takes stock, plans, and works task after task. |
 | `status of <project>` · `what are you working on` | Where things stand, in a sentence. |
+| `how far along is <project>` · `what's left on <project>` | The road to the goal: milestones reached, what is in hand, what is still ahead. Answered from her records, so it comes back at once even while every model is busy. |
+| `what needs me` | Plans awaiting your approval, tasks awaiting your decision, runs that paused themselves. |
 | `tell <project> to <guidance>` | Redirects her without stopping. |
 | `approve task t5 in <project>: <your decision>` · `skip task t5 in <project>` | Answers a task she marked as yours to decide. |
 | `refine <project>` | She reads the whole codebase, writes up what is worth changing, and refines it without changing what it does. |
@@ -72,7 +74,7 @@ talk to her:
 | `search for <topic>` · `read <url>` | The live web, answered with sources. |
 | `note to brain: <text>` | A note in your Obsidian vault. |
 | `ask the <agent> to <task>` · `mission <agent> to <task>` | One agent, now or in the background. |
-| `open <projects \| board \| agents \| orb \| settings>` | Takes you there. |
+| `open <projects \| board \| agents \| settings>` | Takes you there. |
 
 Project names are matched the way you say them — "the meal planner" finds
 `receipt-based-meal-planner`. If nothing fits, or two projects fit equally,
@@ -107,6 +109,7 @@ bin/aria open <slug> editor          # ...folder | terminal — on your desktop
 bin/aria run <slug>                  # how it is started (add a number to start it here)
 bin/aria check <slug>                # run its tests the way she does: sandboxed
 bin/aria models scan                 # your giant models: one per role, loaded on demand
+bin/aria models test general         # prove a giant loads and answers, end to end
 bin/aria adopt <repo|folder> "goal"  # put an existing codebase under autopilot
 bin/aria search "query"              # web search      (fetch <url> reads a page)
 bin/aria brain "text"                # a note in your Obsidian vault
@@ -114,7 +117,8 @@ bin/aria github publish <slug>       # ...init | push | status
 bin/aria agent critic "..."          # run one agent   (mission = in the background)
 bin/aria skills list                 # the skills pack (convert / prompt too)
 bin/aria app                         # the app in a window of her own   (ui = just the server)
-bin/aria voice-gateway               # the authenticated door for Alexa
+bin/aria voice install               # her own voice and ears, on this machine
+bin/aria alexa                       # talk to her from an Echo: where the setup stands
 bin/aria install-service             # always-on: server at login + hourly pipeline
 bin/aria install-skills              # skills and specialist agents (ECC, Anthropic…)
 bin/aria settings                    # your own settings   (set <key> <value> | unset | import)
@@ -136,16 +140,22 @@ bin/aria test --keep   # leave the sandbox on disk to inspect
 It builds a throwaway copy (your real pipeline, projects and vault are
 never touched) and runs everything: capture, spoken commands, triage,
 develop with and without web research, the Obsidian brain, the human
-gate, promotion, a full autopilot run — plus rejected work, a model-server
-outage, stop and resume, a task that waits on you, budgets, the review
-pass — the test sandbox (with a deliberately hostile test in it), the
-giant-model garage against stand-in servers, a commit per task, a stubbed
-GitHub push, adopting a repository, the agent library, the voice gateway
-with simulated Alexa requests, and every page and endpoint of the app.
+gate, promotion, a full autopilot run with its roadmap — plus rejected
+work, a model-server outage, stop and resume, a task that waits on you,
+budgets, the review pass — the test sandbox (with a deliberately hostile
+test in it), the giant-model garage against stand-in servers (including
+a hard task going to a giant and a stubborn one being moved to it), the
+kept outputs and file versions behind the Live and Files tabs, a chat
+that has to answer while the model is busy, her voice against a stand-in
+engine, a commit per task, a stubbed GitHub push, adopting a repository,
+the agent library, the voice gateway with simulated Alexa requests, and
+every page and endpoint of the app.
 `--mock` proves the plumbing on any machine; without it you prove your
 models too. The self-test never touches the internet, never loads one of
 your real models, never fires one of your webhooks and never puts
-anything on your screen. Run it after every `aria update`.
+anything on your screen. Where `aria voice install` has been run, one
+extra check has her say a sentence with the real voice and understand it
+again. Run it after every `aria update`.
 
 On real models the autopilot check stops after the first task or two, so
 a small model may get nothing verified in that time — the check says so
@@ -237,13 +247,53 @@ Without one she opens as a chromeless browser window, or a tab —
 ![A.R.I.A. — chat](docs/ui-shell.png)
 
 One window. The sidebar stays where it is — Chat, Projects, Pipeline,
-Agents, Orb, Settings — and switching is instant: nothing reloads, so a
+Agents, Settings — and switching is instant: nothing reloads, so a
 conversation or a run in flight carries on while you look elsewhere. Under
 the navigation it shows what she is **working on** right now, and at the
 bottom whether the model server is up and which of her reaches (web,
-brain, GitHub) are switched on. On every view except Chat and the Orb
-there is a line at the bottom to ask or tell her something without
-leaving.
+brain, GitHub) are switched on. On every view except Chat there is a line
+at the bottom to ask or tell her something without leaving.
+
+### Chat — and her voice
+
+The orb sits behind the conversation and shows what she is doing: idle,
+listening, thinking, speaking — it moves with her voice and with yours.
+
+- **She answers while she works.** Autopilot and the chat share the same
+  model server, and a server answers one thing at a time. Questions about
+  progress — *how far along is…*, *what needs me*, *status of…* — are
+  answered from her records without a model, so they come back at once.
+  For anything else she waits a bounded time for the model (about 25
+  seconds while autopilot is mid-step, 90 otherwise); if it has not begun
+  to answer by then she says so, and where the work stands, instead of
+  leaving you looking at three dots. The send button becomes **stop**
+  while she is replying.
+- **Her voice and her ears run on this machine.** One command sets up
+  both — a natural voice ([Piper](https://github.com/OHF-Voice/piper1-gpl))
+  and local speech recognition
+  ([faster-whisper](https://github.com/SYSTRAN/faster-whisper)):
+
+  ```bash
+  bin/aria voice install
+  ```
+
+  It builds a private Python environment under `vendor/voice/` (about
+  700 MB with the voice and the recognition model; nothing is installed
+  system-wide) and ends by having her say a sentence and understand it
+  again. After that: 🎙 to talk — she stops listening by herself when you
+  stop speaking — and 🔊 to have replies read aloud. Nothing you say
+  leaves the machine. `bin/aria voice` shows what is in place,
+  `bin/aria voice voices` lists other voices, `bin/aria voice use <name>`
+  switches (Settings → Voice does the same), and `bin/aria voice test`
+  runs the round trip again.
+
+  Without it she falls back to what the window itself offers: Chrome and
+  Edge bring their own recognition and voices, the desktop window
+  (`aria app`) brings neither — which is why voice needs the install
+  there. `sudo pacman -S espeak-ng` alone gives her a plain, robotic
+  voice with no download.
+- **From an Echo** — `bin/aria alexa`, and
+  [docs/ALEXA.md](docs/ALEXA.md).
 
 ### Projects — the board, the Gantt chart, and her at work
 
@@ -255,22 +305,33 @@ says where the project lives on your disk.
 - **Board** — To Do · Planning · In Progress · Reviewing · Done. Every
   card shows the agent, model and skills the plan gave it, and how long
   it took. Older finished work folds away; "Show earlier" brings it back.
-- **Gantt** — everything the project ever planned, in measured time: a
-  finished bar is as long as the task took, and work not done yet is
-  predicted from the pace measured so far in this project. Dependencies
-  are arrows; older batches fold into one line each.
+- **Gantt** — the newest work at the top, in measured time: a finished
+  bar is as long as the task took, and work not done yet is predicted
+  from the pace measured so far in this project. Dependencies are arrows;
+  older batches fold into one line each. Above the tasks is **the road
+  ahead**: the milestones between here and the goal that she has not
+  reached yet, each with an arrow from the ones it waits for — click one
+  for what "reached" means, what it unlocks and the tasks that belong to
+  it. **Current run only** hides everything from earlier runs; **Road
+  ahead** hides the milestones. The line of dots on the right counts the
+  milestones reached.
 
   ![Projects — Gantt chart](docs/ui-gantt.png)
 
 - **Live** — what she is doing this minute, streamed as she thinks, beside
-  the activity log.
+  the activity log. The arrows beside **Right now** page back through her
+  earlier outputs in full — the plan she wrote, the task before this one,
+  the critic's verdict — and forward again, a dozen steps back.
 
   ![Projects — live](docs/ui-live.png)
 
 - **Files** — the project's folder: every file, viewable, with the task
-  that last changed it. Copy path, **Open folder**, **Open in editor**,
-  **Terminal here**. Wherever she names a file — in a report, a change, a
-  chat reply — it is a link to it.
+  that last changed it. **Changes** beside the file shows every verified
+  change to it, newest first, and for each one the previous version next
+  to the modified version — removed lines red, added lines green, side by
+  side or unified, the way GitHub shows a commit. Copy path, **Open
+  folder**, **Open in editor**, **Terminal here**. Wherever she names a
+  file — in a report, a change, a chat reply — it is a link to it.
 
   ![Projects — files](docs/ui-files.png)
 
@@ -286,7 +347,8 @@ says where the project lives on your disk.
   what she can do with what she has, the gaps), her working memory, her
   code review, and your guidance.
 - **Changes** — every completed task: files touched, why, how it was
-  verified, what the tests said, references.
+  verified, what the tests said, references — and **see the change**
+  beside each file, which opens that before-and-after.
 
   ![Projects — changes](docs/ui-changes.png)
 
@@ -336,25 +398,11 @@ planner the ones that fit each project. Run any agent by hand from this
 page, from chat ("ask the critic to…"), or queue it as a background
 **mission** that keeps running with every tab closed.
 
-### Orb — voice
-
-![Orb](docs/ui-orb.png)
-
-The same conversation as Chat, as a presence: idle, listening, thinking,
-speaking.
-
-- **Voice in** — click the mic and talk. Chrome transcribes natively;
-  other browsers (**Firefox**) record and transcribe **locally** through
-  faster-whisper (`pip install faster-whisper`, model set by
-  `aria.stt_model`).
-- **Voice out** — replies are spoken by your system's speech synthesis;
-  🔊 mutes her.
-- **From an Echo** — see [docs/ALEXA.md](docs/ALEXA.md).
-
 ### Settings
 
-Models, internet, the Obsidian brain, Git & GitHub and autopilot's
-behaviour, without touching YAML. What you save goes into
+Models — with a **Test** button beside each giant that loads it and
+asks it a question — her voice, the internet, the Obsidian brain, Git &
+GitHub and autopilot's behaviour, without touching YAML. What you save goes into
 `system/config.local.yml` — your own file, which updates never touch;
 `system/config.yml` keeps the defaults and explains every key.
 
@@ -372,7 +420,7 @@ says. Details and reasoning: **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)**.
 | **Running code** | `autopilot_checks` (sandbox) | The project's own tests after every change, in a sandbox; a change that breaks them is rolled back | Use the network, read your home folder or write outside a scratch copy while testing; start a program — only you do that, in the Run tab |
 | **Your desktop** | — | Open a project's folder, editor or a terminal on your click; a notification when she needs you or a run ends | Open anything but a project's own folder; hand a file to "whatever opens this type" |
 | **Giant models** | `giant_general` … (unset) | Your largest models, one role each, loaded when a task needs them and swapped so only one is in memory | Unload one mid-answer; use one that is still downloading |
-| **Alexa** | `aria voice-gateway` | Everything above, by voice, from any Echo | Approve a plan, answer a task that waits on you, or push to GitHub by voice |
+| **Alexa** | `aria alexa` | Progress, what needs you, and everything above, by voice, from any Echo | Approve a plan, answer a task that waits on you, or push to GitHub by voice |
 | **Webhooks** | `webhooks:` (none) | n8n flows, Home Assistant, deploy hooks — "trigger deploy-site" | Reach any URL you did not name |
 
 With `web_access` on, search queries leave your machine; everything else
@@ -510,16 +558,20 @@ aria/
 │   ├── aria_engine.py         # config, model client, pipeline, chat, agents
 │   ├── aria_autopilot.py      # the autonomous loop
 │   ├── aria_web.py  aria_brain.py  aria_git.py   # her reaches
+│   ├── aria_garage.py         # the giants: one llama-server per role, on demand
+│   ├── aria_voice.py  aria-voice-worker          # her voice and her ears, local
 │   ├── aria-ui                # the app's server
 │   ├── aria-voice-gateway     # the door for Alexa
 │   └── aria-test  aria-mock-llm                  # the self-test and its stand-in model
-├── ui/                        # the app: one shell, six views
-├── integrations/alexa/        # skill model + Lambda
+├── ui/                        # the app: one shell, five views
+├── integrations/alexa/        # the skill's model and logic
 └── docs/                      # autopilot, integrations, Alexa, models, roadmap
 ```
 
 Everything is the Python standard library and plain JavaScript — nothing
-to `pip install` or build.
+to `pip install` or build. The one optional exception is her voice:
+`bin/aria voice install` puts two speech packages into an environment of
+their own under `vendor/voice/`, and she runs without them.
 
 ## More
 
@@ -527,7 +579,8 @@ to `pip install` or build.
   happens when things go wrong, and its honest limits.
 - **[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)** — every reach and its
   boundary; the wider ecosystem (n8n, Uptime Kuma, OpenHands, ECC…).
-- **[docs/ALEXA.md](docs/ALEXA.md)** — voice from an Echo.
+- **[docs/ALEXA.md](docs/ALEXA.md)** — ask an Echo how a project is
+  getting on: the setup, step by step, and what protects it.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — what helps an agent that runs
   on its own for days: what is in place, and what would help most next.
 - **[docs/BIG-MODELS.md](docs/BIG-MODELS.md)**,

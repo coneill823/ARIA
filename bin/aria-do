@@ -29,6 +29,16 @@ itself and hands everything below to this script:
   models use <role> <file.gguf>  give a role its model (general, research,
                                  coder) — the first part of a split model
   models load <role> | unload [role]
+  models test <role>             prove a giant end to end: load it, ask it
+                                 one question, report how long both took
+  voice                          what she speaks and listens with here
+  voice install [name]           local speech in a private environment:
+                                 a natural voice (piper) and recognition
+                                 (faster-whisper), then a round-trip test
+  voice use <name> | voices | test ["text"]
+  alexa                          Alexa → A.R.I.A.: what is set up, what is
+                                 left to do, the address to give Amazon
+  alexa service | url <https://…> | skill <id> | test ["text"]
   search "query"                 web search
   fetch <url>                    read a web page as text
   brain "text"                   write a note into the Obsidian vault
@@ -48,6 +58,7 @@ itself and hands everything below to this script:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -300,12 +311,254 @@ def cmd_models(args):
               "several minutes…", flush=True)
         port = eng.garage_load(args[1], notify=lambda t: print(t, flush=True))
         print(f"ready on http://127.0.0.1:{port}")
+    elif action == "test":
+        need(args, 2, "models test <general|research|coder>")
+        print(f"testing the {args[1]} giant: loading it, then one short "
+              "question. A first load can take several minutes…", flush=True)
+        r = eng.garage_test(args[1], notify=lambda t: print(t, flush=True))
+        if not r["ok"]:
+            raise SystemExit(f"FAILED — {r['error']}\n(the server's own "
+                             f"words: system/garage/{args[1]}.log)")
+        print(f"\nOK — {r['label']} loaded in {_took(r['load_seconds'])} "
+              f"and answered in {_took(r['seconds'])} "
+              f"({r['words'] / max(r['seconds'], 0.1):.1f} words a second):"
+              f"\n  “{r['reply']}”")
     elif action == "unload":
         gone = eng.garage_unload(args[1] if len(args) > 1 else "")
         print("unloaded: " + (", ".join(gone) or "nothing was loaded"))
     else:
         raise SystemExit("models status | scan [folder] | use <role> <file> "
-                         "| load <role> | unload [role]")
+                         "| load <role> | test <role> | unload [role]")
+
+
+def _took(seconds):
+    seconds = float(seconds or 0)
+    return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.1f} min"
+
+
+def cmd_voice(args):
+    """Her voice and her ears, on this machine."""
+    import subprocess
+    import tempfile
+    voice = eng.aria_voice
+    action = args[0] if args else "status"
+    if action == "status":
+        st = eng.voice_status()
+        t, s = st["tts"], st["stt"]
+        print("speaking   " + (f"{t['engine']} — {t['voice']}"
+                               + ("" if t["natural"] else "  (plain; " + t["why"] + ")")
+                               if t["engine"] else t["why"]))
+        print("listening  " + (f"{s['engine']} — model {s['model']}"
+                               if s["engine"] else s["why"]))
+        if st["voices"]:
+            print("voices     " + ", ".join(st["voices"]))
+        print("\nIn her own window these are what she speaks and listens "
+              "with. In a browser that has\nspeech of its own (Chrome), "
+              "Settings → Voice chooses between the two.")
+    elif action == "install":
+        name = args[1] if len(args) > 1 else ""
+        eng.voice_install(say=lambda t: print(t, flush=True), voice=name)
+        print("\ndone — restart is not needed; reload the app window if it "
+              "is open")
+    elif action == "use":
+        need(args, 2, "voice use <name>   (aria voice voices lists them)")
+        if not any(v["name"] == args[1] for v in voice.voices()):
+            voice.add_voice(args[1], say=lambda t: print(t, flush=True))
+        eng.config_set("voice_name", args[1])
+        print(f"her voice is now {args[1]}")
+    elif action == "voices":
+        have = {v["name"] for v in voice.voices()}
+        for name, says in voice.SUGGESTED:
+            print(f"{'*' if name in have else ' '} {name:36} {says}")
+        for name in sorted(have - {n for n, _ in voice.SUGGESTED}):
+            print(f"* {name}")
+        print("\n* = installed. Try one: aria voice use <name>   "
+              "(every voice: https://rhasspy.github.io/piper-samples/)")
+    elif action == "test":
+        said = " ".join(args[1:]) or ("Good evening. All systems are "
+                                      "operational, and I am listening.")
+        wav = eng.voice_speak(said)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav)
+        print(f"she says: “{said}”  ({len(wav) // 1000} kB of audio)")
+        player = next((p for p in ("pw-play", "paplay", "aplay", "ffplay")
+                       if eng._which(p)), "")
+        if player:
+            subprocess.run([player] + (["-nodisp", "-autoexit", "-loglevel",
+                                        "quiet"] if player == "ffplay"
+                                       else []) + [f.name])
+        else:
+            print(f"(no audio player found to play it — the file: {f.name})")
+        try:
+            print(f"she hears: “{eng.transcribe_audio(wav, language='en')}”")
+        except RuntimeError as exc:
+            print(f"she cannot listen yet: {exc}")
+    else:
+        raise SystemExit("voice | voice install [name] | voice use <name> | "
+                         "voice voices | voice test [\"text\"]")
+
+
+VOICE_PORT = 8701
+
+
+def _gateway_up(port=VOICE_PORT):
+    """Is A.R.I.A.'s own voice gateway answering on this machine?"""
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3)
+    except urllib.error.HTTPError as exc:
+        return "aria-voice" in (exc.headers.get("Server") or "")
+    except OSError:
+        return False
+    return False
+
+
+def _alexa_ask(url, text, skill_id):
+    """Send `text` the way Amazon would (one skill request) and return what
+    Alexa would say."""
+    import datetime
+    import urllib.request
+    event = {
+        "version": "1.0",
+        "session": {"new": True, "sessionId": "aria-alexa-test",
+                    "application": {"applicationId":
+                                    skill_id or "amzn1.ask.skill.aria-test"}},
+        "request": {"type": "IntentRequest", "requestId": "aria-alexa-test",
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"), "locale": "en-GB",
+                    "intent": {"name": "SayIntent", "slots": {
+                        "text": {"name": "text", "value": text}}}}}
+    req = urllib.request.Request(url, data=json.dumps(event).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)["response"]["outputSpeech"]["text"]
+
+
+def cmd_alexa(args):
+    """Alexa → A.R.I.A.: set the skill's door up, check it, try it."""
+    import shutil
+    import subprocess
+    action = args[0] if args else "status"
+    cfg = eng.config()
+    if action == "url":
+        need(args, 2, "alexa url https://<the address of your tunnel>")
+        eng.config_set("alexa_url", args[1].rstrip("/"))
+        print("the address to give Amazon (Build → Endpoint → HTTPS → "
+              f"Default Region):\n\n  {args[1].rstrip('/')}/alexa/"
+              f"{eng.voice_token()}\n\nIt holds the secret: treat it like "
+              "a password.")
+    elif action == "skill":
+        need(args, 2, "alexa skill amzn1.ask.skill.…")
+        eng.config_set("alexa_skill_id", args[1])
+        print("only that skill is answered now (the gateway reads it "
+              "without a restart)")
+    elif action == "service":
+        unit_dir = Path(os.environ.get("XDG_CONFIG_HOME")
+                        or Path.home() / ".config") / "systemd" / "user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        (unit_dir / "aria-voice.service").write_text(
+            "[Unit]\nDescription=A.R.I.A. voice gateway (the door for "
+            "Alexa)\nAfter=aria.service\n\n[Service]\n"
+            f"ExecStart=/usr/bin/env python3 {eng.ROOT}/bin/"
+            f"aria-voice-gateway {VOICE_PORT}\nRestart=on-failure\n"
+            "RestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            encoding="utf-8")
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           check=True)
+            subprocess.run(["systemctl", "--user", "enable", "--now",
+                            "aria-voice.service"], check=True)
+            print(f"aria-voice.service — the gateway runs from login on "
+                  f"127.0.0.1:{VOICE_PORT}\nlogs: journalctl --user -u "
+                  "aria-voice -f")
+        except (OSError, subprocess.CalledProcessError):
+            raise SystemExit("the unit is written, but systemd did not "
+                             "start it — run the gateway by hand: "
+                             "bin/aria voice-gateway")
+    elif action == "test":
+        said = " ".join(args[1:]) or "what are you working on"
+        if not _gateway_up():
+            raise SystemExit("the voice gateway is not running — start it: "
+                             "bin/aria alexa service   (or, in a terminal: "
+                             "bin/aria voice-gateway)")
+        token = eng.voice_token()
+        print(f"you (as Alexa would send it): “{said}”")
+        print("she, on this machine:         “" + _alexa_ask(
+            f"http://127.0.0.1:{VOICE_PORT}/alexa/{token}", said,
+            cfg["alexa_skill_id"]) + "”")
+        if cfg["alexa_url"]:
+            try:
+                heard = _alexa_ask(f"{cfg['alexa_url']}/alexa/{token}", said,
+                                   cfg["alexa_skill_id"])
+                print(f"she, through {cfg['alexa_url']}:\n"
+                      f"                              “{heard}”\n\n"
+                      "The whole road from the internet to her works. What "
+                      "is left is Amazon's side: the skill.")
+            except Exception as exc:
+                raise SystemExit(
+                    f"…but not through {cfg['alexa_url']}: {exc}\nIs the "
+                    "tunnel running, and pointed at port "
+                    f"{VOICE_PORT}?")
+        else:
+            print("\nNo public address is set yet, so only the local half "
+                  "was tried — see: bin/aria alexa")
+    elif action == "status":
+        up = _gateway_up()
+        token = eng.voice_token()
+        url, skill = cfg["alexa_url"], cfg["alexa_skill_id"]
+        tool = next((t for t in ("tailscale", "cloudflared", "ngrok")
+                     if shutil.which(t)), "")
+        how = {"tailscale": f"tailscale funnel --bg {VOICE_PORT}",
+               "cloudflared": "cloudflared tunnel --url "
+                              f"http://127.0.0.1:{VOICE_PORT}",
+               "ngrok": f"ngrok http {VOICE_PORT}"}.get(tool, "")
+        print("Alexa → A.R.I.A.\n")
+        print("  1. the door     " + (
+            f"✓ the voice gateway is running on 127.0.0.1:{VOICE_PORT}"
+            if up else
+            "✗ the voice gateway is not running\n"
+            "                    start it, and keep it running:  "
+            "bin/aria alexa service"))
+        print("  2. the address  " + (
+            f"✓ {url}" if url else
+            "✗ not set. Amazon has to reach the gateway over HTTPS, so it "
+            "needs a tunnel\n                    to port "
+            f"{VOICE_PORT} (never 8700). "
+            + (f"You have {tool}:\n                      {how}"
+               if tool else
+               "The simplest that keeps one address for good is\n"
+               "                    Tailscale Funnel:  sudo pacman -S "
+               "tailscale ; sudo systemctl enable --now tailscaled ;\n"
+               "                    sudo tailscale up ; tailscale funnel "
+               f"--bg {VOICE_PORT}")
+            + "\n                    then tell her the address it prints:  "
+              "bin/aria alexa url https://…"))
+        print("  3. the skill    " + (
+            f"✓ only {skill} is answered" if skill else
+            "– any skill that knows the address is answered. Once yours "
+            "exists:\n                    bin/aria alexa skill "
+            "amzn1.ask.skill.…   (its id is on the skill's page)"))
+        print("\nIn the Alexa developer console "
+              "(https://developer.amazon.com/alexa/console/ask):\n"
+              "  a. Create Skill → any name → model: Custom → hosting: "
+              "Provision your own\n"
+              "  b. Build → Interaction Model → JSON Editor: paste "
+              "integrations/alexa/interaction-model.json,\n"
+              "     Save, then Build skill\n"
+              "  c. Build → Endpoint → HTTPS → Default Region:")
+        print(f"       {url}/alexa/{token}" if url else
+              "       (the address appears here once step 2 is done)")
+        print("     certificate type: “…has a certificate from a trusted "
+              "certificate authority”\n"
+              "     (for a trycloudflare.com address: “…sub-domain of a "
+              "domain that has a wildcard certificate”)\n"
+              "  d. Test → skill testing: Development → say “ask my aria "
+              "what are you working on”\n\n"
+              "Try your side first, without Amazon:  bin/aria alexa test")
+    else:
+        raise SystemExit("alexa | alexa service | alexa url <https://…> | "
+                         "alexa skill <id> | alexa test [\"text\"]")
 
 
 def cmd_plan(args):
@@ -608,8 +861,7 @@ def cmd_reach(_args):
               + (f" — {row['error']}" if row.get("error") else "") + ")")
     if all(r["state"] == "unset" for r in roles.values()):
         print("note no giant models set — aria models scan")
-    elif not eng._which("llama-server") and not any(
-            (eng.ROOT / "vendor" / "llama.cpp").glob("**/llama-server")):
+    elif not eng.aria_garage.server_binary():
         print("MISS llama-server (the giants need it) — aria llama install")
     # running and checking code
     ok, why = eng.checks_available(cfg)
@@ -649,6 +901,31 @@ def cmd_reach(_args):
     if cfg["desktop_notifications"] and not eng._which("notify-send"):
         print("note notify-send not found — no desktop notifications "
               "(pacman -S libnotify)")
+    # her voice and her ears
+    try:
+        speech = eng.voice_status()
+    except Exception as exc:            # doctor reports; it does not fall over
+        speech = None
+        print(f"note voice could not be checked — {exc}")
+    if speech:
+        t, s = speech["tts"], speech["stt"]
+        if t["engine"] and s["engine"]:
+            print(f"ok   voice: she speaks with {t['engine']} ({t['voice']})"
+                  + ("" if t["natural"] else " — a plain voice; for a "
+                     "natural one: aria voice install")
+                  + f" and listens with {s['engine']}")
+        else:
+            lacks = " and ".join(what for what, row in (
+                ("no voice", t), ("no speech recognition", s))
+                if not row["engine"])
+            print(f"note voice: {lacks} on this machine — aria voice install"
+                  "  (Chrome brings its own; her desktop window does not)")
+    if cfg["alexa_url"]:
+        print("ok   Alexa: " + ("locked to your skill" if cfg["alexa_skill_id"]
+                                else "address set — lock it to your skill: "
+                                     "aria alexa skill <id>")
+              + ("" if _gateway_up() else " — but the voice gateway is not "
+                 "running: aria alexa service"))
 
 
 COMMANDS = {name[4:]: fn for name, fn in globals().items()

@@ -3,7 +3,7 @@
 
   aria-ui [port]     default port 8700, binds to 127.0.0.1 only
 
-Stdlib only. The pages (/, /projects, /board, /agents, /orb, /settings) all
+Stdlib only. The pages (/, /projects, /board, /agents, /settings) all
 serve the same shell, ui/index.html; its assets come from /ui/<file>.
 
   GET  /api/state      what the shell polls: health, projects, switches
@@ -54,7 +54,10 @@ headers (curl, the voice gateway, scripts) are unaffected.
   POST /api/agent      {"name", "task"} -> streamed agent run
   POST /api/mission    {"agent", "task"} -> queue a background job
   POST /api/config     {key: value, …} -> update settings
-  POST /api/stt        raw audio body -> {"text"} via local faster-whisper
+  POST /api/stt        raw audio body (WAV best) -> {"text"}, recognised
+                       on this machine
+  POST /api/tts        {text} -> a WAV file: her voice, made on this machine
+  GET  /api/voice      which speech engines there are; POST installs them
 """
 
 import json
@@ -74,8 +77,6 @@ import aria_engine as eng  # noqa: E402
 UI_DIR = eng.ROOT / "ui"
 VIEWS = ("/", "/chat", "/projects", "/board", "/agents", "/orb", "/settings")
 RUN_LOCK = threading.Lock()  # one pipeline run at a time
-AUDIO_SUFFIX = {"audio/webm": ".webm", "audio/ogg": ".ogg",
-                "audio/wav": ".wav", "audio/mp4": ".m4a"}
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
                ".jpeg": "image/jpeg", ".gif": "image/gif",
                ".webp": "image/webp", ".svg": "image/svg+xml",
@@ -88,9 +89,11 @@ CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
                "autopilot_max_hours", "autopilot_stall_limit",
                "context_tokens", "giant_general", "giant_research",
                "giant_coder", "giants_use", "giants_loaded",
-               "giants_idle_minutes", "editor", "terminal",
+               "giants_idle_minutes", "giants_free_memory", "editor",
+               "terminal",
                "autopilot_checks", "autopilot_check_seconds",
-               "autopilot_refine", "desktop_notifications")
+               "autopilot_refine", "desktop_notifications",
+               "voice_engine", "voice_input", "voice_name", "voice_speed")
 _HEALTH = {"at": 0.0, "value": None}
 _HEALTH_LOCK = threading.Lock()
 # what this server started with (filled in by main) — see eng.server_mark
@@ -134,6 +137,14 @@ def garage_brief():
             "now": st["now"]}
 
 
+def voice_install(voice=""):
+    try:
+        eng.voice_install(say=lambda t: print("voice:", t, flush=True),
+                          voice=voice)
+    except Exception as exc:
+        print("voice:", exc, flush=True)
+
+
 def load_giant(role):
     try:
         eng.garage_load(role, notify=lambda t: print("garage:", t,
@@ -164,6 +175,11 @@ def config_view():
                   for t, v in tiers.items()},
         "tiers_set": dict(cfg["tiers"]),
         "stt_model": cfg["stt_model"],
+        "voice_engine": cfg["voice_engine"],
+        "voice_input": cfg["voice_input"],
+        "voice_name": cfg["voice_name"],
+        "voice_speed": cfg["voice_speed"],
+        "voice": eng.voice_status(),
         "web_access": cfg["web_access"],
         "web_search": cfg["web_search"],
         "web_search_url": cfg["web_search_url"],
@@ -183,6 +199,7 @@ def config_view():
         "giants_use": cfg["giants_use"],
         "giants_loaded": cfg["giants_loaded"],
         "giants_idle_minutes": cfg["giants_idle_minutes"],
+        "giants_free_memory": cfg["giants_free_memory"],
         "garage": eng.garage_status(probe=False),
         "editor": cfg["editor"],
         "terminal": cfg["terminal"],
@@ -246,6 +263,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_bytes(self, data, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
@@ -348,6 +374,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(health_cached(max_age=3))
         elif path == "/api/version":
             self.send_json(version_view())
+        elif path == "/api/voice":
+            self.send_json(eng.voice_status())
         elif path == "/api/config":
             self.send_json(config_view())
         elif path == "/api/garage":
@@ -368,10 +396,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"slug": slug, "state": state,
                             "activity": ap.activity(slug, limit=60),
                             "live": ap.live(slug),
+                            "outputs": ap.outputs(slug, limit=12),
                             "tasks": [{k: t.get(k) for k in
                                        ("id", "status", "attempts",
                                         "needs_human")}
                                       for t in plan["tasks"]]})
+        elif path == "/api/project/output":
+            # one finished live stream, whole (the Live tab's ◀ ▶)
+            self.send_json(eng.project_output(arg("slug"), arg("n") or 0))
+        elif path == "/api/file/history":
+            self.send_json({"path": arg("path"), "changes":
+                            eng.file_history(arg("slug"), arg("path"))})
+        elif path == "/api/file/diff":
+            self.send_json(eng.file_diff(arg("slug"), arg("path"),
+                                         arg("task")))
         elif path in ("/api/file", "/api/file/raw"):
             proj = eng._project_dir(arg("slug")).resolve()
             target = (proj / arg("path")).resolve()
@@ -440,12 +478,16 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if url.path == "/api/stt":  # raw audio, not JSON
             try:
-                suffix = AUDIO_SUFFIX.get(
+                if length > 40_000_000:
+                    raise ValueError("that recording is too long")
+                suffix = eng.AUDIO_SUFFIXES.get(
                     (self.headers.get("Content-Type") or "").split(";")[0],
                     ".webm")
-                text = eng.transcribe_audio(self.rfile.read(length), suffix)
+                lang = urllib.parse.parse_qs(url.query).get("lang", [""])[0]
+                text = eng.transcribe_audio(self.rfile.read(length), suffix,
+                                            language=lang[:5])
                 self.send_json({"text": text})
-            except RuntimeError as exc:   # faster-whisper not installed
+            except RuntimeError as exc:   # no recogniser here: say what to do
                 self.send_json({"error": str(exc)}, 501)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 400)
@@ -568,6 +610,26 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/open":
             self.send_json({"ok": True, "say": eng.open_path(
                 text("slug").lower(), text("path"), text("how") or "folder")})
+        elif path == "/api/tts":
+            # her voice, made on this machine: text in, a WAV file out
+            try:
+                self.send_bytes(eng.voice_speak(text("text")), "audio/wav")
+            except RuntimeError as exc:
+                self.send_json({"error": str(exc)}, 501)
+        elif path == "/api/voice":
+            action = text("action")
+            if action == "install":
+                if eng.aria_voice.INSTALL["running"]:
+                    raise ValueError("an install is already running")
+                threading.Thread(target=voice_install,
+                                 args=(text("voice"),), daemon=True).start()
+                self.send_json({"ok": True, "installing": True})
+            elif action == "voice":            # one more voice, and use it
+                eng.aria_voice.add_voice(text("voice"))
+                eng.config_set("voice_name", text("voice"))
+                self.send_json({"ok": True, **eng.voice_status()})
+            else:
+                raise ValueError("action must be install or voice")
         elif path == "/api/garage":
             action, role = text("action"), text("role")
             if action == "scan":
@@ -581,11 +643,23 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=load_giant, args=(role,),
                                  daemon=True).start()
                 self.send_json({"ok": True, "loading": role})
+            elif action == "test":
+                # load it, ask it one question, keep the outcome: the proof
+                # that this giant really works on this machine
+                if role not in eng.aria_garage.ROLES:
+                    raise ValueError("role must be general, research or coder")
+                ok, why = eng.aria_garage.available(role, eng.config())
+                if not ok and "failed to load" not in why:
+                    raise ValueError(why)
+                threading.Thread(
+                    target=lambda: eng.garage_test(role, notify=lambda t: print(
+                        "garage:", t, flush=True)), daemon=True).start()
+                self.send_json({"ok": True, "testing": role})
             elif action == "unload":
                 self.send_json({"ok": True, "unloaded":
                                 eng.garage_unload(role)})
             else:
-                raise ValueError("action must be scan, load or unload")
+                raise ValueError("action must be scan, load, test or unload")
         elif path == "/api/plan":
             self.plan_project(body)
         elif path == "/api/github":
@@ -630,7 +704,8 @@ class Handler(BaseHTTPRequestHandler):
             action = intent["action"] if intent else None
             if intent is None:
                 eng.converse(messages, skill=body.get("skill") or None,
-                             on_token=token)
+                             on_token=token, on_status=lambda t: emit(
+                                 {"event": "status", "text": t}))
             elif action in ("triage", "develop"):
                 emit({"event": "action", "action": action,
                       "say": f"On it — running {action} now."})
@@ -683,7 +758,16 @@ class Handler(BaseHTTPRequestHandler):
             intent = eng.detect_intent(text)
             action = intent["action"] if intent else None
             if intent is None:
-                reply = eng.converse([{"role": "user", "content": text}]) or "…"
+                # an integration (Alexa…) cannot wait long: it may say how
+                # long it has, and gets an honest "busy" answer after that
+                try:
+                    patience = min(120.0, max(2.0, float(
+                        body.get("patience") or 0))) \
+                        if body.get("patience") else None
+                except (TypeError, ValueError):
+                    patience = None
+                reply = eng.converse([{"role": "user", "content": text}],
+                                     patience=patience) or "…"
             elif action in ("triage", "develop"):
                 reply = (f"Running {action} in the background."
                          if self._start_stage(action, "") else

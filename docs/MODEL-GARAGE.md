@@ -63,7 +63,21 @@ The same lives in the app: **Settings → Giant models → Scan → Use**.
 bin/aria models
 ```
 
-shows what each role has and what is loaded. What then happens on its own:
+shows what each role has and what is loaded. Then **prove it**, before a
+night's work depends on it:
+
+```bash
+bin/aria models test general
+```
+
+loads that giant, asks it one question and reports how long the load
+took, how long the answer took and what it said — or the server's own
+error if it could not. The **Test** button beside each giant in Settings
+does the same and keeps the result on the page. A first load of a model
+larger than your RAM takes minutes; that is the test working, not
+hanging.
+
+What then happens on its own:
 
 - **On demand.** The first task that needs a role starts its
   `llama-server` (the `giant` preset: experts on CPU, weights mmap'd).
@@ -72,6 +86,10 @@ shows what each role has and what is loaded. What then happens on its own:
 - **One at a time.** Before a giant loads, the least recently used one is
   unloaded — never in the middle of an answer. `giants_loaded: 2` allows
   two at once if your RAM takes it.
+- **Ollama makes room.** Before a giant loads, Ollama is asked to unload
+  whatever it is holding, so the giant gets the graphics memory and the
+  RAM; the everyday model loads again by itself when it is next needed.
+  `giants_free_memory: false` leaves Ollama's models where they are.
 - **Grouped.** Tasks that can run on the giant already loaded go before
   tasks that would need a swap.
 - **Still downloading?** A model with parts missing, or a part still being
@@ -81,6 +99,11 @@ shows what each role has and what is loaded. What then happens on its own:
 - **A load that fails** (out of memory, a damaged file) is reported with
   the server's own error in Settings and `aria models`, and stepped around
   until the files change or you press Retry. Logs: `system/garage/<role>.log`.
+- **No `llama-server`, no giants.** A model file can be complete and
+  still have nothing to run it. Settings then says **cannot start** in
+  place of "ready to load", `aria models` and `aria doctor` say the same,
+  and the giants are not offered to the planner. `bin/aria llama install`
+  builds it.
 - **Idle.** `giants_idle_minutes` unloads a giant nobody has used for that
   long; 0 keeps the last one in memory.
 
@@ -99,14 +122,26 @@ giants fewer GPU layers: `bin/aria settings set giants_flags -ngl 20`.
 
 | `giants_use` | What happens |
 |---|---|
-| `auto` (default) | The planner sees the giants with their price — about 0.5–2 words a second, so one task can take an hour — and gives a task one only when the work is worth that wait. |
+| `auto` (default) | A giant gets the **hard** tasks: the planner marks the few an everyday model is likely to get wrong — a design the rest of the project hangs on, an intricate algorithm, a change that has to stay consistent across several files, subtle debugging, weighing a lot of research. And a task an everyday model has had sent back twice gets its last attempt on a giant. Everything else stays on the quick models. |
 | `always` | Every coding task goes to `coder`, research to `research`, everything else to `general`. Strongest, and slowest by far. |
 | `never` | Giants are used only where you name them yourself. |
+
+Which giant: the coder for code, the researcher for research, the
+general one for the rest — and when the one that fits is not set up, the
+next best you have (with no coder giant, hard coding work goes to the
+general one). The task's card on the board shows the giant and why it
+was chosen; the Live tab says when one is loading.
 
 Planning, verification and memory stay on the `fast`/`smart` tiers either
 way — the loop makes many small calls, and those should be quick. Keep
 those tiers on GPU-speed models (`ollama pull qwen3:30b`, then
 `smart: ollama/qwen3:30b`).
+
+**Never seen a giant used?** Three things to check, in this order:
+`bin/aria doctor` (is `llama-server` there?), `bin/aria models test
+<role>` (does it load and answer on this machine?), and `giants_use`
+(with `never`, only an agent you pin gets one). To see every task go to
+one regardless of difficulty, `bin/aria settings set giants_use always`.
 
 **You can also pin an agent** in its frontmatter (`system/agents/*.md`) —
 a role name is a model like any other:

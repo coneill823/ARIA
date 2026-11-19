@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -367,10 +368,15 @@ def status(cfg, probe=True):
                        since=(rec or {}).get("started", 0))
         elif rec or h == "loading":
             row.update(state="loading", since=(rec or {}).get("started", 0))
+        elif not server_binary():
+            row.update(state="blocked", error=NO_SERVER)
         else:
             fail = _failure(role, info)
             row.update(state="failed" if fail else "stopped",
                        error=(fail or {}).get("error", ""))
+        test = _read(f"{role}.test.json")
+        if test and test.get("sig") == ms["sig"]:
+            row["test"] = test                # the last end-to-end proof
         out[role] = row
     now = next(({"role": r, "phase": "loading",
                  "message": f"loading {row['label']}"}
@@ -383,6 +389,26 @@ def status(cfg, probe=True):
             "use": cfg.get("giants_use", "auto"), "now": now}
 
 
+NO_SERVER = ("llama-server is not installed, so no giant can start — "
+             "run: bin/aria llama install")
+
+
+def server_binary():
+    """Where llama-server is — the places bin/aria-llama looks, in its
+    order. '' when there is none. (The self-test's stand-in command counts
+    as one.)"""
+    if os.environ.get("ARIA_GARAGE_COMMAND"):
+        return "stand-in"
+    vendor = ROOT / "vendor" / "llama.cpp"
+    for path in (vendor / "bin" / "llama-server", vendor / "llama-server",
+                 vendor / "build" / "bin" / "llama-server",
+                 ROOT / "vendor" / "llama.cpp-src" / "build" / "bin"
+                 / "llama-server"):
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return shutil.which("llama-server") or ""
+
+
 def available(role, cfg):
     """(usable, why not) — cheap enough to ask before every call."""
     info = configured(cfg).get(role)
@@ -391,6 +417,8 @@ def available(role, cfg):
     ms = model_set(info["path"])
     if not ms["complete"]:
         return False, f"{info['label']}: {ms['why']}"
+    if not server_binary():
+        return False, NO_SERVER
     fail = _failure(role, info)
     if fail:
         return False, f"{info['label']} failed to load: {fail['error']}"
@@ -525,6 +553,12 @@ def stop(role, wait=0):
     return True
 
 
+# Callables (role, cfg, notify) run just before a giant's server is
+# started — the engine uses this to have the everyday model server let go
+# of its memory first, so the giant gets it.
+BEFORE_START = []
+
+
 def _make_room(role, cfg, notify):
     limit = max(1, int(cfg.get("giants_loaded") or 1))
     used = _read("used.json", {}) or {}
@@ -558,11 +592,18 @@ def ensure(role, cfg, notify=None):
         rec = _pidrec(role)
         if rec or h == "loading":         # someone already started it
             return _wait_ready(role, info, rec, notify)
+        if not server_binary():
+            raise GarageError(NO_SERVER)
         fail = _failure(role, info)
         if fail:
             raise GarageError(f"{info['label']} failed to load earlier: "
                               f"{fail['error']}")
         _make_room(role, cfg, notify)
+        for hook in list(BEFORE_START):
+            try:
+                hook(role, cfg, notify)
+            except Exception:
+                pass                    # a courtesy, never a blocker
         if notify:
             notify(f"loading the {role} giant ({info['label']}) — the first "
                    "load can take several minutes")
@@ -600,6 +641,14 @@ def load(role, cfg, notify=None, retry=False):
     if retry:
         _file(f"{role}.failed.json").unlink(missing_ok=True)
     return ensure(role, cfg, notify)
+
+
+def note_test(role, cfg, result):
+    """Keep the outcome of an end-to-end test of a giant (see the engine's
+    garage_test) for the Settings page."""
+    info = configured(cfg).get(role)
+    sig = model_set(info["path"])["sig"] if info else ""
+    _write(f"{role}.test.json", dict(result, at=time.time(), sig=sig))
 
 
 def stop_all():
