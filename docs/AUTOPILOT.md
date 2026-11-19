@@ -16,50 +16,89 @@ its own workspace (`active-projects/<slug>/`, or wherever
 ## The loop
 
 ```
-assess → plan → [ execute → verify → record ]* → reflect → plan → …
-                                    goal met → audit → review & refine → improve → …
+assess → map the road → plan → [ execute → verify → record ]* → reflect → plan → …
+                                              goal met → audit → review & refine → improve → …
 ```
 
 1. **Assess.** Before planning anything she takes stock and writes
    `ASSESSMENT.md`: what needs to be done, which of the agents, skills,
    models and tools on hand cover which part, what they *cannot* do, and
    the order of attack.
-2. **Plan.** A batch of 3–8 tasks. Each names its **agent** (the standing
-   team, or a library specialist that fits this project), the **skills**
-   it should load, the **model** it needs (a tier, a specific installed
-   model, or one of your [giants](MODEL-GARAGE.md) by its role — fast for
-   simple drafting, a giant only when the work is worth an hour's wait),
-   the files it must read, what it depends on, *why* it exists, and an
-   observable `done_when`. A task that turns on something only you can
-   decide is marked as **yours** — see [When a decision is
+2. **Map the road.** Before the first batch she lays out the *whole* way
+   from where the project is to its goal, as milestones — see [The road
+   to the goal](#the-road-to-the-goal). Every plan after that is drawn
+   against it.
+3. **Plan.** A batch of 3–8 tasks towards the earliest milestones that
+   can be worked on. Each names the **milestone** it serves, its
+   **agent** (the standing team, or a library specialist that fits this
+   project), the **skills** it should load, the **model** it needs (a
+   tier, a specific installed model, or one of your
+   [giants](MODEL-GARAGE.md) by its role), whether it is **hard** — the
+   few tasks an everyday model is likely to get wrong, which go to a
+   giant — the files it must read, what it depends on, *why* it exists,
+   and an observable `done_when`. A task that turns on something only you
+   can decide is marked as **yours** — see [When a decision is
    yours](#when-a-decision-is-yours).
-3. **Execute.** One task at a time, in dependency order. The agent sees
+4. **Execute.** One task at a time, in dependency order. The agent sees
    the goal, the project memory, the files it asked for and its
    dependencies' output, and answers with whole files in `file:` blocks.
    Tasks marked *research* get live web material with sources attached.
-4. **Verify.** Three things, in this order. Mechanically — does the
+5. **Verify.** Three things, in this order. Mechanically — does the
    Python, JSON, shell or JavaScript even parse? Then **the project's own
    tests, run in a sandbox** ([below](#she-runs-the-tests)): a change that
    turns passing tests into failing ones goes no further. Then a judge
    reads the work against the task's own `done_when`, with the test result
    in front of it. A rejected attempt is **rolled back** and retried with
-   the critique — for broken tests, the failing output itself; after three
-   attempts the task is marked failed and the planner routes around it.
+   the critique — for broken tests, the failing output itself. A task
+   sent back twice on an everyday model gets its last attempt on the
+   giant that fits the work, if you have one; after three attempts the
+   task is marked failed and the planner routes around it.
    So every change left in the project passed verification.
-5. **Record.** A structured entry in `changes.jsonl`, a readable one in
+6. **Record.** A structured entry in `changes.jsonl`, a readable one in
    `CHANGELOG.md`, and — when the project is its own git repository — a
    commit on the `aria/autopilot` branch.
-6. **Reflect.** When a batch has nothing left to run, `MEMORY.md` is
+7. **Reflect.** When a batch has nothing left to run, `MEMORY.md` is
    rewritten: the state of the project, decisions made, lessons, what is
    still to do. The next plan starts from that, not from a transcript that
    grows without end.
-7. **Repeat.** When the planner says the goal is met, an **audit** checks
+8. **Repeat.** When the planner says the goal is met, an **audit** checks
    that claim against the requirements; any gaps become the next batch.
-8. **Review and refine.** With the goal met and audited she reads the
+9. **Review and refine.** With the goal met and audited she reads the
    whole codebase and refines it without changing what it does
    ([below](#review-and-refine)). Then she moves on to improvements and
    keeps going until you stop her (set `autopilot_after_goal: stop` to
    have her write the report and stand down instead).
+
+## The road to the goal
+
+A batch is three to eight tasks; a real project is many batches. So that
+each batch is a step on a known road rather than the next thing that came
+to mind, she first writes the road down: `ROADMAP.md` (and
+`roadmap.json`), four to twelve **milestones** from where the project is
+now to the goal itself.
+
+A milestone is an outcome, not an activity — "receipts parse into
+structured items", not "work on the parser" — and carries what must exist
+for it to count as reached, which earlier milestones it cannot start
+without, and roughly how many tasks it will take.
+
+- **Every plan is drawn against it.** The planner is shown the whole road
+  with what is reached, in hand and ahead, plans the work of the earliest
+  milestones whose dependencies are met, and says which milestones its
+  results have now reached. Every task belongs to one.
+- **Every task is told where it fits**: which milestone it serves, what
+  that milestone means, and what comes after it — so the agent writing
+  one file knows what the file is for.
+- **It is redrawn when the ground moves.** Your steering, or an audit
+  that finds gaps, has her draw the road again from where things stand.
+  A milestone that survives keeps its number, so the history on the
+  Gantt still lines up.
+- **You can see it and ask about it.** On the Gantt it is the band above
+  the tasks; in chat or by voice, "how far along is *project*" and
+  "what's left on *project*" are answered straight from it.
+
+The final report lists the road — what is reached, in hand and still
+ahead — and `STATUS.md` carries the count.
 
 ## Watching it
 
@@ -68,15 +107,23 @@ The **Projects** page:
 - **Board** — To Do · Planning · In Progress · Reviewing · Done. Each card
   shows its agent, model and skills, and how long it took. Finished work
   beyond the newest forty folds away — "Show earlier" brings it back.
-- **Gantt** — everything the project has ever planned, in measured time.
-  A finished bar is as long as the task really took; work not done yet is
-  predicted from the pace measured in *this* project (per model, once
-  there is enough to go on) — not from the planner's guess. Dependencies
-  are arrows; older batches fold into one line each and open on a click.
+- **Gantt** — the newest work at the top, in measured time. A finished
+  bar is as long as the task really took; work not done yet is predicted
+  from the pace measured in *this* project (per model, once there is
+  enough to go on) — not from the planner's guess. Dependencies are
+  arrows; older batches fold into one line each and open on a click.
+  Above the tasks, **the road ahead**: the milestones not yet reached,
+  with an arrow from each one it waits for; click one for what "reached"
+  means, what it unlocks, and its tasks. **Current run only** hides the
+  earlier runs; **Road ahead** hides the milestones.
 - **Live** — what she is doing right now, streamed as she thinks, beside
-  the activity log.
+  the activity log. The arrows beside **Right now** step back through
+  her earlier outputs, each in full with what it was for, when it
+  finished and how long it took.
 - **Files** — the project's folder: every file, with the task that last
-  changed it; open the folder, your editor, or a terminal there.
+  changed it. **Changes** shows each verified change to the open file as
+  the previous version beside the modified one. Open the folder, your
+  editor, or a terminal there.
 - **Run** — start the software yourself, and run its tests the way she
   does.
 - **Brief** — her assessment, her memory, her code review, your guidance,
@@ -89,8 +136,10 @@ Wherever she names a file — a report, a change, her memory, a chat reply
 — it is a link: one click shows it, another opens it in your editor.
 
 The sidebar shows what she is working on from every page, and you can ask
-from anywhere: "what are you working on", "status of *project*", "what
-changed in *project*".
+from anywhere: "what are you working on", "status of *project*", "how
+far along is *project*", "what needs me", "what changed in *project*".
+Those are answered from her records, not by a model, so they come back
+at once however busy the models are.
 
 ## Steering without stopping
 
@@ -258,8 +307,9 @@ memory.
 | The model server is down or drops the connection | Waits and retries with a growing pause (30 s up to 15 min). The task is not counted as failed and nothing is lost. |
 | A model stays silent | Fast and smart tiers are abandoned after `autopilot_idle_minutes` and retried. The deep tier and hand-picked models are never cut off. |
 | Work is rejected | Rolled back, retried with the reviewer's critique; failed after three attempts. Tasks that depended on it are skipped and the planner is told why. |
+| Work is rejected twice on an everyday model | The last attempt goes to the giant that fits the work (unless `giants_use: never`, or you have none). The card says why it moved. |
 | A change breaks tests that passed | Rejected like any other, with the failing test output as the critique. |
-| A giant model is still downloading, or fails to load | The task runs on the smart tier instead and says so; the giant joins in once its files are complete. |
+| A giant model is still downloading, or fails to load | The task runs on the smart tier instead and says so; the giant joins in once its files are complete. New tasks go to the next giant that fits — with no coder giant set up, hard coding work goes to the general one. |
 | `autopilot_stall_limit` batches in a row (3 unless you change it) complete nothing, or the planner keeps returning nothing | She pauses herself ("stalled"), writes the report and says why. |
 | The planner proposes work that is already done, that you declined, or that has failed twice | It is left out of the plan, and the log says so. |
 | The server restarts mid-task | The task is picked up again on the next step. |
@@ -303,6 +353,7 @@ Under `<project>/autopilot/` (`.aria/` for an adopted codebase):
 | File | What it is |
 |---|---|
 | `ASSESSMENT.md` | the stock-take written before the first plan |
+| `ROADMAP.md`, `roadmap.json` | the road to the goal: the milestones, what each waits for, which are reached |
 | `plan.json` | the live task plan — the Board and the Gantt are drawn from it |
 | `plan-archive.jsonl` | finished tasks that have left the board (still on the Gantt and under "Show earlier") |
 | `MEMORY.md` | the working memory, rewritten after every batch (a project first run under the earlier autopilot has `lessons.md`; it is folded in at the first rewrite) |
@@ -311,6 +362,8 @@ Under `<project>/autopilot/` (`.aria/` for an adopted codebase):
 | `changes.jsonl` | the complete, structured change record |
 | `CHANGELOG.md` | the same, readable |
 | `task-<id>.md` | every attempt at every task, with its verdict |
+| `versions/<task>/…` | each file as it was before a verified change — what the Files tab compares against (kept on this machine; git ignores it) |
+| `live/` | her last forty finished outputs in full, for the Live tab's arrows (also kept out of git) |
 | `REVIEW.md`, `reviews/` | the latest code review, and every earlier one |
 | `FINAL-REPORT.md`, `reports/` | the latest report, and every earlier one |
 | `run.json`, `run.log` | your own run commands for the project; the output of the last program you started |
@@ -338,10 +391,12 @@ never blocks triage, chat or missions; it shares only the hardware.
 - **Skills and specialists** come from `aria install-skills`. For each
   project the planner is offered only the ones that fit its goal.
 - **Giants** ([MODEL-GARAGE.md](MODEL-GARAGE.md)): with `giants_use: auto`
-  the planner decides which tasks deserve one; `always` sends every
+  a giant gets the tasks the planner marks as hard, and the last attempt
+  at anything an everyday model failed twice; `always` sends every
   coding task to the coder, research to the researcher and the rest to
   the general model — strongest, and slowest by far. Planning, review and
-  memory stay on your everyday tiers either way.
+  memory stay on your everyday tiers either way. `bin/aria models test
+  <role>` proves a giant loads before you rely on it.
 
 ## Honest limits
 

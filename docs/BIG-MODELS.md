@@ -39,7 +39,14 @@ swaps the giants herself —
 bin/aria models scan
 ```
 
-— see **[MODEL-GARAGE.md](MODEL-GARAGE.md)**. Either way the preset keeps
+```bash
+bin/aria models test general
+```
+
+— the second loads the giant you gave that role, asks it one question and
+times both, so you know it really runs on this machine before a night's
+work depends on it. See **[MODEL-GARAGE.md](MODEL-GARAGE.md)**. Either
+way the preset keeps
 **mmap on** (that's the disk streaming), puts every expert on CPU
 (`--n-cpu-moe 999`), attention on the GPU, and shrinks/quantizes the KV
 cache to protect your 62GB of RAM.
@@ -94,3 +101,8 @@ which is exactly what A.R.I.A.'s tier system is for:
   exact box — expect to tune `--ctx-size` and watch `free -h` on first
   runs. If the system swaps hard (not just mmap reads), drop to a smaller
   quant.
+- A giant and an everyday Ollama model do not fit in 16GB of VRAM
+  together, so A.R.I.A. asks Ollama to unload before a giant loads
+  (`giants_free_memory`). The price is that the next plan or review
+  waits for the everyday model to load again — seconds, next to the
+  giant's minutes.

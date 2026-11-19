@@ -113,18 +113,52 @@ microphone is granted to her own page only.
 ### Giant models
 
 Larger-than-RAM models get a role — `general`, `research`, `coder` —
-and she starts the right `llama-server` when a task needs it, unloading
-the others first. One that is still downloading is skipped; one that
-fails to load is reported and stepped around. She only ever starts and
-stops servers she started herself. See
+and she starts the right `llama-server` when a task needs it: the tasks
+the planner marks as hard, and the last attempt at anything an everyday
+model had sent back twice. The other giants are unloaded first and
+Ollama is asked to free its memory. One that is still downloading is
+skipped; one that fails to load is reported and stepped around; with no
+`llama-server` installed she says the giants cannot start instead of
+calling them ready. `bin/aria models test <role>` proves one end to end.
+She only ever starts and stops servers she started herself. See
 **[MODEL-GARAGE.md](MODEL-GARAGE.md)**.
 
 ### Voice
 
-The app's microphone works everywhere (Chrome's built-in recognition, or
-local whisper elsewhere — including her own desktop window). For Echo devices see **[ALEXA.md](ALEXA.md)**:
-a skill, a small Lambda, and `aria voice-gateway` — the one
-authenticated route a tunnel is ever pointed at.
+`bin/aria voice install` gives her a voice and ears that run on this
+machine: [Piper](https://github.com/OHF-Voice/piper1-gpl) speaks,
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) listens. Both
+go into a private Python environment under `vendor/voice/` — nothing is
+installed system-wide, and removing that folder removes all of it. They
+run in one helper process that keeps the models loaded, so a sentence is
+spoken in a fraction of a second and a clip is transcribed in about the
+time it took to say. The page records the microphone, sends the clip to
+her own server on 127.0.0.1 and plays what comes back; **nothing you say
+leaves the machine**. (The install itself downloads the packages from
+PyPI and the voice and recognition models from Hugging Face.)
+
+What speaks and listens, in order of preference (`voice_engine`,
+`voice_input`: `auto`, `local` or `browser`):
+
+| | Speaking | Listening |
+|---|---|---|
+| after `aria voice install` | Piper — a natural voice; `voice_name` picks which, `voice_speed` how fast | faster-whisper; `stt_model` picks the size (`base` is quick, `small` hears better) |
+| with only `espeak-ng` installed | a plain, robotic voice | — |
+| Chrome or Edge, nothing installed | the browser's own voices | the browser's own recognition (Google's or Microsoft's servers) |
+| her desktop window, nothing installed | — | — |
+
+The last row is why voice "stopped working" when A.R.I.A. moved into a
+window of her own: a browser's speech comes from a service behind the
+browser, and that window has none.
+
+Piper is GPL-3.0 software. A.R.I.A. does not include it: `aria voice
+install` fetches it from PyPI onto your machine and talks to it as a
+separate process.
+
+For Echo devices see **[ALEXA.md](ALEXA.md)**: a skill whose endpoint is
+`aria voice-gateway` — the one authenticated route a tunnel is ever
+pointed at. `bin/aria alexa` walks through the setup and says what is
+left.
 
 ## Wired in
 
@@ -154,7 +188,8 @@ authenticated route a tunnel is ever pointed at.
   for reaching A.R.I.A. from your phone. She binds 127.0.0.1 **on
   purpose** and has no auth layer, so never expose her with a public
   tunnel; use a private overlay (Tailscale/WireGuard class) and keep the
-  LAN boundary.
+  LAN boundary. The one thing a public tunnel may point at is the voice
+  gateway on port 8701, which is built for it ([ALEXA.md](ALEXA.md)).
 - **[build-your-own-x](https://github.com/codecrafters-io/build-your-own-x)** —
   reference lead for the researcher agent: when a captured idea is
   "build my own …", the matching tutorial belongs in research.md.
