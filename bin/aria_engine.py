@@ -454,6 +454,8 @@ def chat_messages(target, messages, force_json=False, on_token=None,
         except aria_garage.GarageError as exc:
             _garage_note(f"{exc} — using the smart tier instead")
             target = resolve_tier("smart", cfg)
+    if not target.get("giant") and target.get("kind", "ollama") == "ollama":
+        _free_for_everyday(target)
     return _chat_call(target, messages, force_json, on_token, timeout,
                       deadline)
 
@@ -464,11 +466,11 @@ GARAGE_LISTENERS = []           # callables that want giant load notices
 # ---- two model servers, one machine --------------------------------------
 #
 # Ollama serves the everyday tiers and llama.cpp the giants; they share one
-# GPU and one pool of RAM without knowing of each other. Two courtesies
-# keep them out of each other's way: before a giant loads, Ollama is asked
-# to let go of what it holds (it loads again by itself when next used); and
-# a chat message does not make Ollama throw out the model autopilot is in
-# the middle of using.
+# GPU and one pool of RAM without knowing of each other. So they take
+# turns: before a giant loads, Ollama is asked to let go of what it holds;
+# before an everyday model is used, a giant that has finished its answer is
+# unloaded. And a chat message does not make Ollama throw out the model
+# autopilot is in the middle of using.
 
 def ollama_loaded(cfg=None):
     """The models Ollama has in memory right now ([] when it cannot say)."""
@@ -513,6 +515,31 @@ def _free_for_giant(role, cfg, notify):
 
 
 aria_garage.BEFORE_START.append(_free_for_giant)
+
+
+def _free_for_everyday(target, cfg=None):
+    """The other half of taking turns: before an everyday Ollama model is
+    used, a giant that has finished its work is unloaded. Left loaded it
+    holds most of the graphics card and much of the RAM, and Ollama then
+    either refuses the everyday model or squeezes it onto the CPU, where
+    it crawls. A giant in the middle of an answer is never touched. The
+    Ollama models that were loaded beside it are let go as well, so they
+    load again with the whole card instead of the corner they were given.
+    The giant loads again when the next hard task needs it."""
+    cfg = cfg or config()
+    if not cfg.get("giants_free_memory", True) \
+            or not aria_garage.loaded_roles(cfg):
+        return []
+    freed = aria_garage.stop_idle()
+    if freed:
+        squeezed = ollama_release(cfg)
+        _garage_note(
+            f"unloaded the {' and '.join(freed)} giant so "
+            f"{target.get('model', 'the everyday model')} gets the memory"
+            + (f" (and let Ollama reload {', '.join(squeezed)} with it)"
+               if squeezed else "")
+            + " — the giant loads again when a hard task needs it")
+    return freed
 
 
 def _in_memory(model, loaded):

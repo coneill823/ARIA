@@ -1034,7 +1034,21 @@ def main():
             assert any("its last attempt goes to the general giant" in ln
                        for ln in logs)
             # before the giant loaded, Ollama was asked to make room
-            assert released == ["qwen3:30b"], released
+            assert released and released[0] == "qwen3:30b", released
+            # …and the other way round: once the giant had finished, the
+            # everyday model's next call unloaded it, and the activity log
+            # says so — a giant left loaded starves the everyday model
+            assert any("unloaded the general giant so" in ln for ln in logs), \
+                "a finished giant was never unloaded for the everyday model"
+            assert not garage.loaded_roles(eng.config()), \
+                "the giant was still loaded after the run"
+            # a giant in the middle of an answer is never unloaded for one
+            cfg = eng.config()
+            with garage.serving("general", cfg):
+                freed = eng._free_for_everyday({"model": "qwen3:30b"}, cfg)
+                assert freed == [] and "general" in garage.loaded_roles(cfg)
+            assert eng._free_for_everyday({"model": "qwen3:30b"},
+                                          cfg) == ["general"]
             # with "only where I name them", none is chosen
             set_config(sandbox, giants_use="never")
             plain = [{"id": "x", "title": "Write tests", "detail": "",
@@ -1050,7 +1064,8 @@ def main():
         return ("a task marked hard and a task sent back twice both went to "
                 "a giant (general standing in for the missing coder), each "
                 "saying why; ordinary tasks stayed on the everyday models; "
-                "Ollama made room first")
+                "they took turns — Ollama made room for the giant, and the "
+                "finished giant made room for Ollama, never mid-answer")
     check("giant models — chosen when the work calls for it", c_giants_used)
 
     def c_chat_wait():

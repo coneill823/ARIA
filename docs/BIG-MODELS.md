@@ -102,7 +102,7 @@ which is exactly what A.R.I.A.'s tier system is for:
   runs. If the system swaps hard (not just mmap reads), drop to a smaller
   quant.
 - A giant and an everyday Ollama model do not fit in 16GB of VRAM
-  together, so A.R.I.A. asks Ollama to unload before a giant loads
-  (`giants_free_memory`). The price is that the next plan or review
-  waits for the everyday model to load again — seconds, next to the
-  giant's minutes.
+  together, so they take turns (`giants_free_memory`): Ollama unloads
+  before a giant loads, and a giant that has finished its answer is
+  unloaded before the next everyday call. The price is a reload at each
+  hand-over — seconds for the everyday model, longer for the giant.

@@ -86,10 +86,16 @@ What then happens on its own:
 - **One at a time.** Before a giant loads, the least recently used one is
   unloaded — never in the middle of an answer. `giants_loaded: 2` allows
   two at once if your RAM takes it.
-- **Ollama makes room.** Before a giant loads, Ollama is asked to unload
-  whatever it is holding, so the giant gets the graphics memory and the
-  RAM; the everyday model loads again by itself when it is next needed.
-  `giants_free_memory: false` leaves Ollama's models where they are.
+- **They take turns with Ollama.** Before a giant loads, Ollama is asked
+  to unload whatever it is holding, so the giant gets the graphics memory
+  and the RAM. The other way round too: once the giant has finished its
+  answer, the next call to an everyday model (the verifier, the planner, a
+  chat) unloads it first, so qwen3:30b gets the whole card back instead of
+  being squeezed onto the CPU beside a giant that is doing nothing. A giant
+  in the middle of an answer is never unloaded. Each swap is written in
+  the project's activity log. The price is a reload when the next hard
+  task comes — seconds to minutes, since the weights stream from disk
+  anyway. `giants_free_memory: false` turns both directions off.
 - **Grouped.** Tasks that can run on the giant already loaded go before
   tasks that would need a swap.
 - **Still downloading?** A model with parts missing, or a part still being

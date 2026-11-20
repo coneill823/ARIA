@@ -244,7 +244,7 @@ function render() {
         'Giants answer at about 0.5–2 words a second: one task can take an hour. Planning and review stay on your fast tiers. A role with no model of its own is covered by the next best giant. Every task card shows which model it runs on, and why.'),
       text('giants_loaded', 'Loaded at once', 'How many giants may be in memory together. 1 is safest on 16 GB VRAM / 64 GB RAM.'),
       text('giants_idle_minutes', 'Unload when idle (minutes)', '0 = keep the last one loaded.'),
-      toggle('giants_free_memory', 'Free memory first', 'before a giant loads, ask Ollama to unload the everyday models so the giant gets the video memory — they load again when next needed')),
+      toggle('giants_free_memory', 'Take turns with Ollama', 'giants and everyday models share the memory in turn: Ollama unloads before a giant loads, and a giant that has finished its answer is unloaded before the next everyday call (never one mid-answer)')),
     section('Voice', 'How she speaks and listens. In her own window there is no browser speech service to borrow, so both happen on this machine.',
       voiceStatus(),
       voicePicker(),

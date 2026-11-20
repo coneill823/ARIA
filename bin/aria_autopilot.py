@@ -2913,6 +2913,22 @@ def refine(slug, via="app"):
 
 # ------------------------------------------------------------ the loop
 
+# Notices from the giant-model manager (loading, unloading, making room)
+# belong in the activity log of the project whose step caused them. A step
+# runs in one thread from start to end, so the thread says which project.
+_STEP = threading.local()
+
+
+def _garage_notice(text):
+    emit, slug = getattr(_STEP, "emit", None), getattr(_STEP, "slug", "")
+    if emit is not None:
+        emit({"event": "stage_done", "stage": "garage",
+              "log": f"{slug}: {text}"})
+
+
+eng.GARAGE_LISTENERS.append(_garage_notice)
+
+
 def tick(slug, emit):
     """Run ONE step for a project. Returns what happened: 'task',
     'assessed', 'mapped' (the roadmap was laid out), 'replanned',
@@ -2920,11 +2936,14 @@ def tick(slug, emit):
     'complete', 'waiting', 'busy' or 'idle'."""
     if _state(slug)["status"] != "running":
         return "idle"
+    _STEP.emit, _STEP.slug = emit, slug
     try:
         with _locked(slug):
             return _tick(slug, emit)
     except Busy:
         return "busy"
+    finally:
+        _STEP.emit = None
 
 
 def _tick(slug, emit):
@@ -2933,6 +2952,7 @@ def _tick(slug, emit):
         return "idle"
     auto = _auto(slug)
     emit = _emitter(slug, emit)
+    _STEP.emit = emit              # garage notices land in this log too
     if not eng.project_approved(slug):
         # e.g. a run begun under an older version that had no gate
         state.update(status="idle", phase="", current=None, waiting="")
