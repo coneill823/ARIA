@@ -45,6 +45,16 @@ start` does the start by hand; in the app, a sidebar that reads *model
 server offline — start it* is the button. To leave all of it alone:
 `aria settings set ollama_autostart false`.
 
+An `ollama serve` she starts gets the `OLLAMA_*` settings of her own
+environment — not the ones in your shell profile, which a service never
+sees. If the sidebar then says *model missing*, your models are probably
+somewhere your profile points to; give her the command with it spelled
+out, and she uses that instead:
+
+```bash
+bin/aria settings set ollama_command "env OLLAMA_MODELS=/path/to/models ollama serve"
+```
+
 ## 2. The giants — one role each, loaded when the work needs them
 
 Your largest models are bigger than RAM, so llama.cpp streams them from
