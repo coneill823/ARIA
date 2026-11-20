@@ -935,6 +935,11 @@ def _spawn_ollama(how, url, cfg):
                 "\"…\""), ""
     if not argv:
         return "the command to start the model server is empty", ""
+    try:                                # a log that does not grow for ever
+        if log.stat().st_size > 5_000_000:
+            log.replace(log.with_name(log.name + ".1"))
+    except OSError:
+        pass
     with open(log, "ab") as fh:
         _WAKE_PROCS.append(subprocess.Popen(
             argv, stdout=fh, stderr=subprocess.STDOUT,

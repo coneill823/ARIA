@@ -319,6 +319,7 @@ def main():
                                                       # their own
                                                       "pace.json",
                                                       "pace.lock",
+                                                      "ollama.log*",
                                                       "config.backup-*"))
     os.makedirs(os.path.join(sandbox, "docs"))      # her window's icon
     shutil.copy2(os.path.join(REAL_ROOT, "docs", "aria-icon.svg"),

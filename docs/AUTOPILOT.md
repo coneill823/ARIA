@@ -109,8 +109,9 @@ The **Projects** page:
   beyond the newest forty folds away — "Show earlier" brings it back.
 - **Gantt** — the newest work at the top, in measured time. A finished
   bar is as long as the task really took; work not done yet is predicted
-  from the pace measured in *this* project (per model, once there is
-  enough to go on) — not from the planner's guess. Dependencies are
+  from what this machine has measured — not from the planner's guess
+  ([how](#how-long-will-it-take)). The line above the chart gives the
+  estimate, the slow case, and what both rest on. Dependencies are
   arrows; older batches fold into one line each and open on a click.
   Above the tasks, **the road ahead**: the milestones not yet reached,
   with an arrow from each one it waits for; click one for what "reached"
@@ -128,6 +129,9 @@ The **Projects** page:
   does.
 - **Brief** — her assessment, her memory, her code review, your guidance,
   and the source documents.
+- **Business** — the business plan beside who does what: your part (only
+  you tick it), her part, and what a complete proposal still needs
+  ([below](#your-part-of-the-work)).
 - **Changes** — every completed task: the files it touched, why it was
   done, how it was verified, what the tests said, and what it drew on.
 - **Report** — every run's final report, newest first.
@@ -140,6 +144,50 @@ from anywhere: "what are you working on", "status of *project*", "how
 far along is *project*", "what needs me", "what changed in *project*".
 Those are answered from her records, not by a model, so they come back
 at once however busy the models are.
+
+## How long will it take
+
+A planner asked for hours guesses at a person's effort on an ideal
+system, and looks only at the work itself — which is how plans come out
+short everywhere, not only here. So her estimates do not come from the
+plan. They come from **what this machine has actually done**, kept in
+`system/pace.json`:
+
+- **Every finished task**, with all its attempts and its verification:
+  how long, on which model, by which agent, and whether it passed.
+- **Everything that is not a task** — the assessment, the roadmap, each
+  plan, the memory rewrite, the audits and reviews. That time is in no
+  task and is spent all the same; it is shared out per task.
+- **How many tasks a milestone really took**, against the number the
+  planner gave it, each time one is reached.
+- **How often work is sent back** and has to be planned again.
+
+From those, a task that has not run yet is expected to take what similar
+tasks took: this project's own on the same model once there are three;
+before that, everything this machine has measured on that model; before
+that, on the same kind of model — a giant is never estimated from an
+everyday model. Only on a machine with no record at all is it a first
+guess, and it says so: seven minutes for an everyday model, an hour for
+a giant, deliberately not optimistic. It corrects itself as tasks
+finish.
+
+The road ahead is counted the same way: the tasks a milestone was given,
+times how far such counts have run over before, times the share that
+gets redone — plus the planning around each. What you see is two
+figures: the **typical** case and an **ordinary bad day** (the time four
+tasks in five come in under), with what they rest on — "from this
+project's own 14 finished tasks", "from 212 tasks measured on this
+machine", or "a first guess".
+
+It shows above the Gantt, beside each milestone ahead, and in the answer
+to "how far along is *project*" — in chat, by voice, or
+`aria autopilot <slug> status`.
+
+Two things it is not. It is **working time**: hours spent waiting for
+your decision, or for a model server that was away, are not in it — and
+it does not know when the machine will be on. And it is an estimate of a
+road that gets redrawn: steer her, or let an audit find gaps, and the
+figure moves with the road.
 
 ## Steering without stopping
 
@@ -280,6 +328,36 @@ in the final report. A voice assistant cannot give it for you. If you
 named a `mission-done` webhook she calls it when a task starts waiting
 on you and again when she has run out of other work.
 
+## Your part of the work
+
+A task that *needs you* is a decision. Some work is yours in a different
+way: nobody but a person can do it at all — talk to five people who have
+the problem, choose the name, open the account, register, sign. When she
+writes a project's business plan she splits what is left into two lists
+(`docs/action-list.md`):
+
+- **Her part** — what can be researched, drafted, calculated or built.
+  On approval it joins `requirements.md`, and autopilot does it like any
+  other requirement; the documents it produces go under `business/`.
+- **Your part** — each item with why it is yours and what she can
+  prepare so that it is short: the interview questions, the shortlist of
+  names with the free domains, what each legal form would mean.
+
+Your list is in the **Business** tab, in "what's on my list" (chat or
+voice) and in `aria mylist`; "what needs me" counts it. Tick an item when
+you have done it — in the tab, with "done y2 in *project*", or:
+
+```bash
+aria done <slug> y2
+```
+
+She never ticks one, never moves one to her own list to get it done,
+and never plans a task that does it for you: the planner is told the
+list is yours, and the files that hold it are among those no task may
+write. `aria business <slug>` (or **Write it again**) redrafts the plan
+and both lists and keeps your ticks. What the business plan asks, and
+why: [PROJECT-GROUNDWORK.md](PROJECT-GROUNDWORK.md).
+
 ## Stopping, and the report
 
 "stop working on *project*", **■ Stop**, or `aria autopilot <slug> stop`:
@@ -372,6 +450,11 @@ Under `<project>/autopilot/` (`.aria/` for an adopted codebase):
 | `run.json`, `run.log` | your own run commands for the project; the output of the last program you started |
 | `state.json`, `activity.jsonl` | where she is, and the Live tab's feed (older entries move to `activity-archive.jsonl`) |
 
+Beside it, in the project's `docs/`: `business-plan.md`,
+`action-list.md` and `actions.json` (the same list as data — your ticks
+live there). Machine-wide, in `system/`: `pace.json`, the measured times
+every project's estimates are made from. It never leaves this machine.
+
 ## Where it runs
 
 Inside the always-on server (`aria.service`), beside the mission worker —
@@ -399,6 +482,14 @@ never blocks triage, chat or missions; it shares only the hardware.
   are left alone. `always` leaves every model to itself; `never` asks
   for the answer alone everywhere. Her reasoning shows in the Live tab,
   marked off from her answer.
+- **The model server is hers to start.** She starts Ollama when she
+  starts, and again whenever a step finds it away (at most once a
+  minute); the quick model is loaded at start, and the fast and smart
+  models are kept in memory for `ollama_keep_alive` (default 30m) after
+  each use, so the next task does not wait for a reload. A deep-tier
+  model is left on Ollama's own five minutes, and a giant that needs
+  the memory still gets all of it. Settings → Models, or
+  `aria settings set ollama_keep_alive 2h`.
 - **Budgets and the stall limit** (Settings → Autopilot) bound a run you
   leave for days: hours, batches, tasks, and how many batches may
   complete nothing before she pauses herself. All off or lenient by
@@ -434,6 +525,14 @@ never blocks triage, chat or missions; it shares only the hardware.
   runs.
 - Web research reads search results and a couple of pages per task. It
   cites what it used; it is not a deep-research system.
+- Estimates are only as good as the record behind them. On a fresh
+  machine they are a stated first guess; they become this machine's own
+  after a handful of tasks, and a project unlike anything measured
+  before will still surprise them.
+- A business plan drafted by a local model is a list of leads, not
+  findings: its figures are estimates to check, what it says about law
+  and tax is a list of things to ask, and none of it is advice. It says
+  where each claim came from — read that part.
 - What counts as *yours to decide* is the planner's judgment. A weak
   model may ask too often or not at all — steer it: "decide naming
   yourself", "ask me before anything that costs money".

@@ -322,6 +322,9 @@ def cmd_autopilot(args):
               + (f" ({done['note']})" if done["note"] else ""))
     else:
         print(eng.project_status_text(slug))
+        if eng._autopilot().progress(slug)["total"]:
+            # the road, and how long is left of it in measured time
+            print(eng.project_progress_text(slug))
         state = eng._auto_state(slug)
         state.pop("run_started", None)
         print(json.dumps(state, indent=2))

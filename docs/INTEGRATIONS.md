@@ -110,6 +110,18 @@ WebKitGTK when installed; a chromeless browser window otherwise). In
 that window, links to anywhere else open in your browser and the
 microphone is granted to her own page only.
 
+### The model server
+
+She starts Ollama herself — when she starts, and whenever a call finds
+it away — the way it is run on this machine: its own service where it
+has one, `ollama serve` otherwise. Then she loads the quick-tier model
+and asks for the everyday models to stay in memory between uses. She
+never asks for a password: a system service that takes an administrator
+is reported, with the one command that makes it start with the computer.
+The only server she ever stops is an `ollama serve` she started herself
+(`aria-ollama`), and only when you uninstall her services. See
+**[MODEL-GARAGE.md](MODEL-GARAGE.md)**.
+
 ### Giant models
 
 Larger-than-RAM models get a role — `general`, `research`, `coder` —

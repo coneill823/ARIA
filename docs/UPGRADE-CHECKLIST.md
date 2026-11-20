@@ -18,10 +18,16 @@ tell you what success looks like before moving on.
       means the code on disk is newer than the running server
 - [ ] `bin/aria test --mock` → every check PASS or SKIP, in seconds
 - [ ] `bin/aria test` → the same against your models. If the only FAIL is
-      `backends reachable`, Ollama is not running:
-      `sudo systemctl enable --now ollama`
+      `backends reachable`, Ollama is not running: `bin/aria models start`
 - [ ] `bin/aria doctor` → one line per thing that is switched on, missing
-      or optional
+      or optional — among them how Ollama is run on this machine. She
+      starts it herself from now on; if the line says it is a **system
+      service that does not start with the computer**, run the command
+      it gives, once: `sudo systemctl enable --now ollama`
+- [ ] ⚙ Settings → Pipeline → **Where you are based** → the business
+      plan she writes with every plan names your country's rules
+      instead of a list of things to check. For a project that was
+      planned before this: `bin/aria business <slug>`
 
 ## Stage 0.5 — the three small installs that unlock the most
 - [ ] `sudo pacman -S bubblewrap` → she runs each project's tests in a

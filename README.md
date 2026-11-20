@@ -27,17 +27,20 @@ hardware and models (chat, voice, a task board, autopilot), and inside
       │                                        │     idea.md            │
       │ not a project                          │     research.md        │
       ▼                                        │     proposed-plan.md   │
- knowledge/                                    └────────────────────────┘
-   notes/          random ideas & reference               │
-   lists/          grocery items, todos          ★ HUMAN IN THE LOOP ★
-   content-ideas/  "funny TikTok" material         you read the plan
-   someday/        not now, maybe later                   │ approve
+ knowledge/                                    │     business-plan.md   │
+   notes/          random ideas & reference    │     action-list.md     │
+   lists/          grocery items, todos        └────────────────────────┘
+   content-ideas/  "funny TikTok" material                │
+   someday/        not now, maybe later          ★ HUMAN IN THE LOOP ★
+                                                   you read the plan
+                                                          │ approve
                                                           ▼
                                                requirements.md (approved)
                                                           │ promote
                                                           ▼
                                               active-projects/<slug>/
-                                                docs/        ← idea, research, plan, requirements
+                                                docs/        ← idea, research, plan, business plan,
+                                                               who does what, requirements
                                                 autopilot/   ← her plan, memory, changes, report
                                                 STATUS.md, CLAUDE.md, your project's files
 ```
@@ -45,6 +48,16 @@ hardware and models (chat, voice, a task board, autopilot), and inside
 **The only human touchpoint** is the approval. Nothing gets promoted or
 executed without an approved `requirements.md` — and after it, nothing
 needs you until you choose to stop her.
+
+Beside the plan she writes the **business groundwork**: a business plan
+(every figure sourced, or marked as an estimate with its arithmetic
+shown), the list of what a complete proposal still needs, and the
+remaining work split in two — **her part**, which joins the requirements
+when you approve, and **your part**: what only a person can do, like
+talking to customers, choosing a name, registering, paying, signing. She
+prepares for those and reminds you of them; she never ticks one. The
+questions she asks, and where they come from:
+**[docs/PROJECT-GROUNDWORK.md](docs/PROJECT-GROUNDWORK.md)**.
 
 ## Quickstart
 
@@ -63,7 +76,9 @@ talk to her:
 | `work on <project>` | Autopilot: she takes stock, plans, and works task after task. |
 | `status of <project>` · `what are you working on` | Where things stand, in a sentence. |
 | `how far along is <project>` · `what's left on <project>` | The road to the goal: milestones reached, what is in hand, what is still ahead. Answered from her records, so it comes back at once even while every model is busy. |
-| `what needs me` | Plans awaiting your approval, tasks awaiting your decision, runs that paused themselves. |
+| `what needs me` | Plans awaiting your approval, tasks awaiting your decision, runs that paused themselves, what is on your own list. |
+| `business plan for <project>` | Writes (or rewrites) its business plan, what a complete proposal still needs, and who does what. |
+| `what's on my list` · `done y2 in <project>` | The work only you can do, across your projects — and ticking an item off when you have done it. |
 | `tell <project> to <guidance>` | Redirects her without stopping. |
 | `approve task t5 in <project>: <your decision>` · `skip task t5 in <project>` | Answers a task she marked as yours to decide. |
 | `refine <project>` | She reads the whole codebase, writes up what is worth changing, and refines it without changing what it does. |
@@ -102,6 +117,8 @@ any automation:
 bin/aria capture "app that turns my grocery receipts into a meal planner"
 bin/aria auto                        # triage + plan everything new
 bin/aria projects                    # every project, where it lives, what she is doing
+bin/aria business <slug>             # its business plan, what a proposal still needs, who does what
+bin/aria mylist [slug]               # your part: the work only you can do   (done <slug> y2 ticks one)
 bin/aria approve <slug>              # the human gate
 bin/aria autopilot <slug> start      # ...stop | status | steer "…" | run | refine
 bin/aria autopilot <slug> approve-task t5 "decision"   # ...or skip-task
@@ -110,6 +127,7 @@ bin/aria run <slug>                  # how it is started (add a number to start 
 bin/aria check <slug>                # run its tests the way she does: sandboxed
 bin/aria models scan                 # your giant models: one per role, loaded on demand
 bin/aria models test general         # prove a giant loads and answers, end to end
+bin/aria models start                # the model server up, the quick model loaded (she does this herself)
 bin/aria adopt <repo|folder> "goal"  # put an existing codebase under autopilot
 bin/aria search "query"              # web search      (fetch <url> reads a page)
 bin/aria brain "text"                # a note in your Obsidian vault
@@ -171,7 +189,9 @@ card. If your running A.R.I.A. has a giant loaded, the test says so at
 the top: free it first for a fair run (`bin/aria models unload`).
 
 If the only failure is **backends reachable**, the model server is not
-running: `sudo systemctl enable --now ollama` (or `ollama serve`).
+running: `bin/aria models start`. (Her app starts it by itself — see
+[Models](#models--fast-smart-and-deep-tiers); the self-test deliberately
+starts nothing on your machine.)
 
 ### Always-on mode
 
@@ -318,7 +338,9 @@ says where the project lives on your disk.
   it took. Older finished work folds away; "Show earlier" brings it back.
 - **Gantt** — the newest work at the top, in measured time: a finished
   bar is as long as the task took, and work not done yet is predicted
-  from the pace measured so far in this project. Dependencies are arrows;
+  from what this machine has measured — not from the planner's guess. The
+  line above the chart gives the estimate, what it becomes if things go
+  slowly, and what it rests on. Dependencies are arrows;
   older batches fold into one line each. Above the tasks is **the road
   ahead**: the milestones between here and the goal that she has not
   reached yet, each with an arrow from the ones it waits for — click one
@@ -357,6 +379,15 @@ says where the project lives on your disk.
 - **Brief** — the assessment she wrote before planning (what needs doing,
   what she can do with what she has, the gaps), her working memory, her
   code review, and your guidance.
+- **Business** — the business plan, beside who does what: **your part**
+  (tick an item when you have done it — only you can), **A.R.I.A.'s
+  part** (it joins the requirements when you approve, and autopilot does
+  it), and what a complete proposal needs, each item marked *there*,
+  *assumed* or *missing*. **Write it again** redrafts all three, keeping
+  your ticks.
+
+  ![Projects — business](docs/ui-business.png)
+
 - **Changes** — every completed task: files touched, why, how it was
   verified, what the tests said, references — and **see the change**
   beside each file, which opens that before-and-after.
@@ -383,7 +414,11 @@ model's output token by token, each decision with its confidence, and
 every file move — including runs you started from chat or by voice.
 
 Every card under Potential has **Review & approve** (opens the plan in
-Projects), **Refine**, and **→ Obsidian**.
+Projects), **Refine**, and **→ Obsidian**. With *Business plans* on (the
+default, Settings → Pipeline) every plan arrives with its business plan
+and who-does-what; set **Where you are based** there too, so that what
+she writes about registration, tax, licences and personal data names the
+rules of your country instead of a list of things to check.
 
 ![Refine a proposed project](docs/ui-refine.png)
 
@@ -412,8 +447,10 @@ page, from chat ("ask the critic to…"), or queue it as a background
 ### Settings
 
 Models — with a **Test** button beside each giant that loads it and
-asks it a question — her voice, the internet, the Obsidian brain, Git &
-GitHub and autopilot's behaviour, without touching YAML. What you save goes into
+asks it a question, and whether she starts the model server and keeps
+the everyday models loaded — her voice, the internet, the Obsidian
+brain, Git & GitHub, autopilot's behaviour, and the pipeline's business
+plans, without touching YAML. What you save goes into
 `system/config.local.yml` — your own file, which updates never touch;
 `system/config.yml` keeps the defaults and explains every key.
 
@@ -479,6 +516,31 @@ bin/aria llama install       # optional: llama.cpp Vulkan (fastest on AMD)
 MoE models keep attention on the GPU and park expert weights in system
 RAM (`--n-cpu-moe` — presets in `bin/aria-llama serve smart|deep`), which
 is what makes 30B fast and ~120B possible on this hardware.
+
+**You do not start Ollama; she does.** When her app starts — and whenever
+a call finds the model server away — she starts it the way it is run on
+your machine: its own service if it has one, `ollama serve` otherwise (in
+a unit of its own, `aria-ollama`, so it outlives her restarts). Then she
+loads the quick-tier model, so the first reply does not wait for it to be
+read from disk, and asks Ollama to keep the fast and smart models in
+memory for half an hour after each use instead of five minutes
+(Settings → Models: *Start the model server*, *Load the quick model at
+start*, *Keep models loaded for*). The sidebar shows it happening, and if
+the model server is ever offline, that line is the button that starts it.
+
+One case she cannot do for you: Ollama installed as a **system service**
+that is not enabled — starting it takes an administrator, and she never
+asks for a password. She says so, and `bin/aria doctor` gives the one
+command that settles it for good:
+
+```bash
+sudo systemctl enable --now ollama
+```
+
+(If you have always run `ollama serve` yourself, your models are in your
+own `~/.ollama` and she simply runs it for you — no command needed. A
+model server started in a way of its own, a container say, gets its
+command in Settings → Models → *Start command*.)
 
 **Giants — one role each.** Larger-than-RAM models (671B and 1T-class,
 streamed from NVMe at about a word a second) get a role: `general`,

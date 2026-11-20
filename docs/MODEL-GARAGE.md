@@ -17,6 +17,34 @@ ollama pull gpt-oss:120b   # the heavyweight that still fits RAM   (done)
 All three are available to every agent immediately, no serving needed:
 Ollama loads/unloads on demand (your drop-in allows 3 loaded at once).
 
+**Ollama itself is started by her.** When her app starts — and whenever
+a call finds the model server away — she starts it the way it is run on
+this machine, loads the quick-tier model, and asks for the fast and
+smart models to stay in memory for half an hour after each use
+(`ollama_keep_alive`; a deep-tier model is left on Ollama's own five
+minutes — one the size of your RAM should not linger). How she starts
+it is worked out, in this order:
+
+| What she finds | What she does |
+|---|---|
+| a *Start command* in Settings → Models (`ollama_command`) | runs it — for a container or anything else of your own |
+| an `ollama.service` among your own (user) units | `systemctl --user start ollama` |
+| the system's `ollama.service`, enabled or running — or no models of your own in `~/.ollama` | starts it if this machine lets you; otherwise says so, with the command below |
+| otherwise — you run `ollama serve` yourself, and the models are yours | runs `ollama serve` for you, as a unit of its own (`aria-ollama`), so it outlives her restarts. Its log: `journalctl --user -u aria-ollama -e` |
+
+The one thing she cannot do is start a system service that takes an
+administrator; she never asks for a password. Make it start with the
+computer, once:
+
+```bash
+sudo systemctl enable --now ollama
+```
+
+`bin/aria doctor` says which of these applies to you; `bin/aria models
+start` does the start by hand; in the app, a sidebar that reads *model
+server offline — start it* is the button. To leave all of it alone:
+`aria settings set ollama_autostart false`.
+
 ## 2. The giants — one role each, loaded when the work needs them
 
 Your largest models are bigger than RAM, so llama.cpp streams them from
