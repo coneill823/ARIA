@@ -29,6 +29,7 @@ Environment:
   MOCK_REPEAT    the second batch proposes the first batch's work again
   MOCK_HARD      the planner marks one first-batch task as "hard"
   MOCK_NO_ROADMAP  the planner cannot produce a roadmap (answers nonsense)
+  MOCK_NO_PLAN   the planner answers in prose where a plan was asked for
   MOCK_NO_REACHED  the planner never reports a milestone as reached
   MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
   MOCK_LOADED    comma-separated models Ollama "has in memory" (/api/ps)
@@ -36,6 +37,17 @@ Environment:
                  start, like llama-server loading a giant
   MOCK_REFINE_BREAKS  the first attempt at a refinement changes what the
                  code does (the project's tests must catch it)
+  MOCK_THINKING  behave like a reasoning model (qwen3, deepseek-r1): reason
+                 for this many tokens before every answer — streamed as
+                 `message.thinking` on Ollama's API and as
+                 `reasoning_content` on the OpenAI one — unless the request
+                 says "think": false. Then the window is real: prompt,
+                 reasoning and answer share num_ctx, and an answer that
+                 does not fit is cut off where the room ran out.
+  MOCK_WINDOW    the window of the OpenAI-side server (a stand-in giant),
+                 which takes no num_ctx from the request
+  MOCK_NO_THINK_SWITCH  answer a request that carries "think" with HTTP
+                 400, like a server too old to know the word
 """
 
 import json
@@ -54,7 +66,39 @@ STATE = {"plans": {}, "attempts": {}, "audits": {}, "calls": [],
 DELAY = float(os.environ.get("MOCK_DELAY", "0") or 0)
 BATCHES = int(os.environ.get("MOCK_BATCHES", "2") or 2)
 LOAD_SECONDS = float(os.environ.get("MOCK_LOAD_SECONDS", "0") or 0)
+THINKING = int(os.environ.get("MOCK_THINKING", "0") or 0)
+WINDOW = int(os.environ.get("MOCK_WINDOW", "0") or 0)
 STARTED = time.time()
+CHARS_PER_TOKEN = 3.5           # the mock's "tokenizer"
+MUSING = ("Let me think about what is being asked here, what already "
+          "exists, and what a good answer has to contain. ")
+
+
+def tokens(text):
+    return int(len(text) / CHARS_PER_TOKEN) + 1
+
+
+def fit(prompt_chars, text, window, limit, think):
+    """What a reasoning model with a real window makes of a request: how
+    much it reasons, how much of its answer fits, and how it ended.
+    Returns (reasoning, answer, done_reason, prompt_tokens, written)."""
+    read = int(prompt_chars / CHARS_PER_TOKEN) + 1
+    if not THINKING:
+        wrote = tokens(text)
+        if window:                      # an ordinary model: it simply fits
+            read = min(read, max(0, window - wrote - 1))
+        return "", text, "stop", read, wrote
+    room = max(0, window - read) if window else 10 ** 9
+    if limit:
+        room = min(room, int(limit))
+    mused = min(THINKING, room) if think else 0
+    reasoning = (MUSING * (mused * 4 // len(MUSING) + 1))[:mused * 4]
+    left = room - mused
+    want = tokens(text)
+    if want <= left:
+        return reasoning, text, "stop", read, mused + want
+    cut = text[:int(left * CHARS_PER_TOKEN)]
+    return reasoning, cut, "length", read, mused + left
 
 
 def _slug(text, default="project"):
@@ -503,6 +547,9 @@ def reply_for(system, prompt):
     if "Lay out the WHOLE road" in s:
         return json.dumps(roadmap(p))
     if "You are the project planner inside A.R.I.A." in s:
+        if os.environ.get("MOCK_NO_PLAN"):      # a planner that only talks
+            return ("I would start with the design, then the core module, "
+                    "and write the tests last.")
         return json.dumps(plan_batch(p))
     if "verification judge" in s:
         return json.dumps(verdict(p))
@@ -598,36 +645,63 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/chat" and not any(
                 model == n or n.startswith(model + ":") for n, _ in MODELS):
             return self._json({"error": f"model '{model}' not found"}, 404)
+        if "think" in body and os.environ.get("MOCK_NO_THINK_SWITCH"):
+            return self._json({"error": "json: unknown field \"think\""}, 400)
         text = reply_for(system, prompt)
+        options = body.get("options") or {}
+        ollama = self.path == "/api/chat"
+        reasoning, text, ended, read, wrote = fit(
+            sum(len(m.get("content") or "") for m in messages), text,
+            int(options.get("num_ctx") or 0) if ollama else WINDOW,
+            options.get("num_predict") if ollama else 0,
+            body.get("think") is not False)
         STATE["calls"].append({"model": model, "system": system[:80],
-                               "num_ctx": (body.get("options") or {})
-                               .get("num_ctx"), "chars": len(prompt)})
-        chunks = [text[i:i + 24] for i in range(0, len(text), 24)] or [""]
+                               "num_ctx": options.get("num_ctx"),
+                               "num_predict": options.get("num_predict"),
+                               "think": body.get("think", "unset"),
+                               "reasoned": len(reasoning), "ended": ended,
+                               "chars": len(prompt)})
+
+        def pieces(whole):
+            return [whole[i:i + 24] for i in range(0, len(whole), 24)]
+
         self.send_response(200)
         self.send_header("Connection", "close")
-        if self.path == "/api/chat":
+        if ollama:
             self.send_header("Content-Type", "application/x-ndjson")
             self.end_headers()
-            for c in chunks:
-                self.wfile.write(json.dumps(
-                    {"message": {"role": "assistant", "content": c},
-                     "done": False}).encode() + b"\n")
-                self.wfile.flush()
-                if DELAY:
-                    time.sleep(DELAY)
+            for kind, whole in (("thinking", reasoning), ("content", text)):
+                for c in pieces(whole) or ([""] if kind == "content" else []):
+                    self.wfile.write(json.dumps(
+                        {"message": {"role": "assistant", "content": "",
+                                     kind: c},
+                         "done": False}).encode() + b"\n")
+                    self.wfile.flush()
+                    if DELAY:
+                        time.sleep(DELAY)
             self.wfile.write(json.dumps(
                 {"message": {"role": "assistant", "content": ""},
-                 "done": True}).encode() + b"\n")
+                 "done": True, "done_reason": ended,
+                 "prompt_eval_count": read, "eval_count": wrote,
+                 # forty tokens a second, in nanoseconds
+                 "eval_duration": int(wrote / 40 * 1e9)}).encode() + b"\n")
         elif self.path == "/v1/chat/completions":
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            for c in chunks:
-                self.wfile.write(b"data: " + json.dumps(
-                    {"choices": [{"delta": {"content": c}}]}).encode()
-                    + b"\n\n")
-                self.wfile.flush()
-                if DELAY:
-                    time.sleep(DELAY)
+            for kind, whole in (("reasoning_content", reasoning),
+                                ("content", text)):
+                for c in pieces(whole) or ([""] if kind == "content" else []):
+                    self.wfile.write(b"data: " + json.dumps(
+                        {"choices": [{"delta": {kind: c}}]}).encode()
+                        + b"\n\n")
+                    self.wfile.flush()
+                    if DELAY:
+                        time.sleep(DELAY)
+            self.wfile.write(b"data: " + json.dumps(
+                {"choices": [{"delta": {}, "finish_reason": ended}],
+                 "timings": {"prompt_n": read, "predicted_n": wrote,
+                             "predicted_per_second": 1.5}}).encode()
+                + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
         self.close_connection = True
 

@@ -759,12 +759,13 @@ def cmd_update(args):
         return
     # the server that is running still has the old code in memory
     server = eng.server_running()
-    try:
-        managed = bool(server and server.get("managed")) or subprocess.run(
-            ["systemctl", "--user", "is-active", "--quiet",
-             "aria.service"]).returncode == 0
-    except OSError:
-        managed = bool(server and server.get("managed"))
+    # systemd restarts what it runs — this copy's server and nothing else:
+    # not a unit that belongs to another copy, and not a server someone
+    # started by hand while a unit happens to be installed
+    unit = eng.service_state()
+    managed = bool(unit["pid"]) and (
+        bool(server and server.get("managed"))
+        or (not server and unit["ours"]))
     if not server and not managed:
         print("\nA.R.I.A. picks the new version up the next time she starts "
               "(aria app, or aria ui)")
@@ -777,7 +778,7 @@ def cmd_update(args):
               + ("   (or: systemctl --user restart aria)" if managed else ""))
         return
     if managed:
-        subprocess.run(["systemctl", "--user", "restart", "aria.service"])
+        subprocess.run(["systemctl", "--user", "restart", eng.SERVICE])
     else:
         eng.server_restart(server)
     print("\nrestarted the server — she is running the new version"

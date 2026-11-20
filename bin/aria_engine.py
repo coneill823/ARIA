@@ -15,6 +15,7 @@ aria_brain (Obsidian), aria_git (git/GitHub) — and the autonomous project
 loop lives in aria_autopilot, which builds on everything here.
 """
 
+import collections
 import datetime
 import hashlib
 import json
@@ -199,6 +200,9 @@ def config():
         "backend_urls": {k: v.rstrip("/") for k, v in backends.items()},
         "backend_keys": block("backend_keys"),
         "context_tokens": int(number("context_tokens", 8192)),
+        # how a model that reasons before it answers (qwen3, deepseek-r1…)
+        # is used on the everyday tiers: see thinking_for()
+        "thinking": find("thinking", "auto").split(" #")[0].strip().lower(),
         "webhooks": block("webhooks"),
         "heartbeat_url": find("heartbeat_url", ""),
         "web_access": flag("web_access", "true"),
@@ -232,7 +236,7 @@ def config():
         "giants_use": find("giants_use", "auto").split(" #")[0].strip()
             .lower(),
         "giants_loaded": max(1, int(number("giants_loaded", 1))),
-        "giants_idle_minutes": number("giants_idle_minutes", 0),
+        "giants_idle_minutes": number("giants_idle_minutes", 20),
         "giants_port": int(number("giants_port", 8090)),
         "giants_ctx": int(number("giants_ctx", 8192)),
         "giants_free_memory": flag("giants_free_memory", "true"),
@@ -367,6 +371,49 @@ class GenerationTimeout(RuntimeError):
     """One generation ran past its wall-clock limit."""
 
 
+class ReplyCutOff(RuntimeError):
+    """The model ran out of room before it had finished: its window was
+    full of prompt, reasoning and answer, or it reached its output limit.
+    `reply` is what it had written, `thought` how many characters of
+    reasoning came before it."""
+
+    def __init__(self, message, reply="", thought=0):
+        super().__init__(message)
+        self.reply, self.thought = reply, thought
+
+
+# What the last model call on this thread looked like — how fast it was,
+# whether it reasoned first, whether it was cut off. Callers that care
+# (run_agent, the self-test) read it with last_call().
+_CALL = threading.local()
+CALLS = collections.deque(maxlen=60)    # the recent ones, any thread
+
+
+def last_call():
+    return dict(getattr(_CALL, "info", None) or {})
+
+
+def _note_call(target, **facts):
+    info = {"model": target.get("model", ""), "tier": target.get("tier", ""),
+            "at": time.time(), **facts}
+    _CALL.info = info
+    CALLS.append(info)
+
+
+# A model's reasoning as it streams. It is shown (the Live tab, a "thinking"
+# status in chat) and counts as a sign of life — it is never part of the
+# answer. Callables take the text.
+THINK_LISTENERS = []
+
+
+def _thinking_note(text, on_thought=None):
+    for fn in ([on_thought] if on_thought else []) + list(THINK_LISTENERS):
+        try:
+            fn(text)
+        except Exception:
+            pass
+
+
 def backend_trouble(exc):
     """Is this exception the model server being away (vs the task failing)?"""
     if isinstance(exc, BackendDown):
@@ -421,7 +468,7 @@ def parse_json_reply(reply):
 
 
 def chat_stream(target, prompt, system=None, force_json=False, on_token=None,
-                timeout=3600, max_seconds=0):
+                timeout=3600, max_seconds=0, think=None, on_thought=None):
     """Single-prompt convenience wrapper around chat_messages."""
     messages = []
     if system:
@@ -429,17 +476,86 @@ def chat_stream(target, prompt, system=None, force_json=False, on_token=None,
     messages.append({"role": "user", "content": prompt})
     return chat_messages(target, messages, force_json=force_json,
                          on_token=on_token, timeout=timeout,
-                         max_seconds=max_seconds)
+                         max_seconds=max_seconds, think=think,
+                         on_thought=on_thought)
+
+
+CHARS_PER_TOKEN = 3.2    # how prompts are sized; low for prose, fair for code
+THINK_ROOM = 4000        # tokens a reasoning model needs beyond its prompt
+                         # to think AND still answer
+
+
+def thinking_for(target, messages, cfg=None):
+    """Should a model that can "think" — reason at length before it
+    answers, as qwen3 and deepseek-r1 do — think on this call? None leaves
+    it to the model; False asks for the answer directly.
+
+    Reasoning is paid for twice: in time, and in the window, which it
+    shares with the prompt and the answer. A plan that is reasoned about
+    for two thousand tokens and then has no room left to be written down
+    is no plan. So with `thinking: auto`:
+      - the quick tier never reasons — triage, chat and summaries have to
+        be quick, and a chat that thinks for a minute before its first
+        word looks like a chat that hangs;
+      - the smart tier reasons when its window has room for it — give her
+        a bigger window (context_tokens) and she thinks more;
+      - the deep tier, a model you name yourself and the giants are left
+        as they are: reasoning is what they are for.
+    `always` leaves every model to itself; `never` asks every Ollama model
+    for the answer alone."""
+    if target.get("kind", "ollama") != "ollama" or target.get("giant"):
+        return None                 # only Ollama takes the instruction
+    mode = (cfg or config()).get("thinking", "auto")
+    if mode == "always":
+        return None
+    if mode == "never" or target.get("tier") == "fast":
+        return False
+    if target.get("tier") == "smart":
+        window = int(target.get("num_ctx") or 0)
+        used = sum(len(m.get("content") or "") for m in messages
+                   if isinstance(m.get("content"), str)) / CHARS_PER_TOKEN
+        if window and window - used < THINK_ROOM:
+            return False
+    return None
 
 
 def chat_messages(target, messages, force_json=False, on_token=None,
-                  timeout=3600, max_seconds=0):
+                  timeout=3600, max_seconds=0, think=None, on_thought=None):
     """Stream a chat completion from the target backend; returns the full
     reply text. `target` comes from resolve_tier() — a legacy config dict
     (url+model, no kind) is treated as Ollama. `timeout` is how long the
     server may stay silent; `max_seconds` (0 = no limit) caps the whole
-    generation."""
+    generation. `think` — None: thinking_for() decides; False: ask a
+    reasoning model for the answer alone. `on_thought` receives a model's
+    reasoning as it streams (it is never part of the reply).
+
+    A reply that is cut off because the model's reasoning filled its
+    window is asked for again, for the answer alone. One that is cut off
+    all the same comes back as far as it got (last_call() says so) — or,
+    for JSON, raises ReplyCutOff: half a JSON object is no answer."""
     deadline = time.time() + max_seconds if max_seconds else 0
+
+    def call(target, think):
+        try:
+            return _chat_call(target, messages, force_json, on_token,
+                              timeout, deadline, think, on_thought)
+        except ReplyCutOff as cut:
+            if cut.thought and think is not False \
+                    and target.get("kind", "ollama") == "ollama":
+                note = (f"{target['model']} reasoned until its window was "
+                        "full — asking again for the answer alone")
+                _garage_note(note)
+                if on_token:
+                    on_token(f"\n\n[{note}]\n\n")
+                try:
+                    return _chat_call(target, messages, force_json, on_token,
+                                      timeout, deadline, False, on_thought)
+                except ReplyCutOff as again:
+                    cut = again
+            if force_json:
+                raise cut
+            return cut.reply
+
     if target.get("giant"):
         # a giant: started (and others unloaded) on demand, and held so it
         # cannot be swapped out mid-answer
@@ -447,8 +563,7 @@ def chat_messages(target, messages, force_json=False, on_token=None,
         try:
             with aria_garage.serving(target["giant"], cfg,
                                      notify=_garage_note):
-                return _chat_call(target, messages, force_json, on_token,
-                                  timeout, deadline)
+                return call(target, None)
         except aria_garage.GarageBusy as exc:
             raise BackendDown(str(exc))
         except aria_garage.GarageError as exc:
@@ -456,8 +571,9 @@ def chat_messages(target, messages, force_json=False, on_token=None,
             target = resolve_tier("smart", cfg)
     if not target.get("giant") and target.get("kind", "ollama") == "ollama":
         _free_for_everyday(target)
-    return _chat_call(target, messages, force_json, on_token, timeout,
-                      deadline)
+    if think is None:
+        think = thinking_for(target, messages)
+    return call(target, think)
 
 
 GARAGE_LISTENERS = []           # callables that want giant load notices
@@ -576,19 +692,25 @@ def _garage_note(text):
             pass
 
 
-def _chat_call(target, messages, force_json, on_token, timeout, deadline):
+def _chat_call(target, messages, force_json, on_token, timeout, deadline,
+               think=None, on_thought=None):
     try:
         if target.get("kind", "ollama") == "openai":
             return _openai_stream(target, messages, force_json, on_token,
-                                  timeout, deadline)
+                                  timeout, deadline, on_thought)
         return _ollama_stream(target, messages, force_json, on_token,
-                              timeout, deadline)
+                              timeout, deadline, think, on_thought)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
             detail = exc.read().decode("utf-8", "replace")[:200]
         except Exception:
             pass
+        if exc.code == 400 and think is False and "think" in detail.lower():
+            # a server or model that will not take the instruction: ask
+            # the way it has always been asked
+            return _chat_call(target, messages, force_json, on_token,
+                              timeout, deadline, None, on_thought)
         if exc.code >= 500 or (exc.code == 503 and target.get("giant")):
             raise BackendDown(f"{target['model']}: HTTP {exc.code} {detail}")
         raise RuntimeError(f"{target['model']}: HTTP {exc.code} {detail}")
@@ -600,20 +722,32 @@ def _chat_call(target, messages, force_json, on_token, timeout, deadline):
                           f"{target['url']}: {getattr(exc, 'reason', exc)}")
 
 
-def _ollama_stream(target, messages, force_json, on_token, timeout, deadline):
+def _ollama_stream(target, messages, force_json, on_token, timeout, deadline,
+                   think=None, on_thought=None):
     body = {"model": target["model"], "stream": True, "messages": messages}
     if force_json:
         body["format"] = "json"
-    if target.get("num_ctx"):
-        # without this Ollama silently truncates long prompts to its small
-        # default window — fatal for a planner reading project state
-        body["options"] = {"num_ctx": int(target["num_ctx"])}
+    window = int(target.get("num_ctx") or 0)
+    if window:
+        # Without num_ctx Ollama silently truncates long prompts to its
+        # small default window — fatal for a planner reading project state.
+        # And no more writing than the window has room for: a reply that
+        # outgrows it has the oldest part of its own prompt dropped to make
+        # room, after which a model can go on writing, lost, for hours.
+        # (The prompt is counted generously short here, so a reply that
+        # would have fitted is never cut.)
+        chars = sum(len(m.get("content") or "") for m in messages
+                    if isinstance(m.get("content"), str))
+        body["options"] = {"num_ctx": window,
+                           "num_predict": max(256, window - int(chars / 4.5))}
+    if think is False:
+        body["think"] = False       # a reasoning model: the answer alone
     req = urllib.request.Request(
         target["url"] + "/api/chat",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    parts = []
+    parts, thought, last, t0 = [], 0, {}, time.time()
     # generous timeout: a larger-than-RAM "giant" model can sit silent for
     # a long time processing the prompt before the first token streams
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -624,21 +758,45 @@ def _ollama_stream(target, messages, force_json, on_token, timeout, deadline):
             data = json.loads(raw)
             if data.get("error"):
                 raise RuntimeError(f"{target['model']}: {data['error']}")
-            tok = (data.get("message") or {}).get("content", "")
+            message = data.get("message") or {}
+            reasoning = message.get("thinking") or ""
+            if reasoning:                   # shown, never part of the reply
+                thought += len(reasoning)
+                _thinking_note(reasoning, on_thought)
+            tok = message.get("content", "")
             if tok:
                 parts.append(tok)
                 if on_token:
                     on_token(tok)
             if data.get("done"):
+                last = data
                 break
             if deadline and time.time() > deadline:
                 raise GenerationTimeout(
                     f"{target['model']} ran past its time limit")
-    return "".join(parts)
+    reply = "".join(parts)
+    read, wrote = (int(last.get("prompt_eval_count") or 0),
+                   int(last.get("eval_count") or 0))
+    took = float(last.get("eval_duration") or 0) / 1e9
+    cut = last.get("done_reason") == "length" \
+        or bool(window and read and read + wrote >= window)
+    _note_call(target, think=think, thought=thought, cut_off=cut,
+               prompt_tokens=read, tokens=wrote,
+               seconds=round(time.time() - t0, 1),
+               rate=round(wrote / took, 1) if took and wrote else 0,
+               window=window)
+    if cut:
+        raise ReplyCutOff(
+            f"{target['model']} ran out of room — its window of "
+            f"{window or 'unknown size'} tokens was full"
+            + (f" after {read} tokens of prompt and {wrote} of "
+               + ("reasoning and answer" if thought else "answer")
+               if read else ""), reply, thought)
+    return reply
 
 
 def _openai_stream(target, messages, force_json=False, on_token=None,
-                   timeout=3600, deadline=0):
+                   timeout=3600, deadline=0, on_thought=None):
     """Streaming client for any OpenAI-compatible server (llama.cpp
     llama-server, LM Studio, vLLM...)."""
     body = {"model": target["model"], "stream": True, "messages": messages}
@@ -650,7 +808,7 @@ def _openai_stream(target, messages, force_json=False, on_token=None,
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + target.get("key", "local")},
     )
-    parts = []
+    parts, thought, ended, timings, t0 = [], 0, "", {}, time.time()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             raw = raw.strip()
@@ -661,30 +819,68 @@ def _openai_stream(target, messages, force_json=False, on_token=None,
                 break
             data = json.loads(payload)
             choices = data.get("choices") or [{}]
-            tok = (choices[0].get("delta") or {}).get("content") or ""
+            delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content") or ""
+            if reasoning:                   # shown, never part of the reply
+                thought += len(reasoning)
+                _thinking_note(reasoning, on_thought)
+            tok = delta.get("content") or ""
             if tok:
                 parts.append(tok)
                 if on_token:
                     on_token(tok)
+            ended = choices[0].get("finish_reason") or ended
+            timings = data.get("timings") or timings      # llama-server
             if deadline and time.time() > deadline:
                 raise GenerationTimeout(
                     f"{target['model']} ran past its time limit")
-    return "".join(parts)
+    reply = "".join(parts)
+    _note_call(target, think=None, thought=thought, cut_off=ended == "length",
+               prompt_tokens=int(timings.get("prompt_n") or 0),
+               tokens=int(timings.get("predicted_n") or 0),
+               seconds=round(time.time() - t0, 1),
+               rate=round(float(timings.get("predicted_per_second") or 0), 1),
+               window=0)
+    if ended == "length":
+        raise ReplyCutOff(
+            f"{target['model']} ran out of room — its window was full "
+            "before it had finished"
+            + (" (its reasoning took the room)" if thought and not reply
+               else ""), reply, thought)
+    return reply
 
 
 def ask_json(target, prompt, system, on_token=None, timeout=3600, tries=2):
-    """Ask for JSON and get a parsed value back, re-asking once if the
-    model answers with something that is not JSON."""
-    last = ""
+    """Ask for JSON and get a parsed value back. A reply that is not JSON
+    — or that was cut off before it was whole — is asked for once more,
+    this time for the answer alone, with no reasoning first."""
+    last, cut = "", None
     for attempt in range(tries):
-        last = chat_stream(
-            target, prompt if attempt == 0 else
-            prompt + "\n\nYour previous reply was not valid JSON. Reply "
-                     "with ONLY the JSON object, nothing else.",
-            system, force_json=True, on_token=on_token, timeout=timeout)
-        data = parse_json_reply(last)
+        try:
+            last = chat_stream(
+                target, prompt if attempt == 0 else
+                prompt + "\n\nYour previous reply was not valid JSON. "
+                         "Reply with ONLY the JSON object, nothing else.",
+                system, force_json=True, on_token=on_token, timeout=timeout,
+                think=None if attempt == 0 else False)
+            cut = None
+            data = parse_json_reply(last)
+        except ReplyCutOff as exc:
+            # whole, or nothing: the lenient reader would find a complete
+            # inner piece in a reply that stops short — one task of a plan
+            # — and hand that back as if it were the answer
+            last, cut = exc.reply, exc
+            try:
+                data = json.loads(strip_think(last))
+            except (ValueError, TypeError):
+                data = None
         if data is not None:
             return data
+    if cut is not None:
+        raise ValueError(
+            f"{cut} — the reply did not fit. Raise the context window "
+            "(Settings → Models, or: aria settings set context_tokens "
+            "16384), or use a model that needs less room")
     raise ValueError(f"model did not return JSON: {last[:160]!r}")
 
 
@@ -2395,11 +2591,22 @@ def converse(messages, on_token=None, skill=None, patience=None,
         if on_token:
             on_token(text)
 
+    def thought(_text):
+        # a model that reasons first is not a model that hangs
+        if not first.is_set() and not box.get("thinking"):
+            box["thinking"] = True
+            if on_status and not box["gave_up"]:
+                on_status("thinking it over…")
+        box["thought_at"] = time.time()
+
     def work():
         try:
+            # chat is conversation: with thinking on "auto" she answers
+            # straight away, whichever model happens to serve the chat
             box["reply"] = chat_messages(
                 target, [{"role": "system", "content": system}] + trimmed,
-                on_token=token)
+                on_token=token, on_thought=thought,
+                think=None if cfg.get("thinking") == "always" else False)
         except Exception as exc:
             box["error"] = exc
         first.set()
@@ -2410,6 +2617,8 @@ def converse(messages, on_token=None, skill=None, patience=None,
     told = False
     while not first.wait(2):
         waited = time.time() - t0
+        if box.get("thinking") and time.time() - box.get("thought_at", 0) < 20:
+            continue                     # reasoning as we wait: let her
         if waited >= patience:
             box["gave_up"] = True        # the call may end later, unheard
             reply = _busy_reply(waited, target)
@@ -2814,8 +3023,17 @@ def run_agent(name, task, emit, timeout=3600, model="", skills=None,
     reply = chat_stream(target, task, system, timeout=timeout,
                         max_seconds=max_seconds,
                         on_token=lambda t: emit({"event": "token", "text": t}))
+    said = last_call()
+    if info is not None and said.get("cut_off"):
+        info["cut_off"] = (
+            f"the reply was cut off: {said.get('model') or 'the model'} ran "
+            "out of room in its window"
+            + (f" of {said['window']} tokens" if said.get("window") else "")
+            + " before it had finished")
     emit({"event": "stage_done", "stage": "agent", "agent": agent["name"],
-          "log": f"agent {agent['name']} finished"})
+          "log": f"agent {agent['name']} finished"
+                 + (" — but its reply was cut off (the model's window was "
+                    "full)" if said.get("cut_off") else "")})
     return strip_think(reply)
 
 
@@ -3957,13 +4175,45 @@ def version():
             "subject": git("log", "-1", "--format=%s")}
 
 
+SERVICE = "aria.service"
+
+
+def service_state():
+    """What systemd says about the always-on unit: its main process (0 when
+    it is not running, or where there is no systemd) and whether the unit
+    serves THIS copy of A.R.I.A."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", SERVICE, "-p", "MainPID",
+             "-p", "ExecStart"], capture_output=True, text=True,
+            timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {"pid": 0, "ours": False}
+    found = re.search(r"^MainPID=(\d+)", out, re.M)
+    return {"pid": int(found.group(1)) if found else 0,
+            "ours": str(ROOT / "bin" / "aria-ui") in out}
+
+
+def _is_the_service(pid):
+    """Is this process the one systemd runs as the always-on unit?"""
+    try:
+        return bool(pid) and service_state()["pid"] == int(pid)
+    except (TypeError, ValueError):
+        return False
+
+
 def server_mark(port):
     """The server, at start: put on record who is serving this copy."""
     info = {"pid": os.getpid(), "port": int(port), "code": code_version(),
             "version": version(),
             "started": datetime.datetime.now().isoformat(timespec="seconds"),
-            # systemd names every service run; nothing else sets this
-            "managed": bool(os.environ.get("INVOCATION_ID"))}
+            # "Run by systemd" means being the unit's own main process.
+            # Having been started under SOME unit is not it: systemd's
+            # INVOCATION_ID is handed down to everything a unit starts —
+            # a terminal the desktop launched as one, and with it every
+            # server started by hand there (and every self-test).
+            "managed": bool(os.environ.get("INVOCATION_ID"))
+            and _is_the_service(os.getpid())}
     tmp = SERVER_FILE.with_name(SERVER_FILE.name + ".tmp")
     tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
     os.replace(tmp, SERVER_FILE)
@@ -3995,14 +4245,17 @@ def server_running():
     if live.get("pid") != info.get("pid"):
         return None
     info["stale"] = info.get("code") != code_version()
+    # a record is a claim; whether systemd runs this process is asked now
+    info["managed"] = bool(info.get("managed")) \
+        and _is_the_service(info.get("pid"))
     return info
 
 
 def server_restart(info):
     """Restart the server `info` describes onto the code on disk. Returns
     how it was done: "systemd" or "respawned"."""
-    if info.get("managed"):
-        subprocess.run(["systemctl", "--user", "restart", "aria.service"],
+    if info.get("managed") and _is_the_service(info.get("pid")):
+        subprocess.run(["systemctl", "--user", "restart", SERVICE],
                        check=False)
         return "systemd"
     pid, port = int(info["pid"]), int(info["port"])
@@ -4046,6 +4299,7 @@ _CHOICE_KEYS = {
                    "none"},
     "autopilot_after_goal": {"improve", "stop"},
     "giants_use": {"auto", "always", "never"},
+    "thinking": {"auto", "always", "never"},
     "autopilot_checks": {"sandbox", "direct", "off"},
     "engine": {"ollama", "claude"},
     "voice_engine": {"auto", "local", "browser"},

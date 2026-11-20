@@ -52,10 +52,11 @@ aria:
   # Prove a giant loads and answers:  bin/aria models test general
   giants_use: auto
   # How many giants may be loaded at once; unload one after this many
-  # minutes unused (0 = keep it loaded); the first port (general uses it,
-  # research the next, coder the one after).
+  # minutes unused, so it does not sit on the memory when nothing needs
+  # it (0 = keep it loaded); the first port (general uses it, research
+  # the next, coder the one after).
   giants_loaded: 1
-  giants_idle_minutes: 0
+  giants_idle_minutes: 20
   giants_port: 8090
   # Giants and Ollama's everyday models take turns with the memory: before
   # a giant loads, Ollama unloads what it holds; before an everyday model
@@ -213,9 +214,22 @@ aria:
   # ---- autopilot ----------------------------------------------------
   # Context window, in tokens, requested from Ollama for every call (its
   # own default silently truncates long prompts) and used to size prompts.
-  # Raise it if your models and VRAM allow; 0 leaves the backend's own
-  # setting alone.
+  # A model's prompt, its reasoning and its answer all have to fit in it.
+  # Raise it if your models and VRAM allow (16384 is a good next step);
+  # 0 leaves the backend's own setting alone.
   context_tokens: 8192
+  # Models that reason at length before they answer (qwen3, deepseek-r1…).
+  # Reasoning costs time, and room in the window above.
+  #   auto   = the quick tier answers straight away (chat, triage and
+  #            summaries stay quick); the smart tier reasons when the
+  #            window has room for the reasoning AND the answer — a larger
+  #            context_tokens lets her think more; the deep tier, models
+  #            you name yourself and the giants are left as they are
+  #   always = leave every model to itself
+  #   never  = ask every Ollama model for the answer alone
+  # A reply that is cut off because the reasoning filled the window is
+  # asked for again without it, whatever this is set to.
+  thinking: auto
 
   # After the goal is met and audited:  improve = keep going with
   # improvements until you stop her (or she runs out of improvements

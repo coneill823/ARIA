@@ -307,7 +307,21 @@ def _emitter(slug, emit):
                                              "at": time.time()})
                 if cur.pop("kept", None):       # tokens after a close: a
                     cur.update(text="", at=time.time())   # stream of its own
-                cur["text"] = (cur["text"] + ev.get("text", ""))[-LIVE_FULL:]
+                    cur.pop("mode", None)
+                # reasoning and answer are both shown, and told apart
+                mode = "thinking" if ev.get("thinking") else "answer"
+                mark = ""
+                if mode != cur.get("mode"):
+                    if mode == "thinking":
+                        mark = ("\n\n" if cur["text"] else "") \
+                            + "[thinking it through]\n"
+                    elif cur.get("mode") == "thinking":
+                        mark = "\n\n[her answer]\n"
+                    cur["mode"] = mode
+                cur["text"] = (cur["text"] + mark
+                               + ev.get("text", ""))[-LIVE_FULL:]
+            if ev.get("thinking"):
+                return              # for the Live tab only: not her answer
         elif kind == "thinking":
             _close_live(slug)
             with _LIVE_LOCK:
@@ -1245,7 +1259,7 @@ def _roadmap_make(slug, state, emit, cfg, why):
         state["stats"]["calls"] += 1
         if isinstance(data, list):
             data = {"milestones": data}
-        raw = [m for m in (data or {}).get("milestones") or []
+        raw = [m for m in _listed((data or {}).get("milestones"))
                if isinstance(m, dict)]
     except Exception as exc:
         if eng.backend_trouble(exc):
@@ -1276,7 +1290,8 @@ def _roadmap_make(slug, state, emit, cfg, why):
                       "status": same["status"] if same else "todo",
                       "outcome": " ".join(str(m.get("outcome") or "")
                                           .split())[:400],
-                      "depends_on": [str(d) for d in m.get("depends_on") or []
+                      "depends_on": [str(d) for d in
+                                     _listed(m.get("depends_on"))
                                      if isinstance(d, (str, int))],
                       "est_tasks": est})
     if not fresh:                       # still a road: the goal, in one step
@@ -1471,6 +1486,22 @@ def _truthy(value):
     return value is True or value == 1
 
 
+def _listed(value):
+    """What a model gave where a list was asked for, as a list. Models
+    answer "a" for ["a"], 3 for [3], null for [], and now and then an
+    object for a list — none of which should stop a plan."""
+    if value is None or value is False or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, dict):
+        return list(value.values())
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,;\n]", value)
+                if part.strip()]
+    return [value]
+
+
 _CODE_WORDS = re.compile(
     r"\.(py|js|ts|tsx|jsx|rs|go|java|kt|c|cpp|h|cs|rb|php|swift|sh|sql|"
     r"html|css|vue|svelte|dart|lua)\b|\b(code|implement|function|class|"
@@ -1611,7 +1642,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
         data = {"tasks": data}
     if not isinstance(data, dict):
         raise ValueError("the planner did not return a plan object")
-    raw_tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
+    raw_tasks = [t for t in _listed(data.get("tasks")) if isinstance(t, dict)]
 
     roster = {a["name"] for a in cap["agents"]} | \
         {a["name"] for a in eng.list_library_agents()}
@@ -1670,7 +1701,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             agent = _guess_agent(title + " " + detail,
                                  {a["name"] for a in cap["agents"]
                                   if not a["library"]})
-        skills = [s for s in (raw.get("skills") or [])
+        skills = [s for s in _listed(raw.get("skills"))
                   if isinstance(s, str) and s in skill_names][:3]
         auto_skills = False
         if not skills and skill_names:
@@ -1692,12 +1723,12 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             "model": _valid_model(str(raw.get("model") or ""), cfg, installed),
             "phase": " ".join(str(raw.get("phase") or "work").split())[:40],
             "est_hours": est,
-            "depends_on": [str(d) for d in (raw.get("depends_on") or [])
+            "depends_on": [str(d) for d in _listed(raw.get("depends_on"))
                            if isinstance(d, (str, int))],
-            "reads": [str(p).lstrip("./") for p in (raw.get("reads") or [])
+            "reads": [str(p).lstrip("./") for p in _listed(raw.get("reads"))
                       if isinstance(p, str)
                       and str(p).lstrip("./") in existing_files][:6],
-            "research": bool(raw.get("research")) and eng.web_ready(cfg),
+            "research": _truthy(raw.get("research")) and eng.web_ready(cfg),
             "needs_human": _truthy(raw.get("needs_human")),
             "hard": _truthy(raw.get("hard")),
             "milestone": (str(raw.get("milestone") or "").strip()
@@ -1737,7 +1768,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     plan["iteration"] = state["iteration"]
     plan["updated"] = _stamp()
     _save_plan(slug, plan)
-    reached = {str(r) for r in data.get("reached") or []
+    reached = {str(r) for r in _listed(data.get("reached"))
                if isinstance(r, (str, int))} & ms_ids
     _roadmap_update(slug, plan, reached, fresh)
     complete = bool(data.get("project_complete")) and not fresh
@@ -2284,6 +2315,15 @@ def _run_task(slug, state, plan, task, cfg, emit):
         state["phase"] = "reviewing"
         _save_state(slug, state)
         problems = static_checks(slug, records)
+        if info.get("cut_off"):
+            # whatever was being written when the room ran out is half a
+            # file; nothing of this attempt is kept
+            problems.insert(0, (
+                f"{info['cut_off']}. Write less: only the files this task "
+                "names, each as short as it can be while complete — no "
+                "restating of the task, no commentary around the files"))
+            emit({"event": "error",
+                  "log": f"{slug}: {task['id']} — {info['cut_off']}"})
         if not problems and _wrote_code(records) \
                 and eng.checks_available(cfg)[0]:
             checks = _run_checks(slug, emit,
@@ -2461,7 +2501,7 @@ def _audit(slug, state, cfg, emit):
     state["stats"]["calls"] += 1
     if not isinstance(data, dict):
         return []
-    gaps = [" ".join(str(g).split())[:240] for g in (data.get("gaps") or [])
+    gaps = [" ".join(str(g).split())[:240] for g in _listed(data.get("gaps"))
             if str(g).strip()][:6]
     met = data.get("met")
     if isinstance(met, str):
@@ -2714,7 +2754,7 @@ def _review_file(slug, state, path, cfg, emit):
     state["stats"]["calls"] += 1
     raw = data.get("findings") if isinstance(data, dict) else data
     out = []
-    for f in (raw or [])[:5]:
+    for f in _listed(raw)[:5]:
         if not isinstance(f, dict):
             continue
         problem = " ".join(str(f.get("problem") or "").split())[:400]
@@ -2927,6 +2967,17 @@ def _garage_notice(text):
 
 
 eng.GARAGE_LISTENERS.append(_garage_notice)
+
+
+def _thinking_token(text):
+    """A model's reasoning as it streams: into the Live tab of the project
+    whose step this is, marked off from what it then answers."""
+    emit = getattr(_STEP, "emit", None)
+    if emit is not None:
+        emit({"event": "token", "text": text, "thinking": True})
+
+
+eng.THINK_LISTENERS.append(_thinking_token)
 
 
 def tick(slug, emit):
