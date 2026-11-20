@@ -136,6 +136,19 @@ aria:
   # When capturing from the web UI, automatically run triage and then
   # develop whatever became a project — idea in, proposed plan out.
   auto_pipeline: true
+  # With every plan she also writes the business side of the idea: a
+  # business plan, the list of everything a complete proposal needs (and
+  # what is still missing), and who does what — her part, which joins the
+  # requirements when you approve, and yours, which only you tick. What
+  # these documents ask, and where the questions come from:
+  # docs/PROJECT-GROUNDWORK.md. For a project that has none yet:
+  # bin/aria business <project>
+  business_plans: true
+  # Where you are based, e.g. "United Kingdom". Legal form, tax, licences
+  # and data protection differ by country: with this set she names the
+  # bodies and rules that apply to you; left empty she says which points
+  # depend on the country and what to check.
+  based_in:
 
   # Absolute path to your Obsidian vault to enable the UI's "→ Obsidian"
   # button (exports a project's idea/research/plan plus an index note with

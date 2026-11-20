@@ -81,7 +81,8 @@ IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
                ".jpeg": "image/jpeg", ".gif": "image/gif",
                ".webp": "image/webp", ".svg": "image/svg+xml",
                ".ico": "image/x-icon", ".bmp": "image/bmp"}
-CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
+CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "business_plans",
+               "based_in", "fast", "smart", "deep",
                "stt_model", "web_access", "web_search", "web_search_url",
                "web_allowlist", "github_access", "github_base_branch",
                "brain_journal", "autopilot_git", "autopilot_after_goal",
@@ -171,6 +172,8 @@ def config_view():
         "brain_ready": eng.brain_ready(cfg),
         "brain_journal": cfg["brain_journal"],
         "auto_pipeline": cfg["auto_pipeline"],
+        "business_plans": cfg["business_plans"],
+        "based_in": cfg["based_in"],
         "model": cfg["model"],
         "tiers": {t: v.get("spec") or f"{v['kind']}/{v['model']}"
                   for t, v in tiers.items()},
@@ -664,6 +667,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("action must be scan, load, test or unload")
         elif path == "/api/plan":
             self.plan_project(body)
+        elif path == "/api/business":
+            # draft (or redraft) the business plan and who-does-what, in
+            # the background: the page comes back for it
+            job = eng.business_start(text("slug").lower())
+            self.send_json({"ok": True, "job": job})
+        elif path == "/api/project/action":
+            # the owner ticks an item on their own list — nobody else does
+            item = eng.project_action_done(
+                text("slug").lower(), text("id"),
+                done=body.get("done") is not False)
+            self.send_json({"ok": True, "item": item})
         elif path == "/api/github":
             slug, action = text("slug").lower(), text("action")
             if action == "init":

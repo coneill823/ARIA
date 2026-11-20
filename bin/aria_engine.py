@@ -179,6 +179,10 @@ def config():
         "threshold": float(find("triage_confidence_threshold", "0.7")),
         "promotion_target": find("promotion_target", "./active-projects"),
         "auto_pipeline": flag("auto_pipeline", "true"),
+        # the business side of an idea: written with every plan, fitted to
+        # where the owner is based
+        "business_plans": flag("business_plans", "true"),
+        "based_in": find("based_in", "").split(" #")[0].strip(),
         "obsidian_vault": os.environ.get(
             "ARIA_OBSIDIAN_VAULT", find("obsidian_vault", "")),
         "brain_journal": flag("brain_journal", "true"),
@@ -1478,6 +1482,16 @@ def develop_run(emit, slugs=None):
         brain_journal(f"drafted a plan for [[{slug}]]"
                       + (" from live web research" if found["sources"]
                          else ""))
+        if cfg["business_plans"]:
+            # The plan is what the owner approves, and it is ready. What
+            # follows is groundwork beside it: if it fails, the plan stands.
+            try:
+                business_run(slug, emit, cfg)
+            except Exception as exc:
+                emit({"event": "error",
+                      "log": f"{slug}: the plan is ready; its business plan "
+                             f"could not be written ({exc}) — try again "
+                             f"with: aria business {slug}"})
 
     emit({"event": "stage_done", "stage": "develop",
           "log": "drafts ready — review them, then approve one on the "
@@ -1501,10 +1515,11 @@ def refine(slug, feedback):
         raise ValueError(f"no such potential project: {slug}")
 
     version = len(list(proj.glob("proposed-plan.v*.md"))) + 1
-    for name in ("proposed-plan", "research"):
+    for name in ("proposed-plan", "research") + BUSINESS_DOCS:
         f = proj / f"{name}.md"
         if f.exists():
             f.rename(proj / f"{name}.v{version}.md")
+    # (actions.json stays: the next draft carries the owner's ticks over)
 
     today = datetime.date.today().isoformat()
     with idea.open("a", encoding="utf-8") as fh:
@@ -1518,6 +1533,523 @@ def refine(slug, feedback):
     ledger_update(slug, "project", "processing", "pipeline/01-processing/",
                   (fm.get("captured") or "?")[:10])
     return dest
+
+
+# ---------------------------------------------------------------- business
+#
+# Beside the plan, develop writes what it takes to make the idea real as a
+# venture: a business plan, the list of everything a complete proposal
+# needs (and what is still missing), and who does what — her part, and the
+# owner's. The questions come from docs/PROJECT-GROUNDWORK.md; the shape of
+# the documents from system/templates/business-plan.md and action-list.md.
+
+BUSINESS_DOCS = ("business-plan", "action-list")
+PROJECT_DOCS = ("idea", "research", "proposed-plan", "requirements") \
+    + BUSINESS_DOCS
+
+# What a complete proposal needs: (key, what it is, the document that
+# always answers it — "" where a model has to judge how far it is answered)
+PROPOSAL_ITEMS = (
+    ("idea", "The idea, in your words", "idea"),
+    ("prior_art", "Prior art and alternatives", "research"),
+    ("plan", "The plan: scope, approach, milestones", "proposed-plan"),
+    ("problem", "The problem and who has it, with evidence", ""),
+    ("market", "Market size and competitors", ""),
+    ("offer", "The offer and its price", ""),
+    ("money", "Costs, break-even and a cash forecast", ""),
+    ("funding", "Funding: how much, from where", ""),
+    ("legal", "Legal form and registrations", ""),
+    ("rules", "Licences, data protection, ownership of the work", ""),
+    ("people", "People: who does what, what is missing", ""),
+    ("risks", "Risks and how each is handled", ""),
+    ("measures", "Milestones, and how success is measured", ""),
+    ("decisions", "The decisions that are yours", ""),
+)
+STATE_MARK = {"there": "✔", "assumed": "~", "missing": "✗"}
+
+BUSINESS_SYSTEM = """You write the business plan for a project idea, for its
+owner — one person deciding whether and how to do this.
+Write exactly the sections you are given, in order, each under its '## '
+heading exactly as given. Plain markdown. No preamble, no closing remarks.
+- Specific to THIS idea: name the kinds of customer, the competitors, the
+  channels, the costs. No sentence that would fit any business.
+- Sized to the idea. A small personal tool gets a few honest lines a
+  section; where a section does not apply, say so in one line and why.
+- Numbers are estimates: show the arithmetic (40 customers x 9 a month =
+  360 a month) and say what each figure rests on. A range beats a point.
+- Never present a guess as a fact. Never invent a statistic, a source, a
+  law or a company. Where the research gives a fact, cite it as [n]. What
+  you do not know, say — and say what would have to be found out.
+- %s
+- Plain words. No hype."""
+
+ACTIONS_SYSTEM = """You turn a project's plan and business plan into who
+does what. Respond with ONLY a JSON object:
+
+{"proposal": {"<key>": {"state": "there|assumed|missing",
+                        "note": "<one line: where it is answered, or what is still needed>"}},
+ "aria": [{"title": "short imperative title",
+           "detail": "what will exist when it is done, naming the document",
+           "why": "what it is needed for"}],
+ "you": [{"title": "short imperative title",
+          "why": "why this takes a person",
+          "prepare": "what A.R.I.A. can prepare so that your part is short"}]}
+
+Rules:
+- "proposal": one entry for EVERY key under PROPOSAL ITEMS. "there" = the
+  documents answer it with evidence; "assumed" = answered with an estimate
+  or an assumption that still needs checking; "missing" = not answered.
+- "aria": 4 to 10 things an AI can do alone by researching, reasoning,
+  calculating and writing: a competitor table, pricing options, a cost and
+  break-even sheet, a cash forecast, draft terms or a privacy notice, an
+  interview guide, landing-page copy. Not the build itself — the plan
+  covers that.
+- "you": 3 to 10 things only a person can do: talk to customers, choose a
+  name, decide to spend, register, open accounts, sign, pay, meet people,
+  test with real users. A decision or a legal act is never under "aria".
+- Concrete and specific to this project. Nothing on both lists."""
+
+
+def template_sections(name):
+    """The numbered `## ` sections of a template, each with the guidance
+    written under it between {{ }}: [(heading, guidance)]. A template is
+    the one place a document's shape is decided — for Claude Code, which
+    fills it in, and for the engine, which asks a model for these sections."""
+    text = (ROOT / "system" / "templates" / f"{name}.md").read_text(
+        encoding="utf-8")
+    return [(m.group(1).strip(),
+             " ".join(re.sub(r"[{}]", "", m.group(2)).split()))
+            for m in re.finditer(r"^## (\d+\. [^\n]+)\n(.*?)(?=^## |\Z)", text,
+                                 re.S | re.M)]
+
+
+def _sections_only(text):
+    """A model's sections without what it wrapped around them: a fence
+    round the whole reply, a sentence of preamble."""
+    text = re.sub(r"^```(?:markdown|md)?\s*\n|\n```\s*$", "", text.strip())
+    start = re.search(r"^(?:> \*\*In one line|## )", text, re.M)
+    return text[start.start():].strip() if start else text.strip()
+
+
+def _actions_file(proj):
+    for f in (proj / "docs" / "actions.json", proj / "actions.json"):
+        if f.is_file():
+            return f
+    return None
+
+
+_LIST_ROW = re.compile(r"^\|\s*([✔✓~✗xX-])\s*\|\s*(.+?)\s*\|\s*(.*?)\s*\|\s*$")
+_LIST_HERS = re.compile(r"^\s*[-*]\s+\*\*\s*(a\d+)\s*[—–-]+\s*(.+?)\*\*"
+                        r"\s*(?:[—–-]+\s*(.*))?$", re.I)
+_LIST_MINE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+\*\*\s*(y\d+)\s*[—–-]+\s*"
+                        r"(.+?)\*\*\s*(?:[—–-]+\s*(.*))?$", re.I)
+
+
+def _actions_from_markdown(text, slug):
+    """An action list read back from its markdown — the form Claude Code's
+    planner writes (from system/templates/action-list.md) and the form the
+    engine itself renders. So the list is the same list whichever of the
+    two wrote it."""
+    keys = {item.lower(): key for key, item, _doc in PROPOSAL_ITEMS}
+    states = {"✔": "there", "✓": "there", "~": "assumed"}
+    data = {"slug": slug, "proposal": [], "aria": [], "you": []}
+    for line in text.splitlines():
+        m = _LIST_ROW.match(line)
+        if m and m.group(2).strip().lower() not in ("item", "---"):
+            item = m.group(2).strip()
+            data["proposal"].append({
+                "key": keys.get(item.lower(), slugify(item, limit=3)),
+                "item": item,
+                "state": states.get(m.group(1), "missing"),
+                "note": m.group(3).strip()})
+            continue
+        m = _LIST_HERS.match(line)
+        if m:
+            detail = (m.group(3) or "").strip()
+            why = re.search(r"\s*\*\((.+?)\)\*\s*$", detail)
+            data["aria"].append({
+                "id": m.group(1).lower(), "title": m.group(2).strip(),
+                "detail": detail[:why.start()].strip() if why else detail,
+                "why": why.group(1) if why else ""})
+            continue
+        m = _LIST_MINE.match(line)
+        if m:
+            rest = (m.group(4) or "").strip()
+            done_on = re.search(r"\s*\*\(done ([\d-]*)\)\*\s*$", rest)
+            if done_on:
+                rest = rest[:done_on.start()].strip()
+            why, _, prepare = rest.partition("*She can prepare:*")
+            data["you"].append({
+                "id": m.group(2).lower(), "title": m.group(3).strip(),
+                "why": why.strip().rstrip("."), "prepare": prepare.strip(),
+                "done": m.group(1) != " ",
+                "done_on": done_on.group(1) if done_on else ""})
+    return data
+
+
+def _load_actions(proj, slug):
+    f = _actions_file(proj)
+    if f:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except ValueError:
+            return None
+        for key in ("proposal", "aria", "you"):
+            data.setdefault(key, [])
+        return data
+    listed = _project_doc(proj, "action-list")
+    if listed:                          # written by hand, or by Claude Code
+        data = _actions_from_markdown(listed.read_text(encoding="utf-8"),
+                                      slug)
+        if data["proposal"] or data["aria"] or data["you"]:
+            return data
+    return None
+
+
+def project_actions(slug):
+    """A project's action list as data — what a complete proposal needs,
+    her part, the owner's part — or None when none has been written."""
+    return _load_actions(_project_dir(slug), slug)
+
+
+def _save_actions(slug, data, folder=None):
+    """Write the action list: actions.json (what the app works from) and
+    action-list.md (the same, to read), side by side."""
+    proj = _project_dir(slug)
+    current = _actions_file(proj) or _project_doc(proj, "action-list")
+    folder = folder or (current.parent if current else proj)
+    data["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+    (folder / "actions.json").write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    plan = _project_doc(proj, "proposed-plan")
+    title = _project_title(slug, plan.read_text(encoding="utf-8")
+                           if plan else "")
+
+    def cell(text):
+        return " ".join(str(text).split()).replace("|", "/")
+
+    lines = [f"---\nslug: {slug}\ntype: action-list\n"
+             f"created: {str(data.get('made', ''))[:10]}\n"
+             f"updated: {data['updated'][:10]}\n---", "",
+             f"# What needs doing: {title}", "",
+             "## What a complete proposal needs", "",
+             "✔ there · ~ there as an assumption that still needs checking "
+             "· ✗ missing", "", "| | Item | Where it stands |", "|---|---|---|"]
+    lines += [f"| {STATE_MARK.get(p['state'], '✗')} | {cell(p['item'])} | "
+              f"{cell(p['note'])} |" for p in data["proposal"]]
+    lines += ["", "## A.R.I.A.'s part", "",
+              "What she can research, draft, calculate or build. After you "
+              "approve the plan these join the project's requirements, and "
+              "autopilot does them.", ""]
+    lines += [f"- **{t['id']} — {t['title']}** — {t['detail']}"
+              + (f" *({t['why']})*" if t.get("why") else "")
+              for t in data["aria"]] or ["- (nothing listed)"]
+    lines += ["", "## Your part", "",
+              "What takes a person. Only you tick these — in the app, or "
+              "with `aria done " + slug + " <id>`.", ""]
+    lines += [f"- [{'x' if t.get('done') else ' '}] **{t['id']} — "
+              f"{t['title']}** — {t['why']}"
+              + (f". *She can prepare:* {t['prepare']}" if t.get("prepare")
+                 else "")
+              + (f" *(done {t['done_on']})*" if t.get("done") else "")
+              for t in data["you"]] or ["- (nothing listed)"]
+    (folder / "action-list.md").write_text("\n".join(lines) + "\n",
+                                           encoding="utf-8")
+    return folder / "action-list.md"
+
+
+def _line(value, limit):
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _listy(value):
+    """A list where a model was asked for one (it may give an object, a
+    single item or nothing)."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return list(value.values())
+    return []
+
+
+def _actions_from(raw, slug, before=None):
+    """The model's who-does-what, made safe to store: every proposal item
+    present, ids given, sizes bounded — and the owner's ticks carried over
+    from the list this one replaces."""
+    raw = raw if isinstance(raw, dict) else {}
+    judged = raw.get("proposal") if isinstance(raw.get("proposal"), dict) \
+        else {}
+    proj = _project_dir(slug)
+    proposal = []
+    for key, item, doc in PROPOSAL_ITEMS:
+        if doc:
+            have = _project_doc(proj, doc)
+            proposal.append({
+                "key": key, "item": item,
+                "state": "there" if have else "missing",
+                "note": f"`{have.name}`" if have else "not written yet"})
+            continue
+        row = judged.get(key) if isinstance(judged.get(key), dict) else {}
+        state = str(row.get("state") or "").strip().lower()
+        proposal.append({
+            "key": key, "item": item,
+            "state": state if state in STATE_MARK else "missing",
+            "note": _line(row.get("note"), 220) or "not covered yet"})
+    ticked = {_line(t.get("title"), 140).lower(): t
+              for t in (before or {}).get("you", []) if t.get("done")}
+    aria, you, seen = [], [], set()
+    for t in _listy(raw.get("aria"))[:10]:
+        title = _line(t.get("title") if isinstance(t, dict) else t, 140)
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        aria.append({"id": f"a{len(aria) + 1}", "title": title,
+                     "detail": _line(t.get("detail"), 300)
+                     if isinstance(t, dict) else "",
+                     "why": _line(t.get("why"), 200)
+                     if isinstance(t, dict) else ""})
+    for t in _listy(raw.get("you"))[:10]:
+        title = _line(t.get("title") if isinstance(t, dict) else t, 140)
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        was = ticked.get(title.lower(), {})
+        you.append({"id": f"y{len(you) + 1}", "title": title,
+                    "why": _line(t.get("why"), 240)
+                    if isinstance(t, dict) else "",
+                    "prepare": _line(t.get("prepare"), 240)
+                    if isinstance(t, dict) else "",
+                    "done": bool(was), "done_on": was.get("done_on", "")})
+    return {"slug": slug, "proposal": proposal, "aria": aria, "you": you}
+
+
+def business_run(slug, emit=None, cfg=None):
+    """Write (or rewrite) a project's business plan and its action list,
+    from its idea, research and plan — with live web research on the
+    market when the web is on. Returns the files written. The plan is the
+    document the owner approves; if this stage fails the plan still
+    stands."""
+    emit = emit or (lambda ev: None)
+    cfg = cfg or config()
+    proj = _project_dir(slug)
+    idea_f = _project_doc(proj, "idea")
+    plan_f = _project_doc(proj, "proposed-plan")
+    if not plan_f:
+        raise ValueError(f"{slug} has no plan yet — the business plan is "
+                         "written from the idea and its plan; run develop "
+                         "first")
+    idea = parse_note(idea_f)[2].strip() if idea_f else ""
+    plan = parse_note(plan_f)[2].strip()
+    plan = re.sub(r"\n## Review log.*\Z", "", plan, flags=re.S)
+    res_f = _project_doc(proj, "research")
+    known = parse_note(res_f)[2].strip() if res_f else ""
+    folder = plan_f.parent
+    target = resolve_tier("smart", cfg)
+    budget = prompt_budget(cfg)
+    based = cfg.get("based_in", "")
+    where = (f"The owner is based in {based}: name the bodies, "
+             "registrations and rules that apply there."
+             if based else
+             "Where the owner is based is not known: for whatever depends "
+             "on the country (legal form, tax, licences, data protection) "
+             "say that it does, and what to check.")
+    emit({"event": "start", "stage": "business", "count": 1,
+          "log": f"writing the business plan for {slug} with "
+                 f"{target['model']}"})
+    found = research(
+        "market size, customers, competitors and what they charge"
+        + (f", and the rules for a new business in {based}" if based else "")
+        + ", for: " + excerpt(idea or plan, limit=500),
+        emit=emit, pages=2, budget=min(4500, budget // 3))
+    share = max(900, (budget - len(found["block"]) - 2200) // 3)
+    context = ([f"THE IDEA (the owner's words)\n{clip(idea, share)}"]
+               if idea else []) \
+        + [f"THE PROPOSED PLAN\n{clip(plan, share)}"]
+    if known:
+        context.append("RESEARCH ALREADY DONE\n" + clip(known, share))
+    if found["block"]:
+        context.append("LIVE WEB RESEARCH ON THE MARKET (cite as [n])\n"
+                       + found["block"])
+    sections = template_sections("business-plan")
+    half = (len(sections) + 1) // 2
+    written = []
+    for n, part in enumerate((sections[:half], sections[half:]), 1):
+        if not part:
+            continue
+        ask = "\n\n".join(
+            context
+            + (["THE FIRST HALF OF THIS BUSINESS PLAN (written already — "
+                "build on it, do not repeat it)\n"
+                + clip(written[0], share)] if written else [])
+            + [("Begin with one line — > **In one line:** who it is for, "
+                "what they get, and how it earns (or, plainly, that it is "
+                "not a business). Then write " if n == 1 else "Write ")
+               + "these sections:\n\n" + "\n\n".join(
+                   f"## {h}\n({g})" for h, g in part)])
+        emit({"event": "thinking",
+              "label": f"business plan for {slug}, part {n} of 2"})
+        written.append(_sections_only(strip_think(chat_stream(
+            target, ask, BUSINESS_SYSTEM % where,
+            on_token=lambda t: emit({"event": "token", "text": t})))))
+    body = "\n\n".join(w for w in written if w)
+    if len(body) < 400:
+        raise ValueError("the business plan came back empty")
+    today = datetime.date.today().isoformat()
+    title = _project_title(slug, plan)
+    disclaimer = (
+        "> **Drafted by the local engine from live web research.** Claims "
+        "marked [n] cite the sources at the end; everything else is an "
+        "estimate or an assumption to check. Not legal, tax or financial "
+        "advice.\n" if found["sources"] else
+        "> **Drafted by the local engine without web access.** Every "
+        "figure and every claim about the market is the model's own "
+        "estimate — a lead to check, not a finding. Not legal, tax or "
+        "financial advice.\n")
+    out = folder / "business-plan.md"
+    out.write_text(
+        f"---\nslug: {slug}\ntype: business-plan\ncreated: {today}\n"
+        f"updated: {today}\nengine: {target['kind']}:{target['model']}\n"
+        f"---\n\n# Business plan: {title}\n\n{disclaimer}\n{body}\n"
+        + ("\n## Sources\n\n" + format_sources(found["sources"]) + "\n"
+           if found["sources"] else ""), encoding="utf-8")
+    emit({"event": "file_written", "file": f"{slug}/business-plan.md",
+          "log": f"business plan written for {slug}"})
+    files = [out]
+    try:
+        emit({"event": "thinking",
+              "label": f"working out who does what for {slug}"})
+        raw = ask_json(target, "\n\n".join([
+            f"THE PROPOSED PLAN\n{clip(plan, share)}",
+            "THE BUSINESS PLAN\n" + clip(body, max(2400, budget // 2)),
+            "PROPOSAL ITEMS (judge each one)\n" + "\n".join(
+                f"- {key}: {item}" for key, item, doc in PROPOSAL_ITEMS
+                if not doc)]), ACTIONS_SYSTEM,
+            on_token=lambda t: emit({"event": "token", "text": t}))
+        data = _actions_from(raw, slug, before=project_actions(slug))
+        if not data["aria"] and not data["you"]:
+            raise ValueError("no tasks came back")
+        data["made"] = datetime.datetime.now().isoformat(timespec="seconds")
+        data["engine"] = f"{target['kind']}:{target['model']}"
+        files.append(_save_actions(slug, data, folder))
+        emit({"event": "file_written", "file": f"{slug}/action-list.md",
+              "log": f"who does what for {slug}: {len(data['aria'])} for "
+                     f"her, {len(data['you'])} for you; "
+                     + str(sum(1 for p in data["proposal"]
+                               if p["state"] != "there"))
+                     + " proposal item(s) still open"})
+    except Exception as exc:
+        if backend_trouble(exc):
+            raise
+        emit({"event": "error",
+              "log": f"{slug}: the business plan is written, but the list "
+                     f"of who does what could not be made ({exc}) — draft "
+                     f"it again: aria business {slug}"})
+    brain_journal(f"wrote a business plan for [[{slug}]]")
+    emit({"event": "stage_done", "stage": "business",
+          "log": f"business groundwork ready for {slug}"})
+    return files
+
+
+# The app starts a draft and comes back for it: {slug: {running, error,
+# started, finished}}
+BUSINESS_JOBS = {}
+
+
+def business_start(slug, emit=None):
+    """Draft a project's business groundwork in the background."""
+    _project_dir(slug)                           # validates the slug
+    job = BUSINESS_JOBS.get(slug)
+    if job and job.get("running"):
+        return job
+    job = BUSINESS_JOBS[slug] = {"running": True, "error": "", "step": "",
+                                 "started": time.time()}
+
+    def heard(ev):                      # what she is doing, for the app
+        said = ev.get("label") or ev.get("log")
+        if said and ev.get("event") != "token":
+            job["step"] = " ".join(str(said).split())[:200]
+        if ev.get("event") == "error" and "could not be made" in (
+                ev.get("log") or ""):
+            job["error"] = job["step"]
+        if emit:
+            emit(ev)
+
+    def work():
+        try:
+            business_run(slug, heard)
+        except Exception as exc:
+            job["error"] = " ".join(str(exc).split())[:400]
+        job.update(running=False, finished=time.time())
+
+    threading.Thread(target=work, daemon=True).start()
+    return job
+
+
+def project_business(slug, text=True):
+    """What the app's Business tab shows: the plan (its text, unless
+    `text` is False — a poll only needs to know whether it changed) and
+    where it is, the action list, and whether a draft is being written
+    right now."""
+    proj = _project_dir(slug)
+    plan = _project_doc(proj, "business-plan")
+    actions = project_actions(slug)
+    return {"plan": plan.read_text(encoding="utf-8") if plan and text
+            else "",
+            "has_plan": plan is not None,
+            "stamp": int(plan.stat().st_mtime) if plan else 0,
+            "path": str(plan.relative_to(proj)) if plan else "",
+            "actions": actions,
+            "list_path": (str(_project_doc(proj, "action-list")
+                              .relative_to(proj))
+                          if _project_doc(proj, "action-list") else ""),
+            "job": dict(BUSINESS_JOBS.get(slug) or {}),
+            "can_draft": _project_doc(proj, "proposed-plan") is not None}
+
+
+def project_action_done(slug, item_id, done=True):
+    """The owner ticks (or unticks) an item on their own list. Only ever
+    called from the owner's own action — the checkbox, `aria done`, or
+    saying so in chat. A.R.I.A. never ticks an item of theirs."""
+    data = project_actions(slug)
+    if not data:
+        raise ValueError(f"{slug} has no action list yet")
+    item = next((t for t in data["you"] if t["id"] == str(item_id).lower()),
+                None)
+    if item is None:
+        raise ValueError(
+            f"no item {item_id} on your list for {slug} — it has: "
+            + (", ".join(t["id"] for t in data["you"]) or "nothing"))
+    item["done"] = bool(done)
+    item["done_on"] = datetime.date.today().isoformat() if done else ""
+    _save_actions(slug, data)
+    if done:
+        brain_journal(f"you ticked off “{item['title']}” for [[{slug}]]")
+    return item
+
+
+def owner_list_text(slug=""):
+    """What is on the owner's own list — for one project, or all of them —
+    speakable."""
+    slugs = [slug] if slug else [p["slug"] for p in list_projects()]
+    parts = []
+    for s in slugs:
+        data = project_actions(s)
+        todo = [t for t in (data or {}).get("you", []) if not t.get("done")]
+        if not todo:
+            continue
+        parts.append(
+            f"For {s.replace('-', ' ')}, {_count(len(todo), 'thing')} "
+            f"{_is(len(todo))} yours: "
+            + "; ".join(f"{t['id']}, {t['title']}" for t in todo[:5])
+            + (f"; and {len(todo) - 5} more" if len(todo) > 5 else "") + ".")
+    if parts:
+        return " ".join(parts) + (" Tick one off in the app, or say "
+                                  "'done' with its id and the project.")
+    if slug and not project_actions(slug):
+        return (f"{slug.replace('-', ' ')} has no action list yet — say "
+                f"'business plan for {slug}' and I'll write one.")
+    return "Nothing is waiting on your own lists."
 
 
 # ---------------------------------------------------------------- brain
@@ -1586,7 +2118,7 @@ def brain_sync_project(slug):
     vault = _vault()
     proj = _project_dir(slug)
     docs = []
-    for name in ("idea", "research", "proposed-plan", "requirements"):
+    for name in PROJECT_DOCS:
         f = _project_doc(proj, name)
         if f:
             docs.append((name, f.read_text(encoding="utf-8"), False))
@@ -1947,6 +2479,23 @@ INTENT_NEEDS = re.compile(
     r"|waiting (?:on|for)) (?:me|my (?:decision|approval|attention))|"
     r"(?:is there )?anything (?:for me|i need to do|waiting (?:on|for) me)|"
     r"do you need (?:me|anything from me))\s*\??\s*$", re.I)
+# "business plan for the meal planner", "write a business plan for …"
+INTENT_BUSINESS = re.compile(
+    r"^\s*(?:(?:write|draft|make|do|create|plan out)\s+)?(?:me\s+)?"
+    r"(?:(?:a|the)\s+)?business (?:plan|case)\s+(?:for|of|on)\s+(.+?)\s*$",
+    re.I)
+# "what's on my list", "my list for the meal planner", "what do I need to
+# do for …" — the work that takes a person
+INTENT_MYLIST = re.compile(
+    r"^\s*(?:what(?:'s| is) on my (?:own )?(?:list|to-?do(?: list)?)|"
+    r"(?:show (?:me )?)?my (?:own )?(?:list|to-?do(?: list)?|tasks?|part)|"
+    r"what do i (?:need|have) to do|what (?:are|is) my (?:tasks?|part))"
+    r"(?:\s+(?:for|on|in|with)\s+(.+?))?\s*\??\s*$", re.I)
+# "done y2 in the meal planner", "I've done y2 for …", "untick y2 in …"
+INTENT_TICK = re.compile(
+    r"^\s*(?:(?P<un>untick|not done|undo)|i(?:'ve| have)? (?:done|finished|"
+    r"completed)|done|tick(?: off)?|finished|completed)\s+(?:item\s+)?"
+    r"(?P<id>y\d+)\s+(?:in|for|on|of)\s+(?P<proj>.+?)\s*$", re.I)
 INTENT_CHANGES = re.compile(
     r"^\s*(?:what(?:'s| has)? changed (?:in|on|with)|what did you "
     r"(?:do|change|build)(?: (?:in|on|to|for))?|(?:show (?:me )?)?(?:the )?"
@@ -2045,6 +2594,8 @@ def command_phrases(cfg=None):
            "approve task <id> in <project>: <your decision>",
            "skip task <id> in <project>",
            "what needs me", "status of <project>",
+           "business plan for <project>", "what's on my list",
+           "done <id> in <project>",
            "how far along is <project>",
            "what's left on <project>", "what changed in <project>",
            "where is <project>", "open the folder for <project>",
@@ -2216,6 +2767,25 @@ def _detect(text, cfg):
         return {"action": "status", "slug": ""}
     if INTENT_NEEDS.match(text):
         return {"action": "needs"}
+    m = INTENT_TICK.match(text)
+    if m:
+        slug = match_project(m.group("proj"))
+        if slug:
+            return {"action": "tick", "slug": slug,
+                    "id": m.group("id").lower(), "done": not m.group("un")}
+        return {"action": "no-project", "said": m.group("proj").strip()}
+    m = INTENT_MYLIST.match(text)
+    if m:
+        slug = match_project(m.group(1)) if m.group(1) else ""
+        if m.group(1) and not slug:
+            return {"action": "no-project", "said": m.group(1).strip()}
+        return {"action": "mylist", "slug": slug or ""}
+    m = INTENT_BUSINESS.match(text)
+    if m:
+        slug = match_project(m.group(1))
+        if slug:
+            return {"action": "business", "slug": slug}
+        return {"action": "no-project", "said": m.group(1).strip()}
     if INTENT_PROGRESS_ALL.match(text):
         return {"action": "progress", "slug": ""}
     m = INTENT_PROGRESS.match(text)
@@ -2416,6 +2986,35 @@ def perform(intent, source="chat"):
             out["where"] = str(_project_dir(intent["slug"]))
     elif action == "needs":
         out["say"] = workspace_needs_text()
+    elif action == "mylist":
+        out.update(slug=intent.get("slug", ""),
+                   say=owner_list_text(intent.get("slug", "")))
+    elif action == "tick":
+        try:
+            item = project_action_done(intent["slug"], intent["id"],
+                                       done=intent["done"])
+            left = sum(1 for t in project_actions(intent["slug"])["you"]
+                       if not t.get("done"))
+            out.update(slug=intent["slug"], say=(
+                ("Ticked " if intent["done"] else "Unticked ")
+                + f"{item['id']} — {item['title']}. "
+                + (f"{_count(left, 'thing')} left on your list for "
+                   f"{intent['slug'].replace('-', ' ')}." if left else
+                   "That was the last thing on your list for "
+                   f"{intent['slug'].replace('-', ' ')}.")))
+        except ValueError as exc:
+            out["say"] = str(exc)
+    elif action == "business":
+        try:
+            business_start(intent["slug"])
+            out.update(slug=intent["slug"], say=(
+                f"Writing the business plan for "
+                f"{intent['slug'].replace('-', ' ')} now — the plan, what "
+                "a complete proposal still needs, and who does what. It "
+                "takes a few minutes; you'll find it on the project's "
+                "Business tab."))
+        except ValueError as exc:
+            out["say"] = str(exc)
     elif action == "progress":
         out.update(slug=intent.get("slug", ""),
                    say=project_progress_text(intent["slug"])
@@ -3301,6 +3900,14 @@ def approve_project(slug, via="ui"):
     add("Risks", _section(body, "Risks"))
     if len(parts) <= 4:                  # the plan had no usable sections
         add("Goal", body.strip())
+    actions = project_actions(slug)
+    if actions and actions["aria"]:
+        # what she listed for herself beside the build is approved with it
+        add("Business groundwork", (
+            "Beside the build, these are produced as documents under "
+            "`business/` — each one complete enough to act on:\n\n"
+            + "\n".join(f"- **{a['title']}** — {a['detail']}"
+                        for a in actions["aria"])))
     dest = plan.parent / "requirements.md"
     dest.write_text(
         f"---\nslug: {slug}\nstatus: approved\napproved: true\n"
@@ -3361,9 +3968,11 @@ def promote_project(slug):
     docs = dest / "docs"
     docs.mkdir(exist_ok=True)
     for f in sorted(dest.glob("*.md")):
-        if re.match(r"(idea|research|proposed-plan|requirements)"
-                    r"(\.v\d+)?\.md$", f.name):
+        if re.match(r"(" + "|".join(PROJECT_DOCS) + r")(\.v\d+)?\.md$",
+                    f.name):
             f.rename(docs / f.name)
+    if (dest / "actions.json").is_file():
+        (dest / "actions.json").rename(docs / "actions.json")
     req_text = (docs / "requirements.md").read_text(encoding="utf-8")
     title = _project_title(slug, req_text)
     today = datetime.date.today().isoformat()
@@ -3522,7 +4131,14 @@ def list_projects():
                 approved = project_approved(d.name)
             except ValueError:
                 approved = False
+            # open items on the owner's own list
+            listed = _load_actions(d, d.name)
+            mine = sum(1 for t in (listed or {}).get("you", [])
+                       if not t.get("done"))
             out.append({"slug": d.name, "kind": kind, "approved": approved,
+                        "your_list": mine,
+                        "has_business": _project_doc(d, "business-plan")
+                        is not None,
                         "autopilot": state.get("status", "idle"),
                         "iteration": state.get("iteration", 0),
                         "phase": state.get("phase", ""),
@@ -3671,6 +4287,13 @@ def workspace_needs_text():
         parts.append(f"{_count(len(unclear), 'note')} in the inbox "
                      f"{'has' if len(unclear) == 1 else 'have'} questions "
                      "for you.")
+    mine = sum(p["your_list"] for p in projects)
+    if mine:        # not waiting on a decision — but only they can do it
+        listed = [p["slug"].replace("-", " ") for p in projects
+                  if p["your_list"]]
+        parts.append(f"On your own {'list' if len(listed) == 1 else 'lists'} "
+                     f"({', '.join(listed[:3])}): {_count(mine, 'thing')} "
+                     "only you can do — say 'what's on my list'.")
     if not parts:
         return "Nothing needs you right now."
     return " ".join(parts) + (" Approvals and decisions are yours to make "
@@ -4291,7 +4914,8 @@ def autopilot_busy():
 
 # ---------------------------------------------------------------- config edit
 
-_BOOL_KEYS = {"auto_pipeline", "web_access", "github_access",
+_BOOL_KEYS = {"auto_pipeline", "business_plans", "web_access",
+              "github_access",
               "brain_journal", "autopilot_git", "autopilot_refine",
               "desktop_notifications", "giants_free_memory"}
 _CHOICE_KEYS = {
@@ -4316,7 +4940,7 @@ _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "promotion_target", "giant_general", "giant_research",
               "giant_coder", "giants_flags", "editor", "terminal",
               "heartbeat_url", "voice_name", "alexa_url",
-              "alexa_skill_id"}
+              "alexa_skill_id", "based_in"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 

@@ -11,6 +11,11 @@ itself and hands everything below to this script:
                                  autopilot is doing
   open <slug> [folder|editor|terminal]   open a project on your desktop
   approve <slug>                 THE HUMAN GATE: approve a proposed plan
+  business <slug>                write (or rewrite) a project's business
+                                 plan and who-does-what
+  mylist [slug]                  what is on YOUR list — the work that takes
+                                 a person
+  done <slug> <id>               tick an item on your list (undone unticks)
   adopt <repo|folder> "goal"     put an existing codebase under autopilot
   autopilot <slug> start|stop|status|run|steer "guidance"
   autopilot <slug> approve-task <id> ["your decision"]
@@ -195,6 +200,64 @@ def cmd_approve(args):
     path = eng.approve_project(args[0], via="cli")
     print(f"approved -> {path}")
     print(f"start work with: aria autopilot {args[0]} start")
+
+
+def cmd_business(args):
+    """The business side of a project: its plan, what a complete proposal
+    still needs, and who does what."""
+    need(args, 1, "business <slug>")
+    slug = eng.match_project(args[0]) or args[0]
+
+    def say(ev):
+        if ev.get("log") and ev.get("event") != "token":
+            print(("! " if ev.get("event") == "error" else "· ")
+                  + ev["log"], flush=True)
+
+    for f in eng.business_run(slug, say):
+        print(f"wrote {f}")
+    data = eng.project_actions(slug)
+    if data:
+        missing = [p["item"] for p in data["proposal"]
+                   if p["state"] == "missing"]
+        if missing:
+            print("\nstill missing for a complete proposal: "
+                  + "; ".join(missing))
+        print(f"\n{len(data['aria'])} thing(s) are hers, {len(data['you'])} "
+              f"are yours — see them with: aria mylist {slug}")
+
+
+def cmd_mylist(args):
+    slug = (eng.match_project(args[0]) or args[0]) if args else ""
+    slugs = [slug] if slug else [p["slug"] for p in eng.list_projects()
+                                 if p["your_list"]]
+    shown = False
+    for s in slugs:
+        data = eng.project_actions(s)
+        if not data:
+            if slug:
+                print(f"{s} has no action list yet — write one with: "
+                      f"aria business {s}")
+            continue
+        shown = True
+        print(f"{s}")
+        for t in data["you"]:
+            print(f"  [{'x' if t.get('done') else ' '}] {t['id']:4} "
+                  f"{t['title']}"
+                  + (f"\n         she can prepare: {t['prepare']}"
+                     if t.get("prepare") and not t.get("done") else ""))
+    if not shown and not slug:
+        print("nothing is waiting on your own lists")
+
+
+def cmd_done(args, done=True):
+    need(args, 2, ("done" if done else "undone") + " <slug> <id>")
+    slug = eng.match_project(args[0]) or args[0]
+    item = eng.project_action_done(slug, args[1], done=done)
+    print(("ticked: " if done else "unticked: ") + item["title"])
+
+
+def cmd_undone(args):
+    cmd_done(args, done=False)
 
 
 def cmd_adopt(args):

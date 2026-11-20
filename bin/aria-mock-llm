@@ -30,6 +30,8 @@ Environment:
   MOCK_HARD      the planner marks one first-batch task as "hard"
   MOCK_NO_ROADMAP  the planner cannot produce a roadmap (answers nonsense)
   MOCK_NO_PLAN   the planner answers in prose where a plan was asked for
+  MOCK_NO_BUSINESS  the business plan comes back as one useless sentence
+  MOCK_NO_ACTIONS   "who does what" comes back as prose, not JSON
   MOCK_NO_REACHED  the planner never reports a milestone as reached
   MOCK_FAIL_ALL  the reviewer rejects everything (every batch is a dry one)
   MOCK_LOADED    comma-separated models Ollama "has in memory" (/api/ps)
@@ -405,6 +407,59 @@ def roadmap(prompt):
     return {"milestones": road}
 
 
+def business_plan(prompt):
+    """The sections the prompt asks for, each with a few lines of filler
+    that show their arithmetic — and the one-line summary when asked."""
+    if os.environ.get("MOCK_NO_BUSINESS"):
+        return "I am not able to write that."
+    asked = prompt.split("these sections:")[-1]
+    heads = re.findall(r"^## (\d+\. [^\n]+)$", asked, re.M)
+    out = []
+    if "Begin with one line" in prompt:
+        out.append("> **In one line:** For people who keep thousands of "
+                   "photos: files named by the day they were taken, as a "
+                   "small paid tool.")
+    for h in heads:
+        out.append(f"## {h}\n\nFor this project: an estimate, not a "
+                   "finding. 40 customers x 9 a month = 360 a month, which "
+                   "rests on the assumption that one in fifty who try it "
+                   "pay. What is not known yet: whether they would.")
+    return "\n\n".join(out)
+
+
+def who_does_what(prompt):
+    keys = re.findall(r"^- (\w+): ", prompt.split("PROPOSAL ITEMS")[-1], re.M)
+    states = ("assumed", "missing", "there")
+    return {
+        "proposal": {k: {"state": states[i % 3],
+                         "note": f"see the business plan on {k}"}
+                     for i, k in enumerate(keys)},
+        "aria": [
+            {"title": "Compare the alternatives",
+             "detail": "business/competitors.md: five alternatives, what "
+                       "each costs and where it falls short",
+             "why": "the price has to sit somewhere"},
+            {"title": "Work out the break-even",
+             "detail": "business/break-even.md: fixed costs, margin per "
+                       "sale, sales needed a month", "why": "the money"},
+            {"title": "Draft the interview guide",
+             "detail": "business/interview-guide.md: ten questions about "
+                       "the last time the problem happened",
+             "why": "evidence of the problem"},
+            {"title": "Draft the privacy notice",
+             "detail": "business/privacy-notice.md", "why": "the rules"}],
+        "you": [
+            {"title": "Talk to five people who have this problem",
+             "why": "only a person can have that conversation",
+             "prepare": "the interview guide"},
+            {"title": "Choose the name",
+             "why": "it is your brand", "prepare": "a shortlist with the "
+             "domains that are free"},
+            {"title": "Decide whether to register a company",
+             "why": "a legal act", "prepare": "what each form means for "
+             "tax and liability"}]}
+
+
 def review(prompt):
     """A code review of one file: the core module could document itself
     better; everything else is fine as it is."""
@@ -544,6 +599,12 @@ def reply_for(system, prompt):
         return json.dumps({"queries": [" ".join(words) or "idea prior art"]})
     if "lead planner, about to run a project autonomously" in s:
         return assessment(p)
+    if "You write the business plan for a project idea" in s:
+        return business_plan(p)
+    if "into who does what" in s:
+        if os.environ.get("MOCK_NO_ACTIONS"):
+            return "The lists are in my head; I would rather talk it through."
+        return json.dumps(who_does_what(p))
     if "Lay out the WHOLE road" in s:
         return json.dumps(roadmap(p))
     if "You are the project planner inside A.R.I.A." in s:

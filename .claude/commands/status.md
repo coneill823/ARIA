@@ -21,7 +21,10 @@ Render the A.R.I.A. pipeline dashboard.
 Output, in order:
 
 - **Needs you** — unclear items with their questions, and proposed plans
-  awaiting review. This is the actionable section; lead with it.
+  awaiting review. This is the actionable section; lead with it. After
+  those, the open items under *Your part* in each project's
+  `action-list.md` (one line per project: how many, and the first two) —
+  work only the owner can do. Never tick one for them.
 - **In flight** — counts per stage, each item with its age (days since
   `captured`). Flag anything older than 14 days as stalled.
 - **Active projects** — one line each: phase, progress, last update.

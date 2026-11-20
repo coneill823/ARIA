@@ -851,7 +851,13 @@ def main():
             f.write(f"---\nslug: {slug}\nstatus: processing\ntype: project\n"
                     f"captured: 2026-11-14\n---\n\n## Raw capture\n\n"
                     "build a tiny script that sorts my downloads folder\n")
-        eng.develop_run(quiet, slugs=[slug])
+        set_config(sandbox, business_plans="false")    # checked on its own
+        try:
+            eng.develop_run(quiet, slugs=[slug])
+        finally:
+            set_config(sandbox, business_plans="true")
+        assert not eng.project_business(slug)["has_plan"], \
+            "a business plan was written with business plans switched off"
         research = open(os.path.join(
             sandbox, "pipeline/02-potential-projects", slug,
             "research.md")).read()
@@ -875,8 +881,97 @@ def main():
                     os.path.join(proj, "proposed-plan.md"))
         shutil.copy(os.path.join(proj, "research.v1.md"),
                     os.path.join(proj, "research.md"))
+        for name in ("business-plan", "action-list"):   # kept as versions too
+            old = os.path.join(proj, name + ".v1.md")
+            assert not os.path.exists(os.path.join(proj, name + ".md")), \
+                f"{name}.md was left in place by a refinement"
+            if os.path.isfile(old):
+                shutil.copy(old, os.path.join(proj, name + ".md"))
         return "feedback attached, plan versioned, idea requeued"
     check("refine loop", c_refine)
+
+    def c_business():
+        """The business side of an idea, written beside its plan: a
+        business plan, what a complete proposal still needs, and who does
+        what — her part, and the owner's, which only the owner ticks."""
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        slug = state["slug"]
+        proj = eng._project_dir(slug)
+        plan = eng._project_doc(proj, "business-plan")
+        assert plan, "develop wrote no business plan beside the plan"
+        text = plan.read_text()
+        heads = [ln[3:] for ln in text.splitlines() if ln.startswith("## ")]
+        asked = [h for h, _ in eng.template_sections("business-plan")]
+        assert len(asked) == 12, "the business-plan template changed shape"
+        if MOCK:
+            assert heads[:12] == asked, heads
+            assert "> **In one line:**" in text
+        else:
+            assert len(heads) >= 6, f"only {len(heads)} sections came back"
+        assert "Not legal, tax or financial advice" in text
+        # the template Claude Code fills in and the list the engine judges
+        # are the same list
+        template = open(os.path.join(sandbox, "system", "templates",
+                                     "action-list.md")).read()
+        for _key, item, _doc in eng.PROPOSAL_ITEMS:
+            assert f"| {item} |" in template, \
+                f"the action-list template lacks “{item}”"
+        actions = eng.project_actions(slug)
+        if not actions and not MOCK:
+            return (f"business plan written ({len(heads)} sections); this "
+                    "model did not manage the who-does-what list — a "
+                    f"stronger smart tier will, or: aria business {slug}")
+        assert actions, "no action list was written"
+        assert [p["key"] for p in actions["proposal"]] == \
+            [k for k, _, _ in eng.PROPOSAL_ITEMS], "a proposal item is missing"
+        assert actions["proposal"][0]["state"] == "there"
+        assert actions["aria"] or actions["you"]
+        listed = eng._project_doc(proj, "action-list")
+        ticked = ""
+        if actions["you"]:
+            first = actions["you"][0]["id"]
+            # the owner ticks — by saying so, here
+            got = eng.detect_intent(f"done {first} in {slug}")
+            assert got == {"action": "tick", "slug": slug, "id": first,
+                           "done": True}, got
+            said = eng.perform(got)["say"]
+            assert said.startswith("Ticked " + first), said
+            assert f"- [x] **{first} — " in listed.read_text()
+            assert next(p for p in eng.list_projects()
+                        if p["slug"] == slug)["your_list"] == \
+                len(actions["you"]) - 1
+            # the list read back from its markdown alone (the form Claude
+            # Code's planner writes) is the same list, tick included
+            data = eng._actions_file(proj)
+            keep = data.read_text()
+            data.unlink()
+            again = eng.project_actions(slug)
+            assert again and [t["id"] for t in again["you"]] == \
+                [t["id"] for t in actions["you"]] and again["you"][0]["done"]
+            data.write_text(keep)
+            eng.project_action_done(slug, first, done=False)
+            ticked = "; your ticks are kept in both files"
+            assert "yours" in eng.owner_list_text(slug)
+        if actions["aria"]:
+            try:                        # her items are not the owner's to tick
+                eng.project_action_done(slug, actions["aria"][0]["id"])
+                raise AssertionError("an item of hers was ticked as yours")
+            except ValueError:
+                pass
+        assert ap._protected("docs/actions.json") \
+            and ap._protected("docs/business-plan.md") \
+            and not ap._protected("business/competitors.md"), \
+            "agents could overwrite the business plan or your list"
+        got = eng.detect_intent(f"business plan for {slug}")
+        assert got == {"action": "business", "slug": slug}, got
+        assert eng.detect_intent("what's on my list") == \
+            {"action": "mylist", "slug": ""}
+        return (f"a business plan in {len(heads)} sections beside the plan; "
+                f"{len(actions['proposal'])} proposal items judged; "
+                f"{len(actions['aria'])} thing(s) for her, "
+                f"{len(actions['you'])} for you" + ticked)
+    check("business plan + who does what", c_business)
 
     def c_brain():
         if "slug" not in state:
@@ -1328,8 +1423,19 @@ def main():
         text = req.read_text()
         assert "approved: true" in text and "approved_via: selftest" in text
         assert eng.project_approved(slug)
+        mine = eng.project_actions(slug) or {}
+        if mine.get("aria"):
+            # approving the plan approves her part of the groundwork with
+            # it — and never the owner's own list
+            assert "## Business groundwork" in text \
+                and mine["aria"][0]["title"] in text, \
+                "her part of the groundwork did not join the requirements"
+            assert not any(t["title"] in text for t in mine.get("you", [])), \
+                "the owner's own list was written into the requirements"
         return "unapproved plans cannot start or be promoted; approval " \
-               "writes requirements.md"
+               "writes requirements.md" + (
+                   " (with her part of the business groundwork)"
+                   if mine.get("aria") else "")
     check("the human gate", c_gate)
 
     def c_autopilot():

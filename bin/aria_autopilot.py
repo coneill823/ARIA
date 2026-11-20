@@ -77,7 +77,12 @@ SKIP_DIRS = {"autopilot", ".aria", ".git", "node_modules", "__pycache__",
 PROTECTED = ("autopilot/", ".aria/", ".git/", ".claude/", "docs/requirements.md",
              "docs/idea.md", "docs/research.md", "docs/proposed-plan.md",
              "requirements.md", "idea.md", "research.md", "proposed-plan.md",
-             "CLAUDE.md")
+             # the business plan as it was approved, and the owner's own
+             # list (its ticks are theirs): what she writes for the
+             # business side goes under business/
+             "docs/business-plan.md", "docs/action-list.md",
+             "docs/actions.json", "business-plan.md", "action-list.md",
+             "actions.json", "CLAUDE.md")
 TEXT_SUFFIXES = {
     ".md", ".txt", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
     ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".html", ".htm",
@@ -1603,6 +1608,14 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             "these again, and plan nothing that needs their outcome)\n"
             + "\n".join(f"- {t['title']}" for t in plan["tasks"]
                         if t["id"] in held))
+    listed = eng.project_actions(slug)
+    if listed and listed["you"]:
+        sections.append(
+            "THE OWNER'S OWN LIST (work that takes a person — never plan "
+            "it, and plan nothing that assumes an open item is done. "
+            "✔ = they have done it)\n" + "\n".join(
+                f"{'✔' if t.get('done') else '○'} {t['title']}"
+                for t in listed["you"][:10]))
     unstarted = [t for t in plan["tasks"]
                  if t["status"] == "todo" and t["id"] not in held]
     if replace_unstarted and unstarted:
@@ -3809,6 +3822,7 @@ def view(slug):
         # measured seconds of work per unit of the planner's size estimate
         # (0 until a task has finished): what predictions are scaled by
         "pace": pace,
+        "business": eng.project_business(slug, text=False),
         "changes": eng.project_changes(slug, limit=300),
         "changes_total": _count_lines(auto / "changes.jsonl"),
         "activity": activity(slug) if auto.is_dir() else [],
