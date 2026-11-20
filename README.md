@@ -163,6 +163,13 @@ a small model may get nothing verified in that time — the check says so
 the loop doing its job. What it tells you is that the **smart** tier
 deserves a stronger model.
 
+A run on your own models is a check, not a night's work: one autopilot
+step is given 30 minutes (`ARIA_TEST_STEP_MINUTES`), and a step that
+fails or runs out of time is reported with its reason — the model's own
+error, how fast it was answering, how much of it is on the graphics
+card. If your running A.R.I.A. has a giant loaded, the test says so at
+the top: free it first for a fair run (`bin/aria models unload`).
+
 If the only failure is **backends reachable**, the model server is not
 running: `sudo systemctl enable --now ollama` (or `ollama serve`).
 
@@ -259,6 +266,10 @@ at the bottom to ask or tell her something without leaving.
 The orb sits behind the conversation and shows what she is doing: idle,
 listening, thinking, speaking — it moves with her voice and with yours.
 
+- **She answers straight away.** A model that reasons at length before
+  it answers (qwen3 and its kind) is asked for the answer alone in chat,
+  so a reply starts in a second or two rather than after a minute of
+  thought (`thinking`, Settings → Models).
 - **She answers while she works.** Autopilot and the chat share the same
   model server, and a server answers one thing at a time. Questions about
   progress — *how far along is…*, *what needs me*, *status of…* — are

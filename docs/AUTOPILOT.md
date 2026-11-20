@@ -307,6 +307,9 @@ memory.
 | The model server is down or drops the connection | Waits and retries with a growing pause (30 s up to 15 min). The task is not counted as failed and nothing is lost. |
 | A model stays silent | Fast and smart tiers are abandoned after `autopilot_idle_minutes` and retried. The deep tier and hand-picked models are never cut off. |
 | Work is rejected | Rolled back, retried with the reviewer's critique; failed after three attempts. Tasks that depended on it are skipped and the planner is told why. |
+| A model reasons until its window is full, and its answer is cut off | She asks again for the answer alone, and says so in the log. |
+| A reply is cut off all the same — the window is too small for it | A task's attempt is rolled back and retried with "write less"; a plan stops the step with the reason and the remedy (a larger `context_tokens`). Nothing half-written is kept. |
+| A step fails for any other reason | The reason is written in the log and on the project's status line, and the step is tried again after a pause that grows (30 s up to 15 min). Five failures in a row and she pauses herself, saying why. |
 | Work is rejected twice on an everyday model | The last attempt goes to the giant that fits the work (unless `giants_use: never`, or you have none). The card says why it moved. |
 | A change breaks tests that passed | Rejected like any other, with the failing test output as the critique. |
 | A giant model is still downloading, or fails to load | The task runs on the smart tier instead and says so; the giant joins in once its files are complete. New tasks go to the next giant that fits — with no coder giant set up, hard coding work goes to the general one. |
@@ -384,6 +387,18 @@ never blocks triage, chat or missions; it shares only the hardware.
 - **`context_tokens`** (default 8192) is requested from Ollama for every
   call and prompts are sized to it. Ollama's own default silently cuts
   long prompts — raise this if your model and VRAM allow.
+- **Models that reason first** (qwen3, deepseek-r1 and their kind think
+  at length before they answer). The reasoning costs time, and it shares
+  the window with the prompt and the answer: a plan reasoned about for
+  two thousand tokens that then has no room to be written down is no
+  plan. With `thinking: auto` (the default) chat, triage and summaries
+  are asked for the answer alone, so they stay quick; plans, reviews and
+  tasks on the smart tier reason only when the window has room for both
+  — at 8192 that is the small calls, at `context_tokens: 16384` nearly
+  all of them. The deep tier, models you name yourself and the giants
+  are left alone. `always` leaves every model to itself; `never` asks
+  for the answer alone everywhere. Her reasoning shows in the Live tab,
+  marked off from her answer.
 - **Budgets and the stall limit** (Settings → Autopilot) bound a run you
   leave for days: hours, batches, tasks, and how many batches may
   complete nothing before she pauses herself. All off or lenient by

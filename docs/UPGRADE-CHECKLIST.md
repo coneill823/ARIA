@@ -45,6 +45,12 @@ tell you what success looks like before moving on.
 - [ ] If chat quality matters more than snappiness: also set
       **fast:** `ollama/qwen3:30b` (MoE, only 3B active — still quick);
       revert to `ollama/llama3.1:8b` if it feels sluggish
+- [ ] qwen3 reasons before it answers. On the default setting
+      (`thinking: auto`) chat and triage skip the reasoning and stay
+      quick, and plans and reviews reason when the window has room. To
+      let her think on the big calls too, give her a larger window —
+      ⚙ Settings → Models → Context window `16384` — if `ollama ps`
+      still shows most of the model on the GPU afterwards
 
 ## Stage 2 — deep tier: gpt-oss:120b (~65GB download, fits RAM+VRAM)
 - [ ] `ollama pull gpt-oss:120b`

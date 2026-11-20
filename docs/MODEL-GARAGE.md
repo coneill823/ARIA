@@ -110,8 +110,9 @@ What then happens on its own:
   place of "ready to load", `aria models` and `aria doctor` say the same,
   and the giants are not offered to the planner. `bin/aria llama install`
   builds it.
-- **Idle.** `giants_idle_minutes` unloads a giant nobody has used for that
-  long; 0 keeps the last one in memory.
+- **Idle.** A giant nobody has used for `giants_idle_minutes` (20 by
+  default) is unloaded, so it does not sit on the memory while nothing
+  needs it; 0 keeps the last one in memory.
 
 If a load runs out of VRAM beside your everyday Ollama model, give the
 giants fewer GPU layers: `bin/aria settings set giants_flags -ngl 20`.
