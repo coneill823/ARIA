@@ -54,11 +54,11 @@ const modelName = spec => {
   const g = GIANT.exec(spec || '');
   return g ? g[1] + ' giant' : (spec || '').replace(/^ollama\//, '');
 };
-// how long a task takes on the chart: measured, else predicted from the
-// measured pace, else (nothing has finished yet) the planner's own guess
+// how long a task takes on the chart: measured, else what tasks on its
+// model have been measured to take on this machine (the server's forecast)
 const taskSecs = t => t.took || (['inprogress', 'reviewing'].includes(t.status)
     ? Math.max(t.elapsed || 0, t.predict || 0) : 0)
-  || t.predict || (t.est_hours || 1) * (data.pace || 3600);
+  || t.predict || (data.forecast || {}).per_task || 420;
 const timeNote = t => t.took ? 'took ' + fmtDur(t.took)
   : ['inprogress', 'reviewing'].includes(t.status) && t.elapsed
     ? fmtDur(t.elapsed) + ' so far' + (t.predict ? ' (≈ ' + fmtDur(t.predict) + ')' : '')
@@ -597,15 +597,18 @@ function gantt() {
   // The road ahead: a milestone in progress runs from its first task to
   // the end of what is planned plus what is still unplanned; one not yet
   // started begins when everything it waits for has ended.
-  const finished = all.filter(t => t.status === 'done' && t.took);
-  const perTask = finished.length ? finished.reduce((n, t) => n + t.took, 0) / finished.length
-                                  : (data.pace || 3600);
+  // How long the work nobody has planned yet will take comes from the
+  // server: tasks measured on this machine, the planning and checking that
+  // goes with each, and how many tasks a milestone really takes.
+  const fc = data.forecast || {};
+  const perTask = (fc.per_task || 420) + (fc.overhead || 0);
   let roadLeft = 0;
   for (const m of ahead) {               // roadmap order: what it waits for comes first
     const key = 'ms:' + m.id;
     const mine = tasks.filter(t => t.milestone === m.id && end[t.id] !== undefined);
     const waits = m.depends_on.map(d => end['ms:' + d]).filter(v => v !== undefined);
-    const unplanned = Math.max(mine.length ? 0 : 1, (m.est_tasks || 3) - m.done - m.open) * perTask;
+    const unplanned = m.left != null ? m.left
+      : Math.max(mine.length ? 0 : 1, (m.est_tasks || 3) - m.done - m.open) * perTask;
     if (mine.length) {
       start[key] = Math.min(...mine.map(t => start[t.id]));
       end[key] = Math.max(offset, ...mine.map(t => end[t.id])) + unplanned;
@@ -791,11 +794,16 @@ function gantt() {
     ahead.length ? h('span', {}, h('i', { style: { background: 'rgba(143,107,196,.12)', border: '1px dashed #8f6bc4', borderRadius: '6px' } }), 'milestone ahead') : null,
     tasks.some(t => t.needs_human) ? h('span', {}, h('i', { style: { background: 'rgba(251,191,36,.14)', border: '1px dashed #fbbf24' } }), 'needs you') : null,
     h('span', {}, '→ waits for'));
-  const pace = h('div', { class: 'gantt-pace' }, data.pace
-    ? [h('b', { text: fmtDur(spent) }), ' of work done',
-       left + roadLeft > 0 ? [' · about ', h('b', { text: fmtDur(left + roadLeft) }), ' to the goal at the pace measured so far'] : null,
-       h('span', { class: 'hint', text: ' — newest on top; a finished bar is as long as the task took, the rest are predicted from that.' })]
-    : h('span', { class: 'hint', text: 'Newest on top. Nothing has finished yet, so these lengths are the planner\'s own guess — measured times replace them as tasks complete.' }));
+  // the estimate, its slow case, and what it is made from
+  const togo = fc.seconds || 0, slow = fc.slow || 0;
+  const pace = h('div', { class: 'gantt-pace', id: 'gantt-pace' },
+    spent ? [h('b', { text: fmtDur(spent) }), ' of work done · '] : null,
+    togo > 0 ? ['about ', h('b', { text: fmtDur(togo) }), ' to the goal',
+                slow > togo * 1.15 ? [', up to ', h('b', { text: fmtDur(slow) }), ' if it goes slowly'] : null]
+             : (spent ? 'nothing further is planned' : null),
+    h('span', { class: 'hint', title: 'Working time: planning, checking and retries included; waiting for you, or for a model server that is away, is not.',
+      text: (fc.rests_on ? ' — from ' + fc.rests_on : '')
+        + '. Newest on top; a finished bar is as long as the task took.' }));
   host.append(options, legend, pace, svg);
   return host;
 }

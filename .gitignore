@@ -14,3 +14,5 @@ system/garage/
 system/config.local.yml
 system/config.backup-*.yml
 system/server.json
+system/pace.json
+system/pace.lock

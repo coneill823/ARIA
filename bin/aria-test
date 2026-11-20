@@ -267,6 +267,12 @@ def main():
                                                       "voice-token",
                                                       "garage",
                                                       "server.json",
+                                                      # how fast the real
+                                                      # machine is: the
+                                                      # checks measure
+                                                      # their own
+                                                      "pace.json",
+                                                      "pace.lock",
                                                       "config.backup-*"))
     os.makedirs(os.path.join(sandbox, "docs"))      # her window's icon
     shutil.copy2(os.path.join(REAL_ROOT, "docs", "aria-icon.svg"),
@@ -1708,6 +1714,75 @@ def main():
                 "a file changed twice shows each change as previous | "
                 "modified")
     check("autopilot — history is kept", c_history)
+
+    def c_pace():
+        """Time estimates rest on what this machine has measured — every
+        finished task, the planning and checking around it, how many tasks
+        a milestone really took — and say so. With nothing measured they
+        are a stated first guess, not the planner's own hours."""
+        if not MOCK:
+            raise SkipTest("needs --mock (runs a whole project)")
+        slug = state.get("active")
+        if not slug:
+            raise SkipTest("autopilot check failed earlier")
+        book = json.load(open(os.path.join(sandbox, "system", "pace.json")))
+        mine = [t for t in book["tasks"] if t["project"] == slug]
+        assert mine and all(t["seconds"] > 0 and t["model"] for t in mine), \
+            "finished tasks are not on the machine's record"
+        assert {s["kind"] for s in book["steps"]} >= \
+            {"assessed", "mapped", "replanned", "reflected"}, \
+            "planning and memory steps are not on the record"
+        assert ap._state(slug).get("overhead_seconds", 0) > 0
+        fc = ap.view(slug)["forecast"]
+        assert fc["basis"] in ("project", "machine") and fc["measured"] \
+            and fc["rests_on"], fc
+        # a machine with no record: a first guess, and it says so
+        real, ap.PACE_FILE = ap.PACE_FILE, ap.PACE_FILE.with_name(
+            "pace-none.json")
+        try:
+            fresh = ap.Pace("nobody", [], {})
+            typical, slow, basis = fresh.task("ollama/llama3.1:8b")
+            giant = fresh.task("giant/general")
+            assert (typical, basis) == (ap.FIRST_GUESS["everyday"], "guess") \
+                and slow > typical and giant[0] == ap.FIRST_GUESS["giant"]
+            assert "first guess" in fresh.rests_on()
+            # history from elsewhere on this machine is used straight away,
+            # per model: a giant is not estimated from the everyday model
+            ap._pace_note("tasks", {"project": "a", "model": "giant/general",
+                                    "agent": "coder", "seconds": 3000,
+                                    "attempts": 1, "ok": True})
+            for n in (200, 220, 240, 100):
+                ap._pace_note("tasks", {
+                    "project": "a", "model": "ollama/llama3.1:8b",
+                    "agent": "coder", "seconds": n, "attempts": 1,
+                    "ok": n != 100})
+            for _ in range(3):
+                ap._pace_note("milestones", {"project": "a", "est": 2,
+                                             "tasks": 4})
+            ap._pace_note("steps", {"project": "a", "kind": "replanned",
+                                    "seconds": 250})
+            seen = ap.Pace("b", [], {})
+            typical, slow, basis = seen.task("ollama/llama3.1:8b", "coder")
+            assert basis == "machine" and typical == 190 and slow >= 240, \
+                (typical, slow, basis)
+            assert seen.task("giant/general")[0] > 2000, \
+                "a giant was estimated from the everyday model"
+            more, again = seen.more_tasks()
+            assert more == 2.0 and again > 1.2, (more, again)
+            assert seen.overhead(typical) == 50, seen.overhead(typical)
+            assert "measured on this machine" in seen.rests_on()
+        finally:
+            for f in (ap.PACE_FILE, ap.PACE_FILE.with_name("pace.lock")):
+                if f.name != "pace.lock":
+                    f.unlink(missing_ok=True)
+            ap.PACE_FILE = real
+        said = eng.project_progress_text(slug)
+        return (f"{len(book['tasks'])} tasks and {len(book['steps'])} "
+                "planning steps on record; estimates come from them (per "
+                "model, with the planning around each task and the "
+                "planner's undercount), and a machine with no record says "
+                "its estimate is a first guess")
+    check("time estimates — from what was measured", c_pace)
 
     def c_run_sandbox():
         """Code a model wrote is run without being trusted: the project's

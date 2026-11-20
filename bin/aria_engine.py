@@ -4246,8 +4246,18 @@ def project_progress_text(slug):
     if pr["reached"] == pr["total"]:
         say += " The whole road is behind me."
     elif pr["eta"] and pr["remaining_tasks"]:
+        # measured time, with the slow case said too: an estimate that is
+        # only ever the best case is the one that gets missed
+        slow = _spoken_time(pr.get("eta_slow") or 0)
+        usual = _spoken_time(pr["eta"])
         say += (f" That is roughly {_count(pr['remaining_tasks'], 'task')} "
-                f"— {_spoken_time(pr['eta'])} of work at the pace so far.")
+                f"— {usual} of work"
+                + (f", {slow.replace('about ', 'up to ')} if it goes slowly"
+                   if slow != usual else "")
+                + (" — a first guess; nothing has been measured on this "
+                   "machine yet." if pr.get("basis") == "guess" else
+                   f", going by {pr['rests_on']}."
+                   if pr.get("rests_on") else "."))
     if pr["status"] == "running" and pr["now"]:
         say += f" Right now I'm on: {pr['now']['title']}."
     elif pr["status"] != "running":
