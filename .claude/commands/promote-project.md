@@ -20,6 +20,8 @@ Steps:
 2. Move the whole project folder to `<target>/$ARGUMENTS/` and reorganize:
    - `docs/idea.md`, `docs/research.md`, `docs/proposed-plan.md`,
      `docs/requirements.md` (requirements stay the source of truth)
+   - `docs/business-plan.md`, `docs/action-list.md` and, if the app wrote
+     one, `docs/actions.json` — the business groundwork travels with it
 3. Scaffold the Project Manager from `system/templates/pm-claude.md` →
    `<target>/$ARGUMENTS/CLAUDE.md`, filling every `{{PLACEHOLDER}}` from the
    requirements: project name, one-liner, deliverables, milestone summary,

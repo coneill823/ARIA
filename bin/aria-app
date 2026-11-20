@@ -121,21 +121,37 @@ def run_qt(url):
         except ImportError:
             return False
 
-    if os.geteuid() == 0:                 # Chromium refuses its sandbox
-        os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
+    # The self-test's probe: a window built off-screen to prove it shows
+    # the app. It is a stranger to the owner's real window — it must not
+    # take over that window's place, its saved size or its stored pages.
+    selftest = bool(os.environ.get("ARIA_APP_SELFTEST"))
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    if os.geteuid() == 0 and "--no-sandbox" not in flags:
+        flags.append("--no-sandbox")      # Chromium refuses its sandbox
+    if selftest:
+        # No screen: where there is a graphics card Chromium would still
+        # try to bring its GPU up — against a display that is not there —
+        # and never get as far as loading the page. Software rendering
+        # asks nothing of the machine.
+        if "--disable-gpu" not in flags:
+            flags.append("--disable-gpu")
+        os.environ.setdefault("QT_QUICK_BACKEND", "software")
+    if flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags)
     app = QtWidgets.QApplication([sys.argv[0]])
     app.setApplicationName("ARIA")                 # X11 WM_CLASS
     app.setApplicationDisplayName("A.R.I.A.")
     app.setOrganizationName("aria")
     QtGui.QGuiApplication.setDesktopFileName("aria")   # Wayland app id
-    icon = QtGui.QIcon(str(ICON))
+    icon = QtGui.QIcon(str(ICON)) if ICON.is_file() else QtGui.QIcon()
     app.setWindowIcon(icon)
 
     # one window: a second launch brings the first one forward
-    key = "aria-app-" + str(os.getuid())
+    key = "aria-app-" + str(os.getuid()) \
+        + (f"-selftest-{os.getpid()}" if selftest else "")
     probe = QtNetwork.QLocalSocket()
     probe.connectToServer(key)
-    if probe.waitForConnected(300) and not os.environ.get("ARIA_APP_SELFTEST"):
+    if probe.waitForConnected(300):
         probe.write(url.encode())
         probe.waitForBytesWritten(500)
         return True
@@ -143,8 +159,11 @@ def run_qt(url):
     listener = QtNetwork.QLocalServer()
     listener.listen(key)
 
-    profile = QWebEngineProfile("aria", app)       # named: it keeps your
-    profile.setHttpUserAgent(                      # chats between launches
+    # named: it keeps your chats between launches (the probe's is unnamed,
+    # which Qt keeps in memory only)
+    profile = QWebEngineProfile(app) if selftest \
+        else QWebEngineProfile("aria", app)
+    profile.setHttpUserAgent(
         profile.httpUserAgent() + " ARIA-Desktop/1")
     Feature = QWebEnginePage.Feature
     Policy = QWebEnginePage.PermissionPolicy
@@ -193,12 +212,12 @@ def run_qt(url):
     page.titleChanged.connect(lambda t: win.setWindowTitle(t or "A.R.I.A."))
 
     store = QtCore.QSettings("aria", "app")
-    geometry = store.value("geometry")
+    geometry = None if selftest else store.value("geometry")
     if geometry:
         win.restoreGeometry(geometry)
     else:
         win.resize(1500, 920)
-    view.setZoomFactor(float(store.value("zoom", 1.0)))
+    view.setZoomFactor(1.0 if selftest else float(store.value("zoom", 1.0)))
 
     def shortcut(keys, fn):
         action = QtGui.QAction(win)
@@ -231,7 +250,6 @@ def run_qt(url):
             QtCore.QTimer.singleShot(1500, lambda: view.load(QtCore.QUrl(url)))
     view.loadFinished.connect(retry)
 
-    selftest = os.environ.get("ARIA_APP_SELFTEST")
     if selftest:                   # prove the window really shows the app
         def probe_page(ok):
             def report(found):
@@ -247,7 +265,8 @@ def run_qt(url):
         QtCore.QTimer.singleShot(40000, app.quit)
 
     def closing():
-        store.setValue("geometry", win.saveGeometry())
+        if not selftest:
+            store.setValue("geometry", win.saveGeometry())
         view.setPage(None)         # the page must go before its profile
         page.deleteLater()
     app.aboutToQuit.connect(closing)

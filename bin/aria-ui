@@ -81,13 +81,17 @@ IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
                ".jpeg": "image/jpeg", ".gif": "image/gif",
                ".webp": "image/webp", ".svg": "image/svg+xml",
                ".ico": "image/x-icon", ".bmp": "image/bmp"}
-CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "fast", "smart", "deep",
+CONFIG_KEYS = ("obsidian_vault", "auto_pipeline", "business_plans",
+               "based_in", "fast", "smart", "deep",
                "stt_model", "web_access", "web_search", "web_search_url",
                "web_allowlist", "github_access", "github_base_branch",
                "brain_journal", "autopilot_git", "autopilot_after_goal",
                "autopilot_max_tasks", "autopilot_max_iterations",
                "autopilot_max_hours", "autopilot_stall_limit",
-               "context_tokens", "giant_general", "giant_research",
+               "context_tokens", "thinking", "ollama_autostart",
+               "models_warm", "ollama_keep_alive", "ollama_command",
+               "giant_general",
+               "giant_research",
                "giant_coder", "giants_use", "giants_loaded",
                "giants_idle_minutes", "giants_free_memory", "editor",
                "terminal",
@@ -119,8 +123,14 @@ def health_cached(max_age=10):
     backend; one probe serves every open tab for a few seconds."""
     with _HEALTH_LOCK:
         if _HEALTH["value"] is None or time.time() - _HEALTH["at"] > max_age:
-            _HEALTH["value"] = eng.health()
+            value = _HEALTH["value"] = eng.health()
             _HEALTH["at"] = time.time()
+            if value["ollama"] is not None and eng.wake_seen(value["ollama"]) \
+                    and eng.config().get("models_warm", True):
+                # away when she started, here now — started by hand, or by
+                # the computer a moment later: load the quick model after all
+                threading.Thread(target=eng.ollama_warm, daemon=True).start()
+            value["wake"] = eng.wake_state()
         return _HEALTH["value"]
 
 
@@ -170,6 +180,8 @@ def config_view():
         "brain_ready": eng.brain_ready(cfg),
         "brain_journal": cfg["brain_journal"],
         "auto_pipeline": cfg["auto_pipeline"],
+        "business_plans": cfg["business_plans"],
+        "based_in": cfg["based_in"],
         "model": cfg["model"],
         "tiers": {t: v.get("spec") or f"{v['kind']}/{v['model']}"
                   for t, v in tiers.items()},
@@ -195,6 +207,11 @@ def config_view():
         "autopilot_max_hours": cfg["autopilot_max_hours"],
         "autopilot_stall_limit": cfg["autopilot_stall_limit"],
         "context_tokens": cfg["context_tokens"],
+        "thinking": cfg["thinking"],
+        "ollama_autostart": cfg["ollama_autostart"],
+        "models_warm": cfg["models_warm"],
+        "ollama_keep_alive": cfg["ollama_keep_alive"],
+        "ollama_command": cfg["ollama_command"],
         "giants": cfg["giants"],
         "giants_use": cfg["giants_use"],
         "giants_loaded": cfg["giants_loaded"],
@@ -357,7 +374,11 @@ class Handler(BaseHTTPRequestHandler):
                 "health": {"ok": h["ok"], "server": h["server"],
                            "model": h["model"],
                            "smart": h["tiers"]["smart"]["model"],
-                           "error": h.get("error", "")},
+                           "error": h.get("error", ""),
+                           # is Ollama answering (None: no tier uses it),
+                           # and is she starting it or loading a model
+                           "ollama": h.get("ollama"),
+                           "wake": eng.wake_state()},
                 "projects": eng.list_projects(),
                 "switches": {"web": cfg["web_access"],
                              "brain": eng.brain_ready(cfg),
@@ -662,6 +683,26 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("action must be scan, load, test or unload")
         elif path == "/api/plan":
             self.plan_project(body)
+        elif path == "/api/models/start":
+            # "the model server is offline" — start it, load the quick model
+            state = eng.ollama_start(notify=lambda t: print("models:", t,
+                                                            flush=True))
+            if state["up"] and eng.config().get("models_warm", True):
+                threading.Thread(target=eng.ollama_warm, daemon=True).start()
+            with _HEALTH_LOCK:
+                _HEALTH["value"] = None          # ask again, now
+            self.send_json({"ok": state["up"], **state})
+        elif path == "/api/business":
+            # draft (or redraft) the business plan and who-does-what, in
+            # the background: the page comes back for it
+            job = eng.business_start(text("slug").lower())
+            self.send_json({"ok": True, "job": job})
+        elif path == "/api/project/action":
+            # the owner ticks an item on their own list — nobody else does
+            item = eng.project_action_done(
+                text("slug").lower(), text("id"),
+                done=body.get("done") is not False)
+            self.send_json({"ok": True, "item": item})
         elif path == "/api/github":
             slug, action = text("slug").lower(), text("action")
             if action == "init":
@@ -941,6 +982,11 @@ def main():
     eng.GARAGE_LISTENERS.append(lambda t: print("garage:", t, flush=True))
     threading.Thread(target=mission_worker, daemon=True).start()
     threading.Thread(target=autopilot_worker, daemon=True).start()
+    # the model server up and the quick model loaded, without being asked
+    threading.Thread(
+        target=lambda: eng.models_wake(
+            notify=lambda t: print("models:", t, flush=True)),
+        daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     BOOT.update(eng.server_mark(port))
     print(f"A.R.I.A. UI -> http://127.0.0.1:{port}  (Ctrl+C to stop)")

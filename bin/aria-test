@@ -74,6 +74,41 @@ class SkipTest(Exception):
     pass
 
 
+# On real models a single autopilot step gets this long. The self-test is
+# a check, not a night's work: a step that is still running after it says
+# more about the machine than waiting for it would.
+STEP_MINUTES = float(os.environ.get("ARIA_TEST_STEP_MINUTES") or 30)
+
+
+def real_giants():
+    """The giants the owner's own A.R.I.A. has loaded right now — read
+    from its records; nothing is touched."""
+    found = []
+    for role in ("general", "research", "coder"):
+        try:
+            with open(os.path.join(REAL_ROOT, "system", "garage",
+                                   role + ".json")) as f:
+                os.kill(int(json.load(f)["pid"]), 0)
+            found.append(role)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return found
+
+
+def ollama_loaded(url):
+    """What Ollama has in memory, and how much of each is on the graphics
+    card: [{"name", "gpu": 0..1}] ([] when it cannot say)."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/ps",
+                                    timeout=5) as r:
+            models = json.load(r).get("models") or []
+    except Exception:
+        return []
+    return [{"name": m.get("name", ""),
+             "gpu": (m.get("size_vram") or 0) / m["size"]}
+            for m in models if m.get("size")]
+
+
 TEST_IDEA = ("build a small command line tool that renames my photo files "
              "by the date they were taken, needs a plan, parser and tests")
 
@@ -90,6 +125,52 @@ ARTICLE = ("<html><head><title>Photo renaming guide</title></head><body>"
            "DateTimeOriginal tag and rename the file. " * 12 + "</p>"
            "<script>ignore()</script></body></html>")
 
+
+
+# What `model server — started when she is` runs, in a process of its own
+# (so that nothing it starts or remembers leaks into the other checks).
+# argv: sandbox, the stand-in's command. Prints one JSON line.
+WAKE_PROBE = r"""
+import json, os, sys, time, urllib.request
+sandbox, stand_in = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(sandbox, "bin"))
+import aria_engine as eng
+
+def seen():
+    with urllib.request.urlopen(os.environ["ARIA_OLLAMA_URL"]
+                                + "/mock/calls", timeout=10) as r:
+        return json.load(r)
+
+out, said = {}, []
+eng.GARAGE_LISTENERS.append(said.append)
+if os.environ.get("WAKE_CASE") == "service":
+    # Ollama as a system service this user may not start
+    out["how"], out["boots"] = eng.ollama_how(), eng.ollama_boots()
+    state = eng.ollama_start(wait=2)
+    out.update(up=state["up"], note=state["note"],
+               fix=eng.ENABLE_OLLAMA in state["note"])
+else:
+    os.environ["ARIA_OLLAMA_COMMAND"] = stand_in
+    assert not eng.ollama_up(), "something already answers on the port"
+    fast = eng.resolve_tier("fast")
+    state = eng.models_wake(notify=said.append)        # what her start does
+    out["started"], out["warmed"] = state["started"], state["warmed"]
+    out["loads"] = seen()["loads"]
+    out["expect"] = {"model": fast["model"], "keep_alive": fast["keep_alive"],
+                     "num_ctx": fast["num_ctx"]}
+    out["again"] = eng.ollama_start()["started"]       # up: nothing to start
+    eng.chat_stream(fast, "Say hello.")
+    out["sent"] = seen()["calls"][-1]["keep_alive"]
+    # it goes away — and the next call brings it back
+    eng._WAKE_PROCS[-1].terminate()
+    eng._WAKE_PROCS[-1].wait(10)
+    eng.WAKE["at"] -= 61                               # "a minute later"
+    out["gone"] = not eng.ollama_up(timeout=1)
+    out["reply"] = bool(eng.chat_stream(fast, "Say hello."))
+    out["said"] = said
+    eng._WAKE_PROCS[-1].terminate()
+print(json.dumps(out))
+"""
 
 def free_port():
     with socket.socket() as s:
@@ -203,6 +284,17 @@ def main():
     print(f"A.R.I.A. self-test — sandbox copy, "
           f"{'MOCK model (plumbing only)' if MOCK else 'real models'}\n{DIM}"
           f"source: {REAL_ROOT}{END}\n")
+    if not MOCK:
+        giants = real_giants()
+        if giants:
+            print(f"{YELLOW}note{END}  your running A.R.I.A. has the "
+                  f"{' and '.join(giants)} giant loaded. It holds memory the "
+                  "everyday models need, so this run will be slow and may "
+                  "not get far.\n      For a fair run, free it first:  "
+                  "bin/aria models unload\n")
+        print(f"{DIM}on your own models a line below can take minutes; one "
+              f"autopilot step is given {STEP_MINUTES:g} minutes "
+              f"(ARIA_TEST_STEP_MINUTES){END}\n")
     sandbox = tempfile.mkdtemp(prefix="aria-selftest-")
     vault = os.path.join(sandbox, "_test-vault")
     os.makedirs(vault)
@@ -221,7 +313,17 @@ def main():
                                                       "voice-token",
                                                       "garage",
                                                       "server.json",
+                                                      # how fast the real
+                                                      # machine is: the
+                                                      # checks measure
+                                                      # their own
+                                                      "pace.json",
+                                                      "pace.lock",
+                                                      "ollama.log*",
                                                       "config.backup-*"))
+    os.makedirs(os.path.join(sandbox, "docs"))      # her window's icon
+    shutil.copy2(os.path.join(REAL_ROOT, "docs", "aria-icon.svg"),
+                 os.path.join(sandbox, "docs", "aria-icon.svg"))
     for d in ("pipeline/00-inbox", "pipeline/01-processing",
               "pipeline/02-potential-projects", "pipeline/knowledge/lists",
               "pipeline/knowledge/notes", "pipeline/knowledge/content-ideas",
@@ -250,7 +352,10 @@ def main():
                autopilot_refine="false", autopilot_checks="sandbox",
                autopilot_check_seconds="60", editor="", terminal="",
                # …and it stays off your screen
-               desktop_notifications="false")
+               desktop_notifications="false",
+               # it starts no service on this machine and loads no model
+               # by itself: that has a check of its own, with a stand-in
+               ollama_autostart="false", models_warm="false")
 
     # Her voice and her ears are exercised with a stand-in for the speech
     # worker (the real one needs the packages `aria voice install` adds):
@@ -276,7 +381,10 @@ def main():
         os.environ["ARIA_LLAMACPP_URL"] = f"http://127.0.0.1:{port}"
         os.environ.pop("ARIA_OLLAMA_MODEL", None)
         set_config(sandbox, fast="ollama/llama3.1:8b",
-                   smart="ollama/llama3.1:8b", deep="")
+                   smart="ollama/llama3.1:8b", deep="",
+                   # the stand-in is scripted against the shipped defaults,
+                   # whatever the owner has chosen for their own models
+                   context_tokens="8192", thinking="auto")
         wait_http(f"http://127.0.0.1:{port}/api/tags")
 
     # import the SANDBOX copy of the engine — and of every sibling module
@@ -294,10 +402,61 @@ def main():
     state = {}
     quiet = lambda e: None  # noqa: E731
 
+    def slow_because():
+        """Why the models may be slow on this machine, as far as it can
+        be seen from here."""
+        bits = []
+        rated = [c for c in eng.CALLS if c.get("rate")]
+        if rated:
+            bits.append(f"{rated[-1]['model']} last answered at "
+                        f"{rated[-1]['rate']:g} tokens a second")
+        giants = real_giants()
+        if giants:
+            bits.append(f"your running A.R.I.A. has the "
+                        f"{' and '.join(giants)} giant loaded, which holds "
+                        "memory the everyday model needs (free it: bin/aria "
+                        "models unload)")
+        for m in ollama_loaded(eng.config()["backend_urls"]["ollama"]):
+            if m["gpu"] < 0.9:
+                bits.append(f"only {m['gpu']:.0%} of {m['name']} is on the "
+                            "graphics card")
+        return "; ".join(bits) or "the model server is answering very slowly"
+
+    def step(slug):
+        """One autopilot step — on real models, with a time limit."""
+        if MOCK:
+            return ap.tick(slug, quiet)
+        box = {}
+
+        def work():
+            try:
+                box["result"] = ap.tick(slug, quiet)
+            except Exception as exc:
+                box["error"] = exc
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(STEP_MINUTES * 60)
+        if worker.is_alive():
+            doing = ap._state(slug).get("phase") or "working"
+            raise Exception(
+                f"one autopilot step ({doing}) was still running after "
+                f"{STEP_MINUTES:g} minutes — {slow_because()}. Autopilot "
+                "itself would wait; the self-test stops here")
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def held_up(slug):
+        """Why a run is "waiting" when it is not waiting for the owner: a
+        step failed and will be tried again. "" otherwise."""
+        st = ap._state(slug)
+        return st.get("waiting") or "a step failed" \
+            if st.get("backoff_until", 0) > time.time() else ""
+
     def drive(slug, limit=120, until=("idle", "finalized", "complete")):
         seq = []
         for _ in range(limit):
-            seq.append(ap.tick(slug, quiet))
+            seq.append(step(slug))
             if seq[-1] in until:
                 break
         return seq
@@ -382,10 +541,11 @@ def main():
                     except Exception:
                         active = "unknown"
                     if active != "active":
-                        hint = (" || ollama installed but not running — fix: "
-                                "sudo systemctl start ollama && "
-                                "sudo systemctl enable ollama "
-                                "(or run: ollama serve)")
+                        hint = (" || ollama installed but not running — "
+                                "start it: bin/aria models start (her app "
+                                "does that itself when it starts; a system "
+                                "service wants, once: sudo systemctl enable "
+                                "--now ollama)")
                     else:
                         hint = (" || ollama service is active but not "
                                 "answering on the configured URL — check "
@@ -647,7 +807,31 @@ def main():
                 "backend. On Arch: pacman -Ss '^ollama' and install the "
                 "vulkan (or rocm) variant; or use the official installer "
                 "which bundles all backends")
-        return "model is running on the GPU"
+        # how much of it is on the card, and how fast it answered
+        loaded = ollama_loaded(fast["url"])
+        mine = next((m for m in loaded if m["name"] == fast["model"]
+                     or m["name"].split(":")[0] == fast["model"]), None)
+        rated = [c for c in eng.CALLS if c.get("rate")]
+        said = "model is running on the GPU" + (
+            f" — {mine['gpu']:.0%} of {mine['name']} is on the card"
+            if mine else "") + (
+            f", answering at {rated[-1]['rate']:g} tokens a second"
+            if rated else "")
+        giants = real_giants()
+        if giants:
+            raise Exception(
+                said + f". But your running A.R.I.A. has the "
+                f"{' and '.join(giants)} giant loaded: it holds memory this "
+                "model needs, so everything below is slower than your "
+                "machine can do. Free it for a fair run: bin/aria models "
+                "unload")
+        if mine and mine["gpu"] < 0.5:
+            raise Exception(
+                said + ". Less than half of it fits on the card beside "
+                "whatever else is using the memory, so it is slow: a "
+                "smaller model on the quick tier, or a smaller window "
+                "(context_tokens), leaves more of it on the GPU")
+        return said
     check("gpu acceleration", c_gpu, required=False)
 
     def c_develop_web():
@@ -724,7 +908,13 @@ def main():
             f.write(f"---\nslug: {slug}\nstatus: processing\ntype: project\n"
                     f"captured: 2026-11-14\n---\n\n## Raw capture\n\n"
                     "build a tiny script that sorts my downloads folder\n")
-        eng.develop_run(quiet, slugs=[slug])
+        set_config(sandbox, business_plans="false")    # checked on its own
+        try:
+            eng.develop_run(quiet, slugs=[slug])
+        finally:
+            set_config(sandbox, business_plans="true")
+        assert not eng.project_business(slug)["has_plan"], \
+            "a business plan was written with business plans switched off"
         research = open(os.path.join(
             sandbox, "pipeline/02-potential-projects", slug,
             "research.md")).read()
@@ -748,8 +938,97 @@ def main():
                     os.path.join(proj, "proposed-plan.md"))
         shutil.copy(os.path.join(proj, "research.v1.md"),
                     os.path.join(proj, "research.md"))
+        for name in ("business-plan", "action-list"):   # kept as versions too
+            old = os.path.join(proj, name + ".v1.md")
+            assert not os.path.exists(os.path.join(proj, name + ".md")), \
+                f"{name}.md was left in place by a refinement"
+            if os.path.isfile(old):
+                shutil.copy(old, os.path.join(proj, name + ".md"))
         return "feedback attached, plan versioned, idea requeued"
     check("refine loop", c_refine)
+
+    def c_business():
+        """The business side of an idea, written beside its plan: a
+        business plan, what a complete proposal still needs, and who does
+        what — her part, and the owner's, which only the owner ticks."""
+        if "slug" not in state:
+            raise SkipTest("develop failed earlier")
+        slug = state["slug"]
+        proj = eng._project_dir(slug)
+        plan = eng._project_doc(proj, "business-plan")
+        assert plan, "develop wrote no business plan beside the plan"
+        text = plan.read_text()
+        heads = [ln[3:] for ln in text.splitlines() if ln.startswith("## ")]
+        asked = [h for h, _ in eng.template_sections("business-plan")]
+        assert len(asked) == 12, "the business-plan template changed shape"
+        if MOCK:
+            assert heads[:12] == asked, heads
+            assert "> **In one line:**" in text
+        else:
+            assert len(heads) >= 6, f"only {len(heads)} sections came back"
+        assert "Not legal, tax or financial advice" in text
+        # the template Claude Code fills in and the list the engine judges
+        # are the same list
+        template = open(os.path.join(sandbox, "system", "templates",
+                                     "action-list.md")).read()
+        for _key, item, _doc in eng.PROPOSAL_ITEMS:
+            assert f"| {item} |" in template, \
+                f"the action-list template lacks “{item}”"
+        actions = eng.project_actions(slug)
+        if not actions and not MOCK:
+            return (f"business plan written ({len(heads)} sections); this "
+                    "model did not manage the who-does-what list — a "
+                    f"stronger smart tier will, or: aria business {slug}")
+        assert actions, "no action list was written"
+        assert [p["key"] for p in actions["proposal"]] == \
+            [k for k, _, _ in eng.PROPOSAL_ITEMS], "a proposal item is missing"
+        assert actions["proposal"][0]["state"] == "there"
+        assert actions["aria"] or actions["you"]
+        listed = eng._project_doc(proj, "action-list")
+        ticked = ""
+        if actions["you"]:
+            first = actions["you"][0]["id"]
+            # the owner ticks — by saying so, here
+            got = eng.detect_intent(f"done {first} in {slug}")
+            assert got == {"action": "tick", "slug": slug, "id": first,
+                           "done": True}, got
+            said = eng.perform(got)["say"]
+            assert said.startswith("Ticked " + first), said
+            assert f"- [x] **{first} — " in listed.read_text()
+            assert next(p for p in eng.list_projects()
+                        if p["slug"] == slug)["your_list"] == \
+                len(actions["you"]) - 1
+            # the list read back from its markdown alone (the form Claude
+            # Code's planner writes) is the same list, tick included
+            data = eng._actions_file(proj)
+            keep = data.read_text()
+            data.unlink()
+            again = eng.project_actions(slug)
+            assert again and [t["id"] for t in again["you"]] == \
+                [t["id"] for t in actions["you"]] and again["you"][0]["done"]
+            data.write_text(keep)
+            eng.project_action_done(slug, first, done=False)
+            ticked = "; your ticks are kept in both files"
+            assert "yours" in eng.owner_list_text(slug)
+        if actions["aria"]:
+            try:                        # her items are not the owner's to tick
+                eng.project_action_done(slug, actions["aria"][0]["id"])
+                raise AssertionError("an item of hers was ticked as yours")
+            except ValueError:
+                pass
+        assert ap._protected("docs/actions.json") \
+            and ap._protected("docs/business-plan.md") \
+            and not ap._protected("business/competitors.md"), \
+            "agents could overwrite the business plan or your list"
+        got = eng.detect_intent(f"business plan for {slug}")
+        assert got == {"action": "business", "slug": slug}, got
+        assert eng.detect_intent("what's on my list") == \
+            {"action": "mylist", "slug": ""}
+        return (f"a business plan in {len(heads)} sections beside the plan; "
+                f"{len(actions['proposal'])} proposal items judged; "
+                f"{len(actions['aria'])} thing(s) for her, "
+                f"{len(actions['you'])} for you" + ticked)
+    check("business plan + who does what", c_business)
 
     def c_brain():
         if "slug" not in state:
@@ -1091,6 +1370,97 @@ def main():
                 f"{took:.1f}s; an ordinary chat is answered as before")
     check("chat — never left hanging", c_chat_wait)
 
+    def c_thinking():
+        """Models that reason before they answer (qwen3, deepseek-r1…): the
+        reasoning costs time, and shares the window with the answer. Quick
+        calls are asked for the answer alone; a reply the reasoning left no
+        room for is asked for again; one that cannot fit at all says so."""
+        if not MOCK:
+            raise SkipTest("needs --mock to script a reasoning model and "
+                           "its window")
+
+        def seen():
+            with urllib.request.urlopen(
+                    os.environ["ARIA_OLLAMA_URL"] + "/mock/calls",
+                    timeout=10) as r:
+                return json.load(r)["calls"]
+
+        def planned():
+            return [c for c in seen()
+                    if "project planner inside" in c["system"]]
+
+        was = eng.config()
+        set_config(sandbox, fast="ollama/qwen3:30b", smart="ollama/qwen3:30b",
+                   context_tokens="6144", thinking="auto")
+        try:
+            with scripted_model(MOCK_THINKING="1500"):
+                # chat is conversation: the answer, straight away
+                eng.converse([{"role": "user", "content": "hello"}])
+                chat = seen()[-1]
+                assert chat["think"] is False and not chat["reasoned"], chat
+                # a small call on the smart tier has room to reason — the
+                # reasoning is shown to whoever listens, and is not the reply
+                heard = []
+                text = eng.chat_stream(
+                    eng.resolve_tier("smart"), "Say hello in one sentence.",
+                    "You are terse.", on_thought=heard.append)
+                call = eng.last_call()
+                assert seen()[-1]["think"] == "unset" and heard \
+                    and call["thought"] and call["rate"] \
+                    and "Let me think" not in text, (seen()[-1], call, text)
+                # a prompt that leaves little room in the same window
+                eng.chat_stream(eng.resolve_tier("smart"),
+                                "Consider this carefully. " * 560
+                                + "Then say hello.", "You are terse.")
+                big = seen()[-1]
+                assert big["think"] is False and big["ended"] == "stop", big
+                assert all(c["num_predict"] <= c["num_ctx"] for c in seen()
+                           if c["num_ctx"]), "a call without a writing limit"
+            # left to itself, its reasoning fills the window: the plan is
+            # asked for again, the answer alone — and the log says so
+            set_config(sandbox, thinking="always")
+            with scripted_model(MOCK_THINKING="3800"):
+                slug, logs, got = "selftest-thinking", [], ""
+                started_project(slug)
+                for _ in range(8):
+                    got = ap.tick(slug, lambda ev: logs.append(
+                        ev.get("log") or ""))
+                    if got in ("replanned", "waiting"):
+                        break
+                plan = planned()
+                assert got == "replanned" \
+                    and [c["ended"] for c in plan] == ["length", "stop"] \
+                    and plan[0]["reasoned"] and plan[1]["think"] is False, \
+                    (got, plan, ap._state(slug).get("waiting"))
+                assert any("reasoned until its window was full" in ln
+                           for ln in logs), "the retry went unsaid"
+                eng.autopilot_stop(slug)
+                assert ap.tick(slug, quiet) == "finalized"
+            # a window the plan cannot fit into at all: the step stops with
+            # the reason and the remedy, instead of a wait nobody can read
+            set_config(sandbox, thinking="auto", context_tokens="2048")
+            with scripted_model(MOCK_THINKING="600"):
+                slug = "selftest-thinking-small"
+                started_project(slug)
+                seq = [ap.tick(slug, quiet) for _ in range(3)]
+                why = ap._state(slug).get("waiting", "")
+                assert seq[-1] == "waiting" and "did not fit" in why \
+                    and "context_tokens" in why, (seq, why)
+                assert held_up(slug), "a failed step did not read as one"
+                eng.autopilot_stop(slug)
+                assert ap.tick(slug, quiet) == "finalized"
+        finally:
+            set_config(sandbox, fast=was["tiers"]["fast"],
+                       smart=was["tiers"]["smart"],
+                       context_tokens=str(was["context_tokens"]),
+                       thinking="auto")
+        return ("chat and the quick tier answer without reasoning first; "
+                "the smart tier reasons where its window has room (shown, "
+                "not kept); reasoning that filled the window is asked again "
+                "for the answer alone; a plan that cannot fit says so, and "
+                "how to give it room")
+    check("reasoning models — time and room", c_thinking)
+
     def c_gate():
         slug = state.get("slug") or fixture_project("selftest-gate-approve")
         assert not eng.project_approved(slug)
@@ -1110,8 +1480,19 @@ def main():
         text = req.read_text()
         assert "approved: true" in text and "approved_via: selftest" in text
         assert eng.project_approved(slug)
+        mine = eng.project_actions(slug) or {}
+        if mine.get("aria"):
+            # approving the plan approves her part of the groundwork with
+            # it — and never the owner's own list
+            assert "## Business groundwork" in text \
+                and mine["aria"][0]["title"] in text, \
+                "her part of the groundwork did not join the requirements"
+            assert not any(t["title"] in text for t in mine.get("you", [])), \
+                "the owner's own list was written into the requirements"
         return "unapproved plans cannot start or be promoted; approval " \
-               "writes requirements.md"
+               "writes requirements.md" + (
+                   " (with her part of the business groundwork)"
+                   if mine.get("aria") else "")
     check("the human gate", c_gate)
 
     def c_autopilot():
@@ -1140,10 +1521,24 @@ def main():
                           note="self-test: your call, go ahead")
                 answered.append(g["id"])
 
-        seq = drive(slug, limit=6, until=("task", "waiting"))
-        if seq[-1] == "waiting":        # the plan put everything behind me
-            answer()
-            seq += drive(slug, limit=4, until=("task",))
+        seq, retried, snag = [], 0, ""
+        while len(seq) < 14:
+            seq.append(step(slug))
+            if seq[-1] == "task":
+                break
+            if seq[-1] != "waiting":
+                continue
+            why = held_up(slug)
+            if not why:                 # the plan put everything behind me
+                answer()
+                continue
+            # A step failed. Autopilot would try it again and again with a
+            # growing pause; the check tries twice more and then says why.
+            retried += 1
+            assert retried <= 2, \
+                f"autopilot could not get past a step — {why} [{slow_because()}]"
+            pause = ap._state(slug)["backoff_until"] - time.time()
+            time.sleep(max(0.0, min(pause, 90)) + 0.2)
         # (a plan that is all decisions reports "waiting", not "replanned")
         assert "assessed" in seq and seq[-1] == "task" \
             and ("replanned" in seq or answered), seq
@@ -1154,8 +1549,11 @@ def main():
             if any(c["status"] == "done" for c in eng.project_changes(slug)) \
                     or ap._state(slug)["status"] != "running":
                 break
-            seq.append(ap.tick(slug, quiet))
+            seq.append(step(slug))
             if seq[-1] == "waiting":
+                snag = held_up(slug)
+                if snag:
+                    break               # a failed step: said in the result
                 answer()
         auto = proj / "autopilot"
         assert (auto / "ASSESSMENT.md").is_file()
@@ -1197,7 +1595,8 @@ def main():
                 + "steered, stopped; report lists every change"
                 + ("" if done else " — the work was sent back each time, "
                    "which the loop handled; a stronger smart tier gets "
-                   "more through"))
+                   "more through")
+                + (f"; a later step was held up — {snag}" if snag else ""))
     check("autopilot — gate to report", c_autopilot)
 
     def c_autopilot_full():
@@ -1366,6 +1765,147 @@ def main():
                 "a file changed twice shows each change as previous | "
                 "modified")
     check("autopilot — history is kept", c_history)
+
+    def c_pace():
+        """Time estimates rest on what this machine has measured — every
+        finished task, the planning and checking around it, how many tasks
+        a milestone really took — and say so. With nothing measured they
+        are a stated first guess, not the planner's own hours."""
+        if not MOCK:
+            raise SkipTest("needs --mock (runs a whole project)")
+        slug = state.get("active")
+        if not slug:
+            raise SkipTest("autopilot check failed earlier")
+        book = json.load(open(os.path.join(sandbox, "system", "pace.json")))
+        mine = [t for t in book["tasks"] if t["project"] == slug]
+        assert mine and all(t["seconds"] > 0 and t["model"] for t in mine), \
+            "finished tasks are not on the machine's record"
+        assert {s["kind"] for s in book["steps"]} >= \
+            {"assessed", "mapped", "replanned", "reflected"}, \
+            "planning and memory steps are not on the record"
+        assert ap._state(slug).get("overhead_seconds", 0) > 0
+        fc = ap.view(slug)["forecast"]
+        assert fc["basis"] in ("project", "machine") and fc["measured"] \
+            and fc["rests_on"], fc
+        # a machine with no record: a first guess, and it says so
+        real, ap.PACE_FILE = ap.PACE_FILE, ap.PACE_FILE.with_name(
+            "pace-none.json")
+        try:
+            fresh = ap.Pace("nobody", [], {})
+            typical, slow, basis = fresh.task("ollama/llama3.1:8b")
+            giant = fresh.task("giant/general")
+            assert (typical, basis) == (ap.FIRST_GUESS["everyday"], "guess") \
+                and slow > typical and giant[0] == ap.FIRST_GUESS["giant"]
+            assert "first guess" in fresh.rests_on()
+            # history from elsewhere on this machine is used straight away,
+            # per model: a giant is not estimated from the everyday model
+            ap._pace_note("tasks", {"project": "a", "model": "giant/general",
+                                    "agent": "coder", "seconds": 3000,
+                                    "attempts": 1, "ok": True})
+            for n in (200, 220, 240, 100):
+                ap._pace_note("tasks", {
+                    "project": "a", "model": "ollama/llama3.1:8b",
+                    "agent": "coder", "seconds": n, "attempts": 1,
+                    "ok": n != 100})
+            for _ in range(3):
+                ap._pace_note("milestones", {"project": "a", "est": 2,
+                                             "tasks": 4})
+            ap._pace_note("steps", {"project": "a", "kind": "replanned",
+                                    "seconds": 250})
+            seen = ap.Pace("b", [], {})
+            typical, slow, basis = seen.task("ollama/llama3.1:8b", "coder")
+            assert basis == "machine" and typical == 190 and slow >= 240, \
+                (typical, slow, basis)
+            assert seen.task("giant/general")[0] > 2000, \
+                "a giant was estimated from the everyday model"
+            more, again = seen.more_tasks()
+            assert more == 2.0 and again > 1.2, (more, again)
+            assert seen.overhead(typical) == 50, seen.overhead(typical)
+            assert "measured on this machine" in seen.rests_on()
+        finally:
+            for f in (ap.PACE_FILE, ap.PACE_FILE.with_name("pace.lock")):
+                if f.name != "pace.lock":
+                    f.unlink(missing_ok=True)
+            ap.PACE_FILE = real
+        said = eng.project_progress_text(slug)
+        return (f"{len(book['tasks'])} tasks and {len(book['steps'])} "
+                "planning steps on record; estimates come from them (per "
+                "model, with the planning around each task and the "
+                "planner's undercount), and a machine with no record says "
+                "its estimate is a first guess")
+    check("time estimates — from what was measured", c_pace)
+
+    def c_wake():
+        """Nobody should have to start Ollama first. When she starts — and
+        when a call finds the model server away — she starts it the way it
+        is run on this machine, and loads the quick model. A service only
+        an administrator may start she cannot: then she says the one
+        command that fixes it for good. (A stand-in is started here; your
+        own Ollama is never touched.)"""
+        was = eng.config()
+        port = free_port()
+        stand_in = (f"{sys.executable} "
+                    f"{os.path.join(sandbox, 'bin', 'aria-mock-llm')} "
+                    "{port}")
+        shims = tempfile.mkdtemp(prefix="aria-selftest-shims-")
+        home = tempfile.mkdtemp(prefix="aria-selftest-home-")
+
+        def shim(name, body):
+            path = os.path.join(shims, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+
+        def probe(**env):
+            done = subprocess.run(
+                [sys.executable, "-c", WAKE_PROBE, sandbox, stand_in],
+                env={k: v for k, v in dict(
+                    os.environ, ARIA_OLLAMA_URL=f"http://127.0.0.1:{port}",
+                    **env).items() if k != "ARIA_OLLAMA_COMMAND"},
+                capture_output=True, text=True, timeout=180)
+            assert done.returncode == 0, (done.stderr or done.stdout)[-600:]
+            return json.loads(done.stdout.strip().splitlines()[-1])
+
+        set_config(sandbox, fast="ollama/qwen3:30b", ollama_autostart="true",
+                   models_warm="true")
+        try:
+            got = probe()
+            assert got["started"] and got["warmed"] == "qwen3:30b", got
+            assert got["loads"] == [got["expect"]], \
+                ("the quick model was not loaded the way it will be used",
+                 got["loads"], got["expect"])
+            assert not got["again"], "started a server that was up"
+            assert got["sent"] == (got["expect"]["keep_alive"]
+                                   if got["expect"]["keep_alive"] is not None
+                                   else "unset"), got
+            assert got["gone"] and got["reply"] and any(
+                "starting it" in line for line in got["said"]), \
+                ("a call that found the model server away did not bring "
+                 "it back", got)
+            # a system service, not enabled, and no right to start it
+            shim("ollama", "exit 0\n")
+            shim("systemctl",
+                 'case "$*" in\n'
+                 '  "cat ollama.service") exit 0;;\n'
+                 '  "is-active ollama.service") echo inactive; exit 3;;\n'
+                 '  *) echo "Interactive authentication required." >&2; '
+                 'exit 1;;\n'
+                 'esac\n')
+            got = probe(WAKE_CASE="service", HOME=home,
+                        PATH=shims + os.pathsep + os.environ.get("PATH", ""))
+            assert got["how"] == "system-unit" and got["boots"] is False \
+                and not got["up"] and got["fix"], got
+        finally:
+            set_config(sandbox, fast=was["tiers"]["fast"],
+                       ollama_autostart="false", models_warm="false")
+            shutil.rmtree(shims, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
+        return ("a model server that is away is started at her start, the "
+                "quick model loaded with the window and keep-loaded time it "
+                "will be used with; a call that finds it gone brings it "
+                "back; a system service she may not start gets the one "
+                "command that fixes it — " + eng.ENABLE_OLLAMA)
+    check("model server — started when she is", c_wake)
 
     def c_run_sandbox():
         """Code a model wrote is run without being trusted: the project's
@@ -2060,10 +2600,13 @@ def test_escape():
 
     # ---- server-level checks ----------------------------------------
     port = free_port()
+    # As on a desktop that launches programs as systemd units: everything
+    # started from such a terminal carries the unit's INVOCATION_ID. That
+    # alone must not make a server believe systemd runs it.
     srv = subprocess.Popen(
         [sys.executable, os.path.join(sandbox, "bin", "aria-ui"), str(port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env=os.environ.copy())
+        env=dict(os.environ, INVOCATION_ID="selftest-not-the-unit"))
     procs.append(srv)
     base = f"http://127.0.0.1:{port}"
 
@@ -2321,7 +2864,14 @@ def test_escape():
                                   capture_output=True, text=True, timeout=120)
             lines = [ln for ln in done.stdout.splitlines()
                      if ln.startswith("{")]
-            assert lines, f"the window reported nothing: {done.stderr[-300:]}"
+            said = [ln.strip() for ln in done.stderr.splitlines()
+                    if ln.strip()][-3:]
+            assert lines, (
+                "the off-screen window did not report back (exit "
+                f"{done.returncode}). This probe has no screen to draw on; "
+                "whether her window opens on your desktop is seen by "
+                "running: bin/aria app"
+                + (" — Qt said: " + " | ".join(said) if said else ""))
             seen = json.loads(lines[-1])
             assert seen["loaded"] and seen["shell"] \
                 and seen["title"].startswith("A.R.I.A"), seen
@@ -2338,8 +2888,11 @@ def test_escape():
             with urllib.request.urlopen(base + "/api/state", timeout=15) as r:
                 assert json.load(r)["version"]["code"] == v["code"]
             found = eng.server_running()
-            assert found and found["pid"] == srv.pid and not found["stale"] \
-                and not found["managed"], found
+            assert found and found["pid"] == srv.pid and not found["stale"], \
+                found
+            assert not found["managed"], \
+                "a server started by hand under a systemd unit took itself " \
+                f"for the always-on service: {found}"
             # a left-over record may name a pid that is someone else's by
             # now (here: this very process) — it must not be believed
             record = os.path.join(sandbox, "system", "server.json")
@@ -2350,6 +2903,36 @@ def test_escape():
                 "a record naming another process was believed"
             with open(record, "w") as f:
                 f.write(real)
+            # "run by systemd" is asked of systemd, never assumed: a record
+            # that claims it is believed only for the unit's own process
+            unit = os.path.join(sandbox, "_unit")
+            os.makedirs(unit, exist_ok=True)
+
+            def unit_runs(pid):
+                with open(os.path.join(unit, "systemctl"), "w") as f:
+                    f.write(f'#!/bin/sh\necho "$@" >> "{unit}/asked"\n'
+                            'case " $* " in *" show "*) '
+                            f'echo "MainPID={pid}";; esac\nexit 0\n')
+                os.chmod(os.path.join(unit, "systemctl"), 0o755)
+
+            with open(record, "w") as f:
+                json.dump(dict(json.loads(real), managed=True), f)
+            path = os.environ["PATH"]
+            os.environ["PATH"] = unit + os.pathsep + path
+            try:
+                unit_runs(srv.pid + 1)
+                assert not eng.server_running()["managed"], \
+                    "a claim to be the service was believed unchecked"
+                unit_runs(srv.pid)
+                claimed = eng.server_running()
+                assert claimed["managed"]
+                assert eng.server_restart(claimed) == "systemd" \
+                    and "restart aria.service" in open(
+                        os.path.join(unit, "asked")).read()
+            finally:
+                os.environ["PATH"] = path
+                with open(record, "w") as f:
+                    f.write(real)
             # newer code on disk
             with open(os.path.join(sandbox, "bin", "aria_brain.py"), "a") as f:
                 f.write("\n# self-test: newer code than the server runs\n")
@@ -2372,6 +2955,7 @@ def test_escape():
             assert v2["pid"] != v["pid"] and v2["code"] != v["code"] \
                 and not v2["stale"], (v, v2)
             return ("version reported, a left-over record not believed, "
+                    "only the unit's own process counts as run by systemd, "
                     "new code on disk noticed and restarted onto")
         check("version + restart onto new code", c_server_version)
     finally:
@@ -2411,9 +2995,15 @@ def test_escape():
         asked = os.path.join(top, "systemctl.log")
         os.makedirs(shim)
         # your real server must not be restarted by a self-test: this
-        # stand-in answers "active" and only records what it is asked
+        # stand-in records what it is asked, and describes a unit that
+        # runs the owner's copy (and no server record to go with it)
         with open(os.path.join(shim, "systemctl"), "w") as f:
-            f.write(f'#!/bin/sh\necho "$@" >> "{asked}"\nexit 0\n')
+            f.write(f'#!/bin/sh\necho "$@" >> "{asked}"\n'
+                    'case " $* " in *" show "*)\n'
+                    '  echo "MainPID=4242"\n'
+                    f'  echo "ExecStart={{ path=/usr/bin/env ; argv[]='
+                    f'/usr/bin/env python3 {user}/bin/aria-ui 8700 ; }}"\n'
+                    ';; esac\nexit 0\n')
         os.chmod(os.path.join(shim, "systemctl"), 0o755)
         env = dict(os.environ, GIT_AUTHOR_NAME="selftest",
                    GIT_AUTHOR_EMAIL="selftest@localhost",

@@ -6,7 +6,7 @@
 import { $, $$, h, clear, api, stream, bus, md, modal, confirmBox, toast,
          badge, ago, title, resolvePath, store } from './core.js';
 
-const TABS = ['kanban', 'gantt', 'live', 'files', 'run', 'brief', 'changes', 'report'];
+const TABS = ['kanban', 'gantt', 'live', 'files', 'run', 'brief', 'business', 'changes', 'report'];
 const PALETTE = ['#45d6ff', '#4ade80', '#fbbf24', '#c084fc', '#fb7185',
                  '#34d399', '#f97316', '#60a5fa'];
 const PHASE_SAY = { assessing: 'Taking stock of the project…',
@@ -32,6 +32,8 @@ let diffSplit = store.get('aria_diff_split', true);
 // run: how the project is started, the program you started, its output
 let runInfo = null, runText = '', runNext = 0, runTimer = null, runStamp = 0;
 let checkRes = null, checking = false;
+// business: the plan's text is fetched when it changes, not with every poll
+let bizText = '', bizKey = '';
 
 const fmtDur = s => {
   if (s > 0 && s < 1) return '<1s';
@@ -52,11 +54,11 @@ const modelName = spec => {
   const g = GIANT.exec(spec || '');
   return g ? g[1] + ' giant' : (spec || '').replace(/^ollama\//, '');
 };
-// how long a task takes on the chart: measured, else predicted from the
-// measured pace, else (nothing has finished yet) the planner's own guess
+// how long a task takes on the chart: measured, else what tasks on its
+// model have been measured to take on this machine (the server's forecast)
 const taskSecs = t => t.took || (['inprogress', 'reviewing'].includes(t.status)
     ? Math.max(t.elapsed || 0, t.predict || 0) : 0)
-  || t.predict || (t.est_hours || 1) * (data.pace || 3600);
+  || t.predict || (data.forecast || {}).per_task || 420;
 const timeNote = t => t.took ? 'took ' + fmtDur(t.took)
   : ['inprogress', 'reviewing'].includes(t.status) && t.elapsed
     ? fmtDur(t.elapsed) + ' so far' + (t.predict ? ' (≈ ' + fmtDur(t.predict) + ')' : '')
@@ -359,11 +361,12 @@ function render(force = false) {
     (data.history || []).length, data.pace, fileSet.size, fileSel,
     !!fileView && fileView.path, showRecords, reportSel, !!allChanges,
     [...ganttOpen].join(), [...openDirs].join(), runStamp, checking,
-    (data.review || '').length, (data.state.refine || {}).stage]);
+    (data.review || '').length, (data.state.refine || {}).stage,
+    data.business || null, bizText.length]);
   if (!force && s === sig) { if (tab === 'live') updateLive(); return; }
   sig = s;
   const keep = body.scrollTop;
-  clear(body, notices(), ({ kanban, gantt, live, files, run: runTab, brief, changes, report })[tab]());
+  clear(body, notices(), ({ kanban, gantt, live, files, run: runTab, brief, business, changes, report })[tab]());
   if (tab === 'run') afterRunDraw();
   body.scrollTop = keep;
   if (tab === 'live') updateLive();
@@ -377,6 +380,8 @@ function notices() {
         data.has_plan ? 'Read the proposed plan, then approve it — that is the only step that needs you.'
                       : 'This idea has no plan yet; run develop on the Pipeline page.'),
       data.has_plan ? h('button', { class: 'btn', text: 'Read the plan', onclick: () => openDoc('proposed-plan') }) : null,
+      data.has_plan ? h('button', { class: 'btn', text: (data.business || {}).has_plan ? 'Business plan & who does what' : 'Business plan',
+                                    onclick: () => setTab('business') }) : null,
       data.has_plan ? h('button', { class: 'btn primary', text: '✓ Approve & start', onclick: start }) : null));
   }
   const owed = data.needs_you || [];
@@ -592,15 +597,18 @@ function gantt() {
   // The road ahead: a milestone in progress runs from its first task to
   // the end of what is planned plus what is still unplanned; one not yet
   // started begins when everything it waits for has ended.
-  const finished = all.filter(t => t.status === 'done' && t.took);
-  const perTask = finished.length ? finished.reduce((n, t) => n + t.took, 0) / finished.length
-                                  : (data.pace || 3600);
+  // How long the work nobody has planned yet will take comes from the
+  // server: tasks measured on this machine, the planning and checking that
+  // goes with each, and how many tasks a milestone really takes.
+  const fc = data.forecast || {};
+  const perTask = (fc.per_task || 420) + (fc.overhead || 0);
   let roadLeft = 0;
   for (const m of ahead) {               // roadmap order: what it waits for comes first
     const key = 'ms:' + m.id;
     const mine = tasks.filter(t => t.milestone === m.id && end[t.id] !== undefined);
     const waits = m.depends_on.map(d => end['ms:' + d]).filter(v => v !== undefined);
-    const unplanned = Math.max(mine.length ? 0 : 1, (m.est_tasks || 3) - m.done - m.open) * perTask;
+    const unplanned = m.left != null ? m.left
+      : Math.max(mine.length ? 0 : 1, (m.est_tasks || 3) - m.done - m.open) * perTask;
     if (mine.length) {
       start[key] = Math.min(...mine.map(t => start[t.id]));
       end[key] = Math.max(offset, ...mine.map(t => end[t.id])) + unplanned;
@@ -786,11 +794,16 @@ function gantt() {
     ahead.length ? h('span', {}, h('i', { style: { background: 'rgba(143,107,196,.12)', border: '1px dashed #8f6bc4', borderRadius: '6px' } }), 'milestone ahead') : null,
     tasks.some(t => t.needs_human) ? h('span', {}, h('i', { style: { background: 'rgba(251,191,36,.14)', border: '1px dashed #fbbf24' } }), 'needs you') : null,
     h('span', {}, '→ waits for'));
-  const pace = h('div', { class: 'gantt-pace' }, data.pace
-    ? [h('b', { text: fmtDur(spent) }), ' of work done',
-       left + roadLeft > 0 ? [' · about ', h('b', { text: fmtDur(left + roadLeft) }), ' to the goal at the pace measured so far'] : null,
-       h('span', { class: 'hint', text: ' — newest on top; a finished bar is as long as the task took, the rest are predicted from that.' })]
-    : h('span', { class: 'hint', text: 'Newest on top. Nothing has finished yet, so these lengths are the planner\'s own guess — measured times replace them as tasks complete.' }));
+  // the estimate, its slow case, and what it is made from
+  const togo = fc.seconds || 0, slow = fc.slow || 0;
+  const pace = h('div', { class: 'gantt-pace', id: 'gantt-pace' },
+    spent ? [h('b', { text: fmtDur(spent) }), ' of work done · '] : null,
+    togo > 0 ? ['about ', h('b', { text: fmtDur(togo) }), ' to the goal',
+                slow > togo * 1.15 ? [', up to ', h('b', { text: fmtDur(slow) }), ' if it goes slowly'] : null]
+             : (spent ? 'nothing further is planned' : null),
+    h('span', { class: 'hint', title: 'Working time: planning, checking and retries included; waiting for you, or for a model server that is away, is not.',
+      text: (fc.rests_on ? ' — from ' + fc.rests_on : '')
+        + '. Newest on top; a finished bar is as long as the task took.' }));
   host.append(options, legend, pace, svg);
   return host;
 }
@@ -1183,6 +1196,102 @@ function brief() {
         notes.length ? h('ul', {}, notes.map(n => h('li', { text: n.slice(2) })))
           : h('div', { class: 'dim', text: 'None yet. Use Steer to redirect her without stopping.' }),
         data.approved ? h('button', { class: 'btn small', text: 'Steer', onclick: steer }) : null)));
+}
+
+// ---- business
+//
+// The business side of the project: the plan she wrote for it, what a
+// complete proposal still needs, and who does what. Her part joins the
+// requirements when the plan is approved; yours is a list only you tick.
+
+const NEEDS_SAY = { there: ['✔', 'there'], assumed: ['~', 'an assumption that still needs checking'],
+                    missing: ['✗', 'missing'] };
+
+async function loadBusinessPlan() {
+  const b = data.business || {};
+  const key = cur + ':' + b.stamp;
+  if (!b.has_plan || bizKey === key) return;
+  bizKey = key;
+  const slug = cur;
+  try {
+    const r = await api.get('/api/file?slug=' + encodeURIComponent(slug) + '&path=' + encodeURIComponent(b.path));
+    if (slug !== cur) return;
+    bizText = r.content.replace(/^---\n[\s\S]*?\n---\n+/, '');
+  } catch { bizText = ''; bizKey = ''; return; }
+  if (tab === 'business') render(true);
+}
+
+async function draftBusiness() {
+  try {
+    await api.post('/api/business', { slug: cur });
+    toast('She is writing it — the business plan, what a complete proposal still needs, and who does what. It takes a few minutes.', 'good', 7000);
+  } catch (e) { toast(e.message, 'bad', 8000); }
+  refresh(true);
+}
+
+async function tickMine(item, done) {
+  try {
+    await api.post('/api/project/action', { slug: cur, id: item.id, done });
+  } catch (e) { toast(e.message, 'bad', 8000); }
+  bus.emit('projects:changed', cur);
+  refresh(true);
+}
+
+function business() {
+  const b = data.business || {}, job = b.job || {}, a = b.actions;
+  if (b.has_plan) loadBusinessPlan();
+  const working = job.running
+    ? h('div', { class: 'notice', id: 'biz-working', text: 'She is writing it now — ' + (job.step || 'starting…') }) : null;
+  const failed = !job.running && job.error
+    ? h('div', { class: 'notice warn', text: 'The last draft did not finish: ' + job.error }) : null;
+  if (!b.has_plan && !a) {
+    return h('div', {}, working, failed, h('div', { class: 'empty' },
+      h('div', { class: 'big', text: 'No business plan yet' }),
+      b.can_draft
+        ? 'She can write one from the idea and its plan: the business plan itself, everything a complete proposal still needs, and who does what — her part and yours.'
+        : 'It is written from the idea and its plan, and this idea has no plan yet.',
+      b.can_draft && !job.running ? h('div', { style: { marginTop: '14px' } },
+        h('button', { class: 'btn primary', id: 'biz-draft', text: 'Write the business plan', onclick: draftBusiness })) : null));
+  }
+  const mine = a ? a.you : [], hers = a ? a.aria : [], needs = a ? a.proposal : [];
+  const open = mine.filter(t => !t.done).length;
+  const none = text => h('div', { class: 'dim', text });
+  const plan = panel('Business plan',
+    b.has_plan ? (bizText ? body(bizText, b.path) : none('Loading…'))
+               : none('Not written yet.'),
+    h('span', {},
+      b.has_plan ? h('button', { class: 'btn small', text: 'Show in Files', onclick: () => pickFile(b.path) }) : null, ' ',
+      job.running ? null : h('button', { class: 'btn small', text: 'Write it again',
+        title: 'a fresh draft from the idea, the research and the plan — what you have ticked stays ticked',
+        onclick: draftBusiness })));
+  const yours = panel('Your part' + (mine.length ? ' — ' + (open ? open + ' of ' + mine.length + ' open' : 'all done') : ''),
+    mine.length ? h('div', { class: 'ticks' }, mine.map(t => {
+      const box = h('input', { type: 'checkbox', id: 'tick-' + t.id });
+      box.checked = !!t.done;
+      box.onchange = () => tickMine(t, box.checked);
+      return h('label', { class: 'tick' + (t.done ? ' done' : '') }, box,
+        h('div', {}, h('div', { class: 't-title' }, h('span', { class: 't-id', text: t.id }), ' ' + t.title),
+          t.why ? h('div', { class: 't-why', text: t.why }) : null,
+          t.prepare && !t.done ? h('div', { class: 't-prep', text: 'She can prepare: ' + t.prepare }) : null,
+          t.done ? h('div', { class: 't-why', text: 'done ' + (t.done_on || '') }) : null));
+    })) : none('Nothing listed for you.'),
+    h('span', { class: 'hint', text: 'only you tick these' }));
+  const her = panel("A.R.I.A.'s part",
+    hers.length ? h('div', { class: 'ticks' }, hers.map(t => h('div', { class: 'tick hers' },
+      h('span', { class: 't-mark', text: '◆' }),
+      h('div', {}, h('div', { class: 't-title' }, h('span', { class: 't-id', text: t.id }), ' ' + t.title),
+        t.detail ? h('div', { class: 't-why', text: t.detail }) : null))))
+      : none('Nothing listed for her.'),
+    h('span', { class: 'hint', text: data.approved ? 'part of the requirements — autopilot does these' : 'joins the requirements when you approve' }));
+  const need = panel('What a complete proposal needs',
+    needs.length ? h('table', { class: 'needs' }, needs.map(p => h('tr', { class: p.state },
+      h('td', { class: 'n-mark', text: (NEEDS_SAY[p.state] || NEEDS_SAY.missing)[0], title: (NEEDS_SAY[p.state] || NEEDS_SAY.missing)[1] }),
+      h('td', { class: 'n-item', text: p.item }),
+      h('td', { class: 'n-note' }, md(p.note || '', links())))))
+      : none('Not worked out yet.'),
+    h('span', { class: 'hint', text: '✔ there · ~ assumed · ✗ missing' }));
+  return h('div', {}, working, failed,
+    h('div', { class: 'biz' }, plan, h('div', { class: 'biz-side' }, yours, her, need)));
 }
 
 async function refineNow() {

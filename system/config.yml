@@ -52,10 +52,11 @@ aria:
   # Prove a giant loads and answers:  bin/aria models test general
   giants_use: auto
   # How many giants may be loaded at once; unload one after this many
-  # minutes unused (0 = keep it loaded); the first port (general uses it,
-  # research the next, coder the one after).
+  # minutes unused, so it does not sit on the memory when nothing needs
+  # it (0 = keep it loaded); the first port (general uses it, research
+  # the next, coder the one after).
   giants_loaded: 1
-  giants_idle_minutes: 0
+  giants_idle_minutes: 20
   giants_port: 8090
   # Giants and Ollama's everyday models take turns with the memory: before
   # a giant loads, Ollama unloads what it holds; before an everyday model
@@ -135,6 +136,19 @@ aria:
   # When capturing from the web UI, automatically run triage and then
   # develop whatever became a project — idea in, proposed plan out.
   auto_pipeline: true
+  # With every plan she also writes the business side of the idea: a
+  # business plan, the list of everything a complete proposal needs (and
+  # what is still missing), and who does what — her part, which joins the
+  # requirements when you approve, and yours, which only you tick. What
+  # these documents ask, and where the questions come from:
+  # docs/PROJECT-GROUNDWORK.md. For a project that has none yet:
+  # bin/aria business <project>
+  business_plans: true
+  # Where you are based, e.g. "United Kingdom". Legal form, tax, licences
+  # and data protection differ by country: with this set she names the
+  # bodies and rules that apply to you; left empty she says which points
+  # depend on the country and what to check.
+  based_in:
 
   # Absolute path to your Obsidian vault to enable the UI's "→ Obsidian"
   # button (exports a project's idea/research/plan plus an index note with
@@ -213,9 +227,43 @@ aria:
   # ---- autopilot ----------------------------------------------------
   # Context window, in tokens, requested from Ollama for every call (its
   # own default silently truncates long prompts) and used to size prompts.
-  # Raise it if your models and VRAM allow; 0 leaves the backend's own
-  # setting alone.
+  # A model's prompt, its reasoning and its answer all have to fit in it.
+  # Raise it if your models and VRAM allow (16384 is a good next step);
+  # 0 leaves the backend's own setting alone.
   context_tokens: 8192
+  # The everyday model server (Ollama) is started by her, not by you:
+  # when her app starts — and whenever a call finds it away — she starts
+  # it the way it is installed on this machine (its service if it has
+  # one, `ollama serve` otherwise). A system service only an administrator
+  # can start is the one case she cannot: `aria doctor` says so, with the
+  # command that makes it start with the computer.
+  ollama_autostart: true
+  # …then she loads the quick-tier model, so the first reply does not
+  # wait for it to be read from disk…
+  models_warm: true
+  # …and asks for the fast and smart models to stay in memory this long
+  # after their last use (30m, 2h, -1 = always; empty = Ollama's own
+  # default of five minutes — which a deep-tier model always gets: one
+  # the size of your RAM should not linger). A giant that needs the
+  # memory still gets it.
+  ollama_keep_alive: 30m
+  # Only if your model server is started in a way of its own (a container,
+  # another models folder): the command that starts it, which she then
+  # runs instead of working it out. {port} stands for the port she expects
+  # it on. e.g.  docker start ollama
+  ollama_command:
+  # Models that reason at length before they answer (qwen3, deepseek-r1…).
+  # Reasoning costs time, and room in the window above.
+  #   auto   = the quick tier answers straight away (chat, triage and
+  #            summaries stay quick); the smart tier reasons when the
+  #            window has room for the reasoning AND the answer — a larger
+  #            context_tokens lets her think more; the deep tier, models
+  #            you name yourself and the giants are left as they are
+  #   always = leave every model to itself
+  #   never  = ask every Ollama model for the answer alone
+  # A reply that is cut off because the reasoning filled the window is
+  # asked for again without it, whatever this is set to.
+  thinking: auto
 
   # After the goal is met and audited:  improve = keep going with
   # improvements until you stop her (or she runs out of improvements

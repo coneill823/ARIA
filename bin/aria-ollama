@@ -31,7 +31,8 @@ def check():
     h = eng.health()
     if not h["server"]:
         print(f"FAIL  cannot reach Ollama at {h['url']}: {h.get('error', '')}")
-        print("      is it running? try: ollama serve")
+        print("      start it: bin/aria models start   (she also starts it "
+              "herself when her app starts)")
         return 1
     print(f"ok    Ollama server at {h['url']}")
     if h["ok"]:

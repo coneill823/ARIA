@@ -15,11 +15,13 @@ aria_brain (Obsidian), aria_git (git/GitHub) — and the autonomous project
 loop lives in aria_autopilot, which builds on everything here.
 """
 
+import collections
 import datetime
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -28,6 +30,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -178,6 +181,10 @@ def config():
         "threshold": float(find("triage_confidence_threshold", "0.7")),
         "promotion_target": find("promotion_target", "./active-projects"),
         "auto_pipeline": flag("auto_pipeline", "true"),
+        # the business side of an idea: written with every plan, fitted to
+        # where the owner is based
+        "business_plans": flag("business_plans", "true"),
+        "based_in": find("based_in", "").split(" #")[0].strip(),
         "obsidian_vault": os.environ.get(
             "ARIA_OBSIDIAN_VAULT", find("obsidian_vault", "")),
         "brain_journal": flag("brain_journal", "true"),
@@ -199,6 +206,19 @@ def config():
         "backend_urls": {k: v.rstrip("/") for k, v in backends.items()},
         "backend_keys": block("backend_keys"),
         "context_tokens": int(number("context_tokens", 8192)),
+        # how a model that reasons before it answers (qwen3, deepseek-r1…)
+        # is used on the everyday tiers: see thinking_for()
+        "thinking": find("thinking", "auto").split(" #")[0].strip().lower(),
+        # the everyday model server: started when she starts, the quick
+        # model loaded, and kept loaded this long between uses
+        "ollama_autostart": flag("ollama_autostart", "true"),
+        "models_warm": flag("models_warm", "true"),
+        # (set to nothing by the owner, it is nothing: Ollama decides)
+        "ollama_keep_alive": (mine["ollama_keep_alive"]
+                              if "ollama_keep_alive" in mine else
+                              find("ollama_keep_alive", "30m"))
+            .split(" #")[0].strip().lower(),
+        "ollama_command": find("ollama_command", "").split(" #")[0].strip(),
         "webhooks": block("webhooks"),
         "heartbeat_url": find("heartbeat_url", ""),
         "web_access": flag("web_access", "true"),
@@ -232,7 +252,7 @@ def config():
         "giants_use": find("giants_use", "auto").split(" #")[0].strip()
             .lower(),
         "giants_loaded": max(1, int(number("giants_loaded", 1))),
-        "giants_idle_minutes": number("giants_idle_minutes", 0),
+        "giants_idle_minutes": number("giants_idle_minutes", 20),
         "giants_port": int(number("giants_port", 8090)),
         "giants_ctx": int(number("giants_ctx", 8192)),
         "giants_free_memory": flag("giants_free_memory", "true"),
@@ -243,14 +263,34 @@ def config():
     }
 
 
-def _parse_spec(spec, cfg):
-    """Parse a 'backend/model' spec against configured backends; None if
-    the backend name is unknown."""
-    backend, _, model = spec.partition("/")
+def _split_spec(spec):
+    backend, _, model = (spec or "").partition("/")
     backend = backend.strip().lower()
     model = model.strip()
     if not model:  # bare model name means ollama
         backend, model = "ollama", backend
+    return backend, model
+
+
+def _kept_loaded(backend, model, cfg):
+    """How long Ollama is asked to keep this model in memory after a call
+    (None: Ollama decides). Only the everyday models — the fast and smart
+    tiers — are kept: they are what a chat or the next task waits for. A
+    deep-tier model the size of the machine's RAM is let go on Ollama's
+    own, shorter clock."""
+    if backend != "ollama":
+        return None
+    everyday = [_split_spec(cfg["tiers"].get(t)) for t in ("fast", "smart")
+                if cfg.get("tiers", {}).get(t)]
+    if everyday and (backend, model) not in everyday:
+        return None
+    return _keep_alive(cfg.get("ollama_keep_alive"))
+
+
+def _parse_spec(spec, cfg):
+    """Parse a 'backend/model' spec against configured backends; None if
+    the backend name is unknown."""
+    backend, model = _split_spec(spec)
     url = cfg["backend_urls"].get(backend)
     if url is None:
         return None
@@ -259,13 +299,15 @@ def _parse_spec(spec, cfg):
            or cfg["backend_keys"].get(backend) or "local")
     return {"kind": kind, "url": url, "model": model,
             "backend": backend, "key": key, "spec": f"{backend}/{model}",
-            "num_ctx": cfg.get("context_tokens", 0)}
+            "num_ctx": cfg.get("context_tokens", 0),
+            "keep_alive": _kept_loaded(backend, model, cfg)}
 
 
 def _legacy_target(cfg, tier):
     return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
             "backend": "ollama", "spec": f"ollama/{cfg['model']}",
-            "num_ctx": cfg.get("context_tokens", 0), "tier": tier}
+            "num_ctx": cfg.get("context_tokens", 0), "tier": tier,
+            "keep_alive": _keep_alive(cfg.get("ollama_keep_alive"))}
 
 
 def resolve_tier(tier, cfg=None):
@@ -367,6 +409,49 @@ class GenerationTimeout(RuntimeError):
     """One generation ran past its wall-clock limit."""
 
 
+class ReplyCutOff(RuntimeError):
+    """The model ran out of room before it had finished: its window was
+    full of prompt, reasoning and answer, or it reached its output limit.
+    `reply` is what it had written, `thought` how many characters of
+    reasoning came before it."""
+
+    def __init__(self, message, reply="", thought=0):
+        super().__init__(message)
+        self.reply, self.thought = reply, thought
+
+
+# What the last model call on this thread looked like — how fast it was,
+# whether it reasoned first, whether it was cut off. Callers that care
+# (run_agent, the self-test) read it with last_call().
+_CALL = threading.local()
+CALLS = collections.deque(maxlen=60)    # the recent ones, any thread
+
+
+def last_call():
+    return dict(getattr(_CALL, "info", None) or {})
+
+
+def _note_call(target, **facts):
+    info = {"model": target.get("model", ""), "tier": target.get("tier", ""),
+            "at": time.time(), **facts}
+    _CALL.info = info
+    CALLS.append(info)
+
+
+# A model's reasoning as it streams. It is shown (the Live tab, a "thinking"
+# status in chat) and counts as a sign of life — it is never part of the
+# answer. Callables take the text.
+THINK_LISTENERS = []
+
+
+def _thinking_note(text, on_thought=None):
+    for fn in ([on_thought] if on_thought else []) + list(THINK_LISTENERS):
+        try:
+            fn(text)
+        except Exception:
+            pass
+
+
 def backend_trouble(exc):
     """Is this exception the model server being away (vs the task failing)?"""
     if isinstance(exc, BackendDown):
@@ -421,7 +506,7 @@ def parse_json_reply(reply):
 
 
 def chat_stream(target, prompt, system=None, force_json=False, on_token=None,
-                timeout=3600, max_seconds=0):
+                timeout=3600, max_seconds=0, think=None, on_thought=None):
     """Single-prompt convenience wrapper around chat_messages."""
     messages = []
     if system:
@@ -429,17 +514,86 @@ def chat_stream(target, prompt, system=None, force_json=False, on_token=None,
     messages.append({"role": "user", "content": prompt})
     return chat_messages(target, messages, force_json=force_json,
                          on_token=on_token, timeout=timeout,
-                         max_seconds=max_seconds)
+                         max_seconds=max_seconds, think=think,
+                         on_thought=on_thought)
+
+
+CHARS_PER_TOKEN = 3.2    # how prompts are sized; low for prose, fair for code
+THINK_ROOM = 4000        # tokens a reasoning model needs beyond its prompt
+                         # to think AND still answer
+
+
+def thinking_for(target, messages, cfg=None):
+    """Should a model that can "think" — reason at length before it
+    answers, as qwen3 and deepseek-r1 do — think on this call? None leaves
+    it to the model; False asks for the answer directly.
+
+    Reasoning is paid for twice: in time, and in the window, which it
+    shares with the prompt and the answer. A plan that is reasoned about
+    for two thousand tokens and then has no room left to be written down
+    is no plan. So with `thinking: auto`:
+      - the quick tier never reasons — triage, chat and summaries have to
+        be quick, and a chat that thinks for a minute before its first
+        word looks like a chat that hangs;
+      - the smart tier reasons when its window has room for it — give her
+        a bigger window (context_tokens) and she thinks more;
+      - the deep tier, a model you name yourself and the giants are left
+        as they are: reasoning is what they are for.
+    `always` leaves every model to itself; `never` asks every Ollama model
+    for the answer alone."""
+    if target.get("kind", "ollama") != "ollama" or target.get("giant"):
+        return None                 # only Ollama takes the instruction
+    mode = (cfg or config()).get("thinking", "auto")
+    if mode == "always":
+        return None
+    if mode == "never" or target.get("tier") == "fast":
+        return False
+    if target.get("tier") == "smart":
+        window = int(target.get("num_ctx") or 0)
+        used = sum(len(m.get("content") or "") for m in messages
+                   if isinstance(m.get("content"), str)) / CHARS_PER_TOKEN
+        if window and window - used < THINK_ROOM:
+            return False
+    return None
 
 
 def chat_messages(target, messages, force_json=False, on_token=None,
-                  timeout=3600, max_seconds=0):
+                  timeout=3600, max_seconds=0, think=None, on_thought=None):
     """Stream a chat completion from the target backend; returns the full
     reply text. `target` comes from resolve_tier() — a legacy config dict
     (url+model, no kind) is treated as Ollama. `timeout` is how long the
     server may stay silent; `max_seconds` (0 = no limit) caps the whole
-    generation."""
+    generation. `think` — None: thinking_for() decides; False: ask a
+    reasoning model for the answer alone. `on_thought` receives a model's
+    reasoning as it streams (it is never part of the reply).
+
+    A reply that is cut off because the model's reasoning filled its
+    window is asked for again, for the answer alone. One that is cut off
+    all the same comes back as far as it got (last_call() says so) — or,
+    for JSON, raises ReplyCutOff: half a JSON object is no answer."""
     deadline = time.time() + max_seconds if max_seconds else 0
+
+    def call(target, think):
+        try:
+            return _chat_call(target, messages, force_json, on_token,
+                              timeout, deadline, think, on_thought)
+        except ReplyCutOff as cut:
+            if cut.thought and think is not False \
+                    and target.get("kind", "ollama") == "ollama":
+                note = (f"{target['model']} reasoned until its window was "
+                        "full — asking again for the answer alone")
+                _garage_note(note)
+                if on_token:
+                    on_token(f"\n\n[{note}]\n\n")
+                try:
+                    return _chat_call(target, messages, force_json, on_token,
+                                      timeout, deadline, False, on_thought)
+                except ReplyCutOff as again:
+                    cut = again
+            if force_json:
+                raise cut
+            return cut.reply
+
     if target.get("giant"):
         # a giant: started (and others unloaded) on demand, and held so it
         # cannot be swapped out mid-answer
@@ -447,8 +601,7 @@ def chat_messages(target, messages, force_json=False, on_token=None,
         try:
             with aria_garage.serving(target["giant"], cfg,
                                      notify=_garage_note):
-                return _chat_call(target, messages, force_json, on_token,
-                                  timeout, deadline)
+                return call(target, None)
         except aria_garage.GarageBusy as exc:
             raise BackendDown(str(exc))
         except aria_garage.GarageError as exc:
@@ -456,8 +609,24 @@ def chat_messages(target, messages, force_json=False, on_token=None,
             target = resolve_tier("smart", cfg)
     if not target.get("giant") and target.get("kind", "ollama") == "ollama":
         _free_for_everyday(target)
-    return _chat_call(target, messages, force_json, on_token, timeout,
-                      deadline)
+    if think is None:
+        think = thinking_for(target, messages)
+    try:
+        return call(target, think)
+    except BackendDown:
+        # the model server is not running: start it (where it is hers to
+        # start) and ask again — once, and not more than once a minute
+        cfg = config()
+        # (a start that could not be made — no right to, no Ollama found —
+        # is not tried again for ten minutes: nothing will have changed)
+        hold = 600 if WAKE["note"] else 60
+        if target.get("kind", "ollama") != "ollama" \
+                or not cfg.get("ollama_autostart", True) \
+                or time.time() - WAKE["at"] < hold or ollama_up(cfg):
+            raise
+        if not ollama_start(cfg, notify=_garage_note)["up"]:
+            raise
+        return call(target, think)
 
 
 GARAGE_LISTENERS = []           # callables that want giant load notices
@@ -568,6 +737,334 @@ def chat_target(cfg=None):
     return fast
 
 
+# ---- the everyday model server: up when she is ---------------------------
+#
+# She cannot work without it, and "start Ollama first" is a step nobody
+# should have to remember. When her server starts — and whenever a call
+# finds the model server away — she starts it the way it is run on this
+# machine, then loads the quick-tier model so the first reply does not
+# wait for it. What she cannot do is start a service only an administrator
+# may start; then she says so, with the one command that fixes it for good.
+
+WAKE = {"at": 0.0, "trying": False, "how": "", "note": "", "started": False,
+        "warmed": "", "warming": "", "log": "", "away": False}
+_WAKE_LOCK = threading.Lock()
+_WAKE_PROCS = []                        # an `ollama serve` she started
+ENABLE_OLLAMA = "sudo systemctl enable --now ollama"
+OLLAMA_UNIT = "aria-ollama"             # hers, when she runs `ollama serve`
+
+
+def _is_local(url):
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def uses_ollama(cfg=None):
+    """Does any tier run on Ollama? Where none does, its server is not
+    hers to start."""
+    cfg = cfg or config()
+    return any(not t.get("giant") and t.get("kind", "ollama") == "ollama"
+               for t in (resolve_tier(n, cfg)
+                         for n in ("fast", "smart", "deep")))
+
+
+def ollama_up(cfg=None, timeout=2):
+    cfg = cfg or config()
+    url = cfg["backend_urls"].get("ollama")
+    if not url:
+        return False
+    try:
+        urllib.request.urlopen(url + "/api/tags", timeout=timeout).close()
+        return True
+    except Exception:
+        return False
+
+
+def _keep_alive(text):
+    """The keep-loaded setting as Ollama's API takes it: a count of seconds
+    goes as a number (a bare "-1" or "90" in a string is refused), a time
+    with its unit as text. None: nothing is sent, and Ollama decides."""
+    text = str(text or "").strip().lower()
+    if not text:
+        return None
+    return int(text) if re.fullmatch(r"-?\d+", text) else text
+
+
+def _systemctl(*args, timeout=5):
+    try:
+        return subprocess.run(["systemctl", *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _unit_known(*scope):
+    """Does systemd know an ollama.service (among the user's units, or the
+    system's)?"""
+    done = _systemctl(*scope, "cat", "ollama.service")
+    return bool(done) and done.returncode == 0
+
+
+def _unit_state(*scope, unit="ollama.service"):
+    """active, activating, inactive, failed … ("" when it cannot be told)"""
+    done = _systemctl(*scope, "is-active", unit)
+    return done.stdout.strip() if done else ""
+
+
+def _unit_enabled(*scope):
+    done = _systemctl(*scope, "is-enabled", "ollama.service")
+    return None if done is None else done.returncode == 0
+
+
+def _own_store():
+    """Has this user Ollama models of their own? That is the sign of an
+    Ollama that is run as them (`ollama serve` in a terminal) rather than
+    as the system's service, which keeps its models elsewhere — and a
+    server started the other way would come up with none of them."""
+    store = Path(os.environ.get("OLLAMA_MODELS")
+                 or Path.home() / ".ollama" / "models")
+    try:
+        return any(p.is_file() for p in (store / "manifests").rglob("*"))
+    except OSError:
+        return False
+
+
+def ollama_how(cfg=None):
+    """How the model server is started on this machine:
+      "command"      the owner's own command (the ollama_command setting)
+      "user-unit"    an ollama.service among the user's own units
+      "system-unit"  the system's ollama.service
+      "binary"       `ollama serve`, run as the user
+      ""             no Ollama was found"""
+    if os.environ.get("ARIA_OLLAMA_COMMAND") \
+            or (cfg or config()).get("ollama_command"):
+        return "command"
+    if not shutil.which("ollama"):
+        return ""
+    if _unit_known("--user"):
+        return "user-unit"
+    if _unit_known() and (_unit_state() in ("active", "activating")
+                          or _unit_enabled() or not _own_store()):
+        return "system-unit"
+    return "binary"
+
+
+def ollama_boots(cfg=None):
+    """Will the model server be there after the computer restarts, without
+    anyone starting it? True: its own service is set to. False: it is not.
+    None: it has no service (she starts it herself, when she starts)."""
+    how = ollama_how(cfg)
+    if how == "user-unit":
+        return _unit_enabled("--user")
+    if how == "system-unit":
+        return _unit_enabled()
+    return None
+
+
+def _ollama_env(url):
+    """What an `ollama serve` she starts is given beyond the usual: the
+    Ollama and graphics-card settings of her own environment, and the
+    address she expects it at when that is not Ollama's usual one."""
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith(("OLLAMA_", "CUDA_", "HSA_", "ROCR_", "HIP_",
+                            "GPU_DEVICE_"))}
+    at = urllib.parse.urlparse(url)
+    if (at.port or 11434) != 11434:
+        env["OLLAMA_HOST"] = f"{at.hostname}:{at.port}"
+    return env
+
+
+def _spawn_ollama(how, url, cfg):
+    """Start it. Returns (why not, "") — or ("", where its log is) when
+    the start was issued."""
+    port = urllib.parse.urlparse(url).port or 11434
+    log = ROOT / "system" / "ollama.log"
+    env = dict(os.environ)
+    if how == "command":
+        argv = [part.replace("{port}", str(port)) for part in shlex.split(
+            os.environ.get("ARIA_OLLAMA_COMMAND")
+            or cfg.get("ollama_command", ""))]
+    elif how in ("user-unit", "system-unit"):
+        scope = ["--user"] if how == "user-unit" else []
+        journal = "journalctl " + " ".join(scope + ["-u", "ollama", "-e"])
+        if _unit_state(*scope) in ("active", "activating"):
+            return "", journal          # on its way up already: wait for it
+        done = _systemctl(*scope, "--no-ask-password", "start",
+                          "ollama.service", timeout=60)
+        if done is not None and done.returncode == 0:
+            return "", journal
+        if how == "user-unit":
+            return ("systemd could not start ollama.service: " + " ".join(
+                (done.stderr or done.stdout).split())[:200]
+                if done is not None else
+                "systemd did not answer when asked to start ollama.service"
+            ), ""
+        if _unit_enabled():
+            return ("Ollama's service is set to start with the computer but "
+                    "is not running, and only an administrator can start "
+                    "it: sudo systemctl start ollama   (why it stopped: "
+                    + journal + ")"), ""
+        return ("Ollama is installed as a system service, which only an "
+                "administrator can start. Make it start with the computer "
+                f"— once, in a terminal: {ENABLE_OLLAMA}"), ""
+    elif how == "binary":
+        argv = [shutil.which("ollama"), "serve"]
+        extra = _ollama_env(url)
+        env.update(extra)
+        if shutil.which("systemd-run"):
+            # a unit of its own, so that it outlives a restart of hers
+            journal = f"journalctl --user -u {OLLAMA_UNIT} -e"
+            if _unit_state("--user", unit=OLLAMA_UNIT + ".service") in (
+                    "active", "activating"):
+                return "", journal
+            try:
+                done = subprocess.run(
+                    ["systemd-run", "--user", "--collect", "--quiet",
+                     "--unit", OLLAMA_UNIT,
+                     "--description", "Ollama, started by A.R.I.A.",
+                     *[f"--setenv={k}={v}" for k, v in extra.items()],
+                     *argv], capture_output=True, text=True, timeout=30)
+                if done.returncode == 0:
+                    return "", journal
+            except (OSError, subprocess.TimeoutExpired):
+                pass                    # no user manager here: run it plainly
+    else:
+        return ("I cannot find Ollama on this machine to start it (there "
+                "is no `ollama` command). If it is started some other way, "
+                "give me the command: aria settings set ollama_command "
+                "\"…\""), ""
+    if not argv:
+        return "the command to start the model server is empty", ""
+    try:                                # a log that does not grow for ever
+        if log.stat().st_size > 5_000_000:
+            log.replace(log.with_name(log.name + ".1"))
+    except OSError:
+        pass
+    with open(log, "ab") as fh:
+        _WAKE_PROCS.append(subprocess.Popen(
+            argv, stdout=fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True, env=env))
+    return "", str(log)
+
+
+def ollama_start(cfg=None, wait=45, notify=None):
+    """Make sure the everyday model server is answering; start it if it is
+    not and this is a machine she may start it on. Returns the state of
+    that: {up, how, started, note}. Never raises."""
+    cfg = cfg or config()
+    url = cfg["backend_urls"].get("ollama", "")
+    with _WAKE_LOCK:
+        if ollama_up(cfg):
+            WAKE.update(trying=False, note="", away=False)
+            return {"up": True, "how": WAKE["how"], "started": False,
+                    "note": ""}
+        if not url or not _is_local(url):
+            note = (f"the model server at {url} is not answering, and it "
+                    "is not on this machine for me to start")
+            WAKE.update(trying=False, how="remote", note=note, away=True)
+            return {"up": False, "how": "remote", "started": False,
+                    "note": note}
+        how = ollama_how(cfg)
+        WAKE.update(at=time.time(), trying=True, how=how, note="")
+        if notify:
+            notify("the model server is not running — starting it")
+        try:
+            note, log = _spawn_ollama(how, url, cfg)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            note, log = f"could not start the model server: {exc}", ""
+        up = False
+        if not note:
+            deadline = time.time() + wait
+            while time.time() < deadline and not up:
+                time.sleep(0.5)
+                up = ollama_up(cfg, timeout=1)
+            if not up:
+                note = ("the model server was started but is not answering "
+                        f"yet — see {log}")
+        WAKE.update(trying=False, note=note, log=log, away=not up,
+                    started=up or WAKE["started"])
+        if notify:
+            notify("the model server is up" if up else note)
+        return {"up": up, "how": how, "started": up, "note": note}
+
+
+def ollama_warm(cfg=None, notify=None):
+    """Load the quick-tier model now, so the first reply does not wait for
+    it. Left alone when it would get in the way: a giant has the memory,
+    or autopilot is mid-step and will load what it needs. Returns the
+    model loaded, or ""."""
+    cfg = cfg or config()
+    target = resolve_tier("fast", cfg)
+    if target.get("kind", "ollama") != "ollama" or target.get("giant") \
+            or target.get("keep_alive") == 0 \
+            or aria_garage.loaded_roles(cfg) or autopilot_busy():
+        return ""
+    model = target["model"]
+    if _in_memory(model, ollama_loaded(cfg)):
+        WAKE["warmed"] = model
+        return model
+    WAKE["warming"] = model
+    if notify:
+        notify(f"loading {model} so the first reply is quick")
+    body = {"model": model}
+    if target.get("keep_alive") is not None:
+        body["keep_alive"] = target["keep_alive"]
+    if target.get("num_ctx"):
+        # the window she will ask for anyway: a different one later would
+        # make Ollama load the model a second time
+        body["options"] = {"num_ctx": int(target["num_ctx"])}
+    try:
+        req = urllib.request.Request(
+            target["url"] + "/api/generate", method="POST",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=900).close()
+        WAKE.update(warmed=model, warming="")
+        if notify:
+            notify(f"{model} is loaded")
+        return model
+    except Exception as exc:
+        WAKE.update(warming="")
+        if notify:
+            notify(f"{model} could not be loaded ahead of time: "
+                   + " ".join(str(exc).split())[:160])
+        return ""
+
+
+def models_wake(notify=None):
+    """What her server does when it starts: the model server up, the quick
+    model loaded. Each part can be switched off in Settings."""
+    cfg = config()
+    if not uses_ollama(cfg):
+        return wake_state()
+    state = {"up": ollama_up(cfg), "note": ""}
+    if not state["up"] and cfg.get("ollama_autostart", True):
+        state = ollama_start(cfg, notify=notify)
+    WAKE["away"] = not state["up"]
+    if state["up"] and cfg.get("models_warm", True):
+        ollama_warm(cfg, notify=notify)
+    return wake_state()
+
+
+def wake_seen(up):
+    """Told what a look at the model server found. Returns True when it
+    has just come back from being away — started by hand, or by the
+    computer a moment after she started: the time to load the quick model
+    after all."""
+    back = bool(up) and WAKE["away"]
+    WAKE["away"] = not up
+    if up and not WAKE["trying"]:
+        WAKE["note"] = ""               # what was wrong no longer is
+    return back
+
+
+def wake_state():
+    """For the sidebar and doctor: is she starting or loading something,
+    and if the model server is away, what would fix that."""
+    return {k: WAKE[k] for k in ("trying", "how", "note", "started",
+                                 "warmed", "warming")}
+
+
 def _garage_note(text):
     for fn in list(GARAGE_LISTENERS):
         try:
@@ -576,19 +1073,25 @@ def _garage_note(text):
             pass
 
 
-def _chat_call(target, messages, force_json, on_token, timeout, deadline):
+def _chat_call(target, messages, force_json, on_token, timeout, deadline,
+               think=None, on_thought=None):
     try:
         if target.get("kind", "ollama") == "openai":
             return _openai_stream(target, messages, force_json, on_token,
-                                  timeout, deadline)
+                                  timeout, deadline, on_thought)
         return _ollama_stream(target, messages, force_json, on_token,
-                              timeout, deadline)
+                              timeout, deadline, think, on_thought)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
             detail = exc.read().decode("utf-8", "replace")[:200]
         except Exception:
             pass
+        if exc.code == 400 and think is False and "think" in detail.lower():
+            # a server or model that will not take the instruction: ask
+            # the way it has always been asked
+            return _chat_call(target, messages, force_json, on_token,
+                              timeout, deadline, None, on_thought)
         if exc.code >= 500 or (exc.code == 503 and target.get("giant")):
             raise BackendDown(f"{target['model']}: HTTP {exc.code} {detail}")
         raise RuntimeError(f"{target['model']}: HTTP {exc.code} {detail}")
@@ -600,20 +1103,36 @@ def _chat_call(target, messages, force_json, on_token, timeout, deadline):
                           f"{target['url']}: {getattr(exc, 'reason', exc)}")
 
 
-def _ollama_stream(target, messages, force_json, on_token, timeout, deadline):
+def _ollama_stream(target, messages, force_json, on_token, timeout, deadline,
+                   think=None, on_thought=None):
     body = {"model": target["model"], "stream": True, "messages": messages}
     if force_json:
         body["format"] = "json"
-    if target.get("num_ctx"):
-        # without this Ollama silently truncates long prompts to its small
-        # default window — fatal for a planner reading project state
-        body["options"] = {"num_ctx": int(target["num_ctx"])}
+    window = int(target.get("num_ctx") or 0)
+    if window:
+        # Without num_ctx Ollama silently truncates long prompts to its
+        # small default window — fatal for a planner reading project state.
+        # And no more writing than the window has room for: a reply that
+        # outgrows it has the oldest part of its own prompt dropped to make
+        # room, after which a model can go on writing, lost, for hours.
+        # (The prompt is counted generously short here, so a reply that
+        # would have fitted is never cut.)
+        chars = sum(len(m.get("content") or "") for m in messages
+                    if isinstance(m.get("content"), str))
+        body["options"] = {"num_ctx": window,
+                           "num_predict": max(256, window - int(chars / 4.5))}
+    if think is False:
+        body["think"] = False       # a reasoning model: the answer alone
+    if target.get("keep_alive") is not None:
+        # stay loaded between uses: a chat half an hour apart should not
+        # wait for the model to be read from disk again
+        body["keep_alive"] = target["keep_alive"]
     req = urllib.request.Request(
         target["url"] + "/api/chat",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    parts = []
+    parts, thought, last, t0 = [], 0, {}, time.time()
     # generous timeout: a larger-than-RAM "giant" model can sit silent for
     # a long time processing the prompt before the first token streams
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -624,21 +1143,45 @@ def _ollama_stream(target, messages, force_json, on_token, timeout, deadline):
             data = json.loads(raw)
             if data.get("error"):
                 raise RuntimeError(f"{target['model']}: {data['error']}")
-            tok = (data.get("message") or {}).get("content", "")
+            message = data.get("message") or {}
+            reasoning = message.get("thinking") or ""
+            if reasoning:                   # shown, never part of the reply
+                thought += len(reasoning)
+                _thinking_note(reasoning, on_thought)
+            tok = message.get("content", "")
             if tok:
                 parts.append(tok)
                 if on_token:
                     on_token(tok)
             if data.get("done"):
+                last = data
                 break
             if deadline and time.time() > deadline:
                 raise GenerationTimeout(
                     f"{target['model']} ran past its time limit")
-    return "".join(parts)
+    reply = "".join(parts)
+    read, wrote = (int(last.get("prompt_eval_count") or 0),
+                   int(last.get("eval_count") or 0))
+    took = float(last.get("eval_duration") or 0) / 1e9
+    cut = last.get("done_reason") == "length" \
+        or bool(window and read and read + wrote >= window)
+    _note_call(target, think=think, thought=thought, cut_off=cut,
+               prompt_tokens=read, tokens=wrote,
+               seconds=round(time.time() - t0, 1),
+               rate=round(wrote / took, 1) if took and wrote else 0,
+               window=window)
+    if cut:
+        raise ReplyCutOff(
+            f"{target['model']} ran out of room — its window of "
+            f"{window or 'unknown size'} tokens was full"
+            + (f" after {read} tokens of prompt and {wrote} of "
+               + ("reasoning and answer" if thought else "answer")
+               if read else ""), reply, thought)
+    return reply
 
 
 def _openai_stream(target, messages, force_json=False, on_token=None,
-                   timeout=3600, deadline=0):
+                   timeout=3600, deadline=0, on_thought=None):
     """Streaming client for any OpenAI-compatible server (llama.cpp
     llama-server, LM Studio, vLLM...)."""
     body = {"model": target["model"], "stream": True, "messages": messages}
@@ -650,7 +1193,7 @@ def _openai_stream(target, messages, force_json=False, on_token=None,
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + target.get("key", "local")},
     )
-    parts = []
+    parts, thought, ended, timings, t0 = [], 0, "", {}, time.time()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             raw = raw.strip()
@@ -661,30 +1204,68 @@ def _openai_stream(target, messages, force_json=False, on_token=None,
                 break
             data = json.loads(payload)
             choices = data.get("choices") or [{}]
-            tok = (choices[0].get("delta") or {}).get("content") or ""
+            delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content") or ""
+            if reasoning:                   # shown, never part of the reply
+                thought += len(reasoning)
+                _thinking_note(reasoning, on_thought)
+            tok = delta.get("content") or ""
             if tok:
                 parts.append(tok)
                 if on_token:
                     on_token(tok)
+            ended = choices[0].get("finish_reason") or ended
+            timings = data.get("timings") or timings      # llama-server
             if deadline and time.time() > deadline:
                 raise GenerationTimeout(
                     f"{target['model']} ran past its time limit")
-    return "".join(parts)
+    reply = "".join(parts)
+    _note_call(target, think=None, thought=thought, cut_off=ended == "length",
+               prompt_tokens=int(timings.get("prompt_n") or 0),
+               tokens=int(timings.get("predicted_n") or 0),
+               seconds=round(time.time() - t0, 1),
+               rate=round(float(timings.get("predicted_per_second") or 0), 1),
+               window=0)
+    if ended == "length":
+        raise ReplyCutOff(
+            f"{target['model']} ran out of room — its window was full "
+            "before it had finished"
+            + (" (its reasoning took the room)" if thought and not reply
+               else ""), reply, thought)
+    return reply
 
 
 def ask_json(target, prompt, system, on_token=None, timeout=3600, tries=2):
-    """Ask for JSON and get a parsed value back, re-asking once if the
-    model answers with something that is not JSON."""
-    last = ""
+    """Ask for JSON and get a parsed value back. A reply that is not JSON
+    — or that was cut off before it was whole — is asked for once more,
+    this time for the answer alone, with no reasoning first."""
+    last, cut = "", None
     for attempt in range(tries):
-        last = chat_stream(
-            target, prompt if attempt == 0 else
-            prompt + "\n\nYour previous reply was not valid JSON. Reply "
-                     "with ONLY the JSON object, nothing else.",
-            system, force_json=True, on_token=on_token, timeout=timeout)
-        data = parse_json_reply(last)
+        try:
+            last = chat_stream(
+                target, prompt if attempt == 0 else
+                prompt + "\n\nYour previous reply was not valid JSON. "
+                         "Reply with ONLY the JSON object, nothing else.",
+                system, force_json=True, on_token=on_token, timeout=timeout,
+                think=None if attempt == 0 else False)
+            cut = None
+            data = parse_json_reply(last)
+        except ReplyCutOff as exc:
+            # whole, or nothing: the lenient reader would find a complete
+            # inner piece in a reply that stops short — one task of a plan
+            # — and hand that back as if it were the answer
+            last, cut = exc.reply, exc
+            try:
+                data = json.loads(strip_think(last))
+            except (ValueError, TypeError):
+                data = None
         if data is not None:
             return data
+    if cut is not None:
+        raise ValueError(
+            f"{cut} — the reply did not fit. Raise the context window "
+            "(Settings → Models, or: aria settings set context_tokens "
+            "16384), or use a model that needs less room")
     raise ValueError(f"model did not return JSON: {last[:160]!r}")
 
 
@@ -1282,6 +1863,16 @@ def develop_run(emit, slugs=None):
         brain_journal(f"drafted a plan for [[{slug}]]"
                       + (" from live web research" if found["sources"]
                          else ""))
+        if cfg["business_plans"]:
+            # The plan is what the owner approves, and it is ready. What
+            # follows is groundwork beside it: if it fails, the plan stands.
+            try:
+                business_run(slug, emit, cfg)
+            except Exception as exc:
+                emit({"event": "error",
+                      "log": f"{slug}: the plan is ready; its business plan "
+                             f"could not be written ({exc}) — try again "
+                             f"with: aria business {slug}"})
 
     emit({"event": "stage_done", "stage": "develop",
           "log": "drafts ready — review them, then approve one on the "
@@ -1305,10 +1896,11 @@ def refine(slug, feedback):
         raise ValueError(f"no such potential project: {slug}")
 
     version = len(list(proj.glob("proposed-plan.v*.md"))) + 1
-    for name in ("proposed-plan", "research"):
+    for name in ("proposed-plan", "research") + BUSINESS_DOCS:
         f = proj / f"{name}.md"
         if f.exists():
             f.rename(proj / f"{name}.v{version}.md")
+    # (actions.json stays: the next draft carries the owner's ticks over)
 
     today = datetime.date.today().isoformat()
     with idea.open("a", encoding="utf-8") as fh:
@@ -1322,6 +1914,523 @@ def refine(slug, feedback):
     ledger_update(slug, "project", "processing", "pipeline/01-processing/",
                   (fm.get("captured") or "?")[:10])
     return dest
+
+
+# ---------------------------------------------------------------- business
+#
+# Beside the plan, develop writes what it takes to make the idea real as a
+# venture: a business plan, the list of everything a complete proposal
+# needs (and what is still missing), and who does what — her part, and the
+# owner's. The questions come from docs/PROJECT-GROUNDWORK.md; the shape of
+# the documents from system/templates/business-plan.md and action-list.md.
+
+BUSINESS_DOCS = ("business-plan", "action-list")
+PROJECT_DOCS = ("idea", "research", "proposed-plan", "requirements") \
+    + BUSINESS_DOCS
+
+# What a complete proposal needs: (key, what it is, the document that
+# always answers it — "" where a model has to judge how far it is answered)
+PROPOSAL_ITEMS = (
+    ("idea", "The idea, in your words", "idea"),
+    ("prior_art", "Prior art and alternatives", "research"),
+    ("plan", "The plan: scope, approach, milestones", "proposed-plan"),
+    ("problem", "The problem and who has it, with evidence", ""),
+    ("market", "Market size and competitors", ""),
+    ("offer", "The offer and its price", ""),
+    ("money", "Costs, break-even and a cash forecast", ""),
+    ("funding", "Funding: how much, from where", ""),
+    ("legal", "Legal form and registrations", ""),
+    ("rules", "Licences, data protection, ownership of the work", ""),
+    ("people", "People: who does what, what is missing", ""),
+    ("risks", "Risks and how each is handled", ""),
+    ("measures", "Milestones, and how success is measured", ""),
+    ("decisions", "The decisions that are yours", ""),
+)
+STATE_MARK = {"there": "✔", "assumed": "~", "missing": "✗"}
+
+BUSINESS_SYSTEM = """You write the business plan for a project idea, for its
+owner — one person deciding whether and how to do this.
+Write exactly the sections you are given, in order, each under its '## '
+heading exactly as given. Plain markdown. No preamble, no closing remarks.
+- Specific to THIS idea: name the kinds of customer, the competitors, the
+  channels, the costs. No sentence that would fit any business.
+- Sized to the idea. A small personal tool gets a few honest lines a
+  section; where a section does not apply, say so in one line and why.
+- Numbers are estimates: show the arithmetic (40 customers x 9 a month =
+  360 a month) and say what each figure rests on. A range beats a point.
+- Never present a guess as a fact. Never invent a statistic, a source, a
+  law or a company. Where the research gives a fact, cite it as [n]. What
+  you do not know, say — and say what would have to be found out.
+- %s
+- Plain words. No hype."""
+
+ACTIONS_SYSTEM = """You turn a project's plan and business plan into who
+does what. Respond with ONLY a JSON object:
+
+{"proposal": {"<key>": {"state": "there|assumed|missing",
+                        "note": "<one line: where it is answered, or what is still needed>"}},
+ "aria": [{"title": "short imperative title",
+           "detail": "what will exist when it is done, naming the document",
+           "why": "what it is needed for"}],
+ "you": [{"title": "short imperative title",
+          "why": "why this takes a person",
+          "prepare": "what A.R.I.A. can prepare so that your part is short"}]}
+
+Rules:
+- "proposal": one entry for EVERY key under PROPOSAL ITEMS. "there" = the
+  documents answer it with evidence; "assumed" = answered with an estimate
+  or an assumption that still needs checking; "missing" = not answered.
+- "aria": 4 to 10 things an AI can do alone by researching, reasoning,
+  calculating and writing: a competitor table, pricing options, a cost and
+  break-even sheet, a cash forecast, draft terms or a privacy notice, an
+  interview guide, landing-page copy. Not the build itself — the plan
+  covers that.
+- "you": 3 to 10 things only a person can do: talk to customers, choose a
+  name, decide to spend, register, open accounts, sign, pay, meet people,
+  test with real users. A decision or a legal act is never under "aria".
+- Concrete and specific to this project. Nothing on both lists."""
+
+
+def template_sections(name):
+    """The numbered `## ` sections of a template, each with the guidance
+    written under it between {{ }}: [(heading, guidance)]. A template is
+    the one place a document's shape is decided — for Claude Code, which
+    fills it in, and for the engine, which asks a model for these sections."""
+    text = (ROOT / "system" / "templates" / f"{name}.md").read_text(
+        encoding="utf-8")
+    return [(m.group(1).strip(),
+             " ".join(re.sub(r"[{}]", "", m.group(2)).split()))
+            for m in re.finditer(r"^## (\d+\. [^\n]+)\n(.*?)(?=^## |\Z)", text,
+                                 re.S | re.M)]
+
+
+def _sections_only(text):
+    """A model's sections without what it wrapped around them: a fence
+    round the whole reply, a sentence of preamble."""
+    text = re.sub(r"^```(?:markdown|md)?\s*\n|\n```\s*$", "", text.strip())
+    start = re.search(r"^(?:> \*\*In one line|## )", text, re.M)
+    return text[start.start():].strip() if start else text.strip()
+
+
+def _actions_file(proj):
+    for f in (proj / "docs" / "actions.json", proj / "actions.json"):
+        if f.is_file():
+            return f
+    return None
+
+
+_LIST_ROW = re.compile(r"^\|\s*([✔✓~✗xX-])\s*\|\s*(.+?)\s*\|\s*(.*?)\s*\|\s*$")
+_LIST_HERS = re.compile(r"^\s*[-*]\s+\*\*\s*(a\d+)\s*[—–-]+\s*(.+?)\*\*"
+                        r"\s*(?:[—–-]+\s*(.*))?$", re.I)
+_LIST_MINE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+\*\*\s*(y\d+)\s*[—–-]+\s*"
+                        r"(.+?)\*\*\s*(?:[—–-]+\s*(.*))?$", re.I)
+
+
+def _actions_from_markdown(text, slug):
+    """An action list read back from its markdown — the form Claude Code's
+    planner writes (from system/templates/action-list.md) and the form the
+    engine itself renders. So the list is the same list whichever of the
+    two wrote it."""
+    keys = {item.lower(): key for key, item, _doc in PROPOSAL_ITEMS}
+    states = {"✔": "there", "✓": "there", "~": "assumed"}
+    data = {"slug": slug, "proposal": [], "aria": [], "you": []}
+    for line in text.splitlines():
+        m = _LIST_ROW.match(line)
+        if m and m.group(2).strip().lower() not in ("item", "---"):
+            item = m.group(2).strip()
+            data["proposal"].append({
+                "key": keys.get(item.lower(), slugify(item, limit=3)),
+                "item": item,
+                "state": states.get(m.group(1), "missing"),
+                "note": m.group(3).strip()})
+            continue
+        m = _LIST_HERS.match(line)
+        if m:
+            detail = (m.group(3) or "").strip()
+            why = re.search(r"\s*\*\((.+?)\)\*\s*$", detail)
+            data["aria"].append({
+                "id": m.group(1).lower(), "title": m.group(2).strip(),
+                "detail": detail[:why.start()].strip() if why else detail,
+                "why": why.group(1) if why else ""})
+            continue
+        m = _LIST_MINE.match(line)
+        if m:
+            rest = (m.group(4) or "").strip()
+            done_on = re.search(r"\s*\*\(done ([\d-]*)\)\*\s*$", rest)
+            if done_on:
+                rest = rest[:done_on.start()].strip()
+            why, _, prepare = rest.partition("*She can prepare:*")
+            data["you"].append({
+                "id": m.group(2).lower(), "title": m.group(3).strip(),
+                "why": why.strip().rstrip("."), "prepare": prepare.strip(),
+                "done": m.group(1) != " ",
+                "done_on": done_on.group(1) if done_on else ""})
+    return data
+
+
+def _load_actions(proj, slug):
+    f = _actions_file(proj)
+    if f:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except ValueError:
+            return None
+        for key in ("proposal", "aria", "you"):
+            data.setdefault(key, [])
+        return data
+    listed = _project_doc(proj, "action-list")
+    if listed:                          # written by hand, or by Claude Code
+        data = _actions_from_markdown(listed.read_text(encoding="utf-8"),
+                                      slug)
+        if data["proposal"] or data["aria"] or data["you"]:
+            return data
+    return None
+
+
+def project_actions(slug):
+    """A project's action list as data — what a complete proposal needs,
+    her part, the owner's part — or None when none has been written."""
+    return _load_actions(_project_dir(slug), slug)
+
+
+def _save_actions(slug, data, folder=None):
+    """Write the action list: actions.json (what the app works from) and
+    action-list.md (the same, to read), side by side."""
+    proj = _project_dir(slug)
+    current = _actions_file(proj) or _project_doc(proj, "action-list")
+    folder = folder or (current.parent if current else proj)
+    data["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+    (folder / "actions.json").write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    plan = _project_doc(proj, "proposed-plan")
+    title = _project_title(slug, plan.read_text(encoding="utf-8")
+                           if plan else "")
+
+    def cell(text):
+        return " ".join(str(text).split()).replace("|", "/")
+
+    lines = [f"---\nslug: {slug}\ntype: action-list\n"
+             f"created: {str(data.get('made', ''))[:10]}\n"
+             f"updated: {data['updated'][:10]}\n---", "",
+             f"# What needs doing: {title}", "",
+             "## What a complete proposal needs", "",
+             "✔ there · ~ there as an assumption that still needs checking "
+             "· ✗ missing", "", "| | Item | Where it stands |", "|---|---|---|"]
+    lines += [f"| {STATE_MARK.get(p['state'], '✗')} | {cell(p['item'])} | "
+              f"{cell(p['note'])} |" for p in data["proposal"]]
+    lines += ["", "## A.R.I.A.'s part", "",
+              "What she can research, draft, calculate or build. After you "
+              "approve the plan these join the project's requirements, and "
+              "autopilot does them.", ""]
+    lines += [f"- **{t['id']} — {t['title']}** — {t['detail']}"
+              + (f" *({t['why']})*" if t.get("why") else "")
+              for t in data["aria"]] or ["- (nothing listed)"]
+    lines += ["", "## Your part", "",
+              "What takes a person. Only you tick these — in the app, or "
+              "with `aria done " + slug + " <id>`.", ""]
+    lines += [f"- [{'x' if t.get('done') else ' '}] **{t['id']} — "
+              f"{t['title']}** — {t['why']}"
+              + (f". *She can prepare:* {t['prepare']}" if t.get("prepare")
+                 else "")
+              + (f" *(done {t['done_on']})*" if t.get("done") else "")
+              for t in data["you"]] or ["- (nothing listed)"]
+    (folder / "action-list.md").write_text("\n".join(lines) + "\n",
+                                           encoding="utf-8")
+    return folder / "action-list.md"
+
+
+def _line(value, limit):
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _listy(value):
+    """A list where a model was asked for one (it may give an object, a
+    single item or nothing)."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return list(value.values())
+    return []
+
+
+def _actions_from(raw, slug, before=None):
+    """The model's who-does-what, made safe to store: every proposal item
+    present, ids given, sizes bounded — and the owner's ticks carried over
+    from the list this one replaces."""
+    raw = raw if isinstance(raw, dict) else {}
+    judged = raw.get("proposal") if isinstance(raw.get("proposal"), dict) \
+        else {}
+    proj = _project_dir(slug)
+    proposal = []
+    for key, item, doc in PROPOSAL_ITEMS:
+        if doc:
+            have = _project_doc(proj, doc)
+            proposal.append({
+                "key": key, "item": item,
+                "state": "there" if have else "missing",
+                "note": f"`{have.name}`" if have else "not written yet"})
+            continue
+        row = judged.get(key) if isinstance(judged.get(key), dict) else {}
+        state = str(row.get("state") or "").strip().lower()
+        proposal.append({
+            "key": key, "item": item,
+            "state": state if state in STATE_MARK else "missing",
+            "note": _line(row.get("note"), 220) or "not covered yet"})
+    ticked = {_line(t.get("title"), 140).lower(): t
+              for t in (before or {}).get("you", []) if t.get("done")}
+    aria, you, seen = [], [], set()
+    for t in _listy(raw.get("aria"))[:10]:
+        title = _line(t.get("title") if isinstance(t, dict) else t, 140)
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        aria.append({"id": f"a{len(aria) + 1}", "title": title,
+                     "detail": _line(t.get("detail"), 300)
+                     if isinstance(t, dict) else "",
+                     "why": _line(t.get("why"), 200)
+                     if isinstance(t, dict) else ""})
+    for t in _listy(raw.get("you"))[:10]:
+        title = _line(t.get("title") if isinstance(t, dict) else t, 140)
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        was = ticked.get(title.lower(), {})
+        you.append({"id": f"y{len(you) + 1}", "title": title,
+                    "why": _line(t.get("why"), 240)
+                    if isinstance(t, dict) else "",
+                    "prepare": _line(t.get("prepare"), 240)
+                    if isinstance(t, dict) else "",
+                    "done": bool(was), "done_on": was.get("done_on", "")})
+    return {"slug": slug, "proposal": proposal, "aria": aria, "you": you}
+
+
+def business_run(slug, emit=None, cfg=None):
+    """Write (or rewrite) a project's business plan and its action list,
+    from its idea, research and plan — with live web research on the
+    market when the web is on. Returns the files written. The plan is the
+    document the owner approves; if this stage fails the plan still
+    stands."""
+    emit = emit or (lambda ev: None)
+    cfg = cfg or config()
+    proj = _project_dir(slug)
+    idea_f = _project_doc(proj, "idea")
+    plan_f = _project_doc(proj, "proposed-plan")
+    if not plan_f:
+        raise ValueError(f"{slug} has no plan yet — the business plan is "
+                         "written from the idea and its plan; run develop "
+                         "first")
+    idea = parse_note(idea_f)[2].strip() if idea_f else ""
+    plan = parse_note(plan_f)[2].strip()
+    plan = re.sub(r"\n## Review log.*\Z", "", plan, flags=re.S)
+    res_f = _project_doc(proj, "research")
+    known = parse_note(res_f)[2].strip() if res_f else ""
+    folder = plan_f.parent
+    target = resolve_tier("smart", cfg)
+    budget = prompt_budget(cfg)
+    based = cfg.get("based_in", "")
+    where = (f"The owner is based in {based}: name the bodies, "
+             "registrations and rules that apply there."
+             if based else
+             "Where the owner is based is not known: for whatever depends "
+             "on the country (legal form, tax, licences, data protection) "
+             "say that it does, and what to check.")
+    emit({"event": "start", "stage": "business", "count": 1,
+          "log": f"writing the business plan for {slug} with "
+                 f"{target['model']}"})
+    found = research(
+        "market size, customers, competitors and what they charge"
+        + (f", and the rules for a new business in {based}" if based else "")
+        + ", for: " + excerpt(idea or plan, limit=500),
+        emit=emit, pages=2, budget=min(4500, budget // 3))
+    share = max(900, (budget - len(found["block"]) - 2200) // 3)
+    context = ([f"THE IDEA (the owner's words)\n{clip(idea, share)}"]
+               if idea else []) \
+        + [f"THE PROPOSED PLAN\n{clip(plan, share)}"]
+    if known:
+        context.append("RESEARCH ALREADY DONE\n" + clip(known, share))
+    if found["block"]:
+        context.append("LIVE WEB RESEARCH ON THE MARKET (cite as [n])\n"
+                       + found["block"])
+    sections = template_sections("business-plan")
+    half = (len(sections) + 1) // 2
+    written = []
+    for n, part in enumerate((sections[:half], sections[half:]), 1):
+        if not part:
+            continue
+        ask = "\n\n".join(
+            context
+            + (["THE FIRST HALF OF THIS BUSINESS PLAN (written already — "
+                "build on it, do not repeat it)\n"
+                + clip(written[0], share)] if written else [])
+            + [("Begin with one line — > **In one line:** who it is for, "
+                "what they get, and how it earns (or, plainly, that it is "
+                "not a business). Then write " if n == 1 else "Write ")
+               + "these sections:\n\n" + "\n\n".join(
+                   f"## {h}\n({g})" for h, g in part)])
+        emit({"event": "thinking",
+              "label": f"business plan for {slug}, part {n} of 2"})
+        written.append(_sections_only(strip_think(chat_stream(
+            target, ask, BUSINESS_SYSTEM % where,
+            on_token=lambda t: emit({"event": "token", "text": t})))))
+    body = "\n\n".join(w for w in written if w)
+    if len(body) < 400:
+        raise ValueError("the business plan came back empty")
+    today = datetime.date.today().isoformat()
+    title = _project_title(slug, plan)
+    disclaimer = (
+        "> **Drafted by the local engine from live web research.** Claims "
+        "marked [n] cite the sources at the end; everything else is an "
+        "estimate or an assumption to check. Not legal, tax or financial "
+        "advice.\n" if found["sources"] else
+        "> **Drafted by the local engine without web access.** Every "
+        "figure and every claim about the market is the model's own "
+        "estimate — a lead to check, not a finding. Not legal, tax or "
+        "financial advice.\n")
+    out = folder / "business-plan.md"
+    out.write_text(
+        f"---\nslug: {slug}\ntype: business-plan\ncreated: {today}\n"
+        f"updated: {today}\nengine: {target['kind']}:{target['model']}\n"
+        f"---\n\n# Business plan: {title}\n\n{disclaimer}\n{body}\n"
+        + ("\n## Sources\n\n" + format_sources(found["sources"]) + "\n"
+           if found["sources"] else ""), encoding="utf-8")
+    emit({"event": "file_written", "file": f"{slug}/business-plan.md",
+          "log": f"business plan written for {slug}"})
+    files = [out]
+    try:
+        emit({"event": "thinking",
+              "label": f"working out who does what for {slug}"})
+        raw = ask_json(target, "\n\n".join([
+            f"THE PROPOSED PLAN\n{clip(plan, share)}",
+            "THE BUSINESS PLAN\n" + clip(body, max(2400, budget // 2)),
+            "PROPOSAL ITEMS (judge each one)\n" + "\n".join(
+                f"- {key}: {item}" for key, item, doc in PROPOSAL_ITEMS
+                if not doc)]), ACTIONS_SYSTEM,
+            on_token=lambda t: emit({"event": "token", "text": t}))
+        data = _actions_from(raw, slug, before=project_actions(slug))
+        if not data["aria"] and not data["you"]:
+            raise ValueError("no tasks came back")
+        data["made"] = datetime.datetime.now().isoformat(timespec="seconds")
+        data["engine"] = f"{target['kind']}:{target['model']}"
+        files.append(_save_actions(slug, data, folder))
+        emit({"event": "file_written", "file": f"{slug}/action-list.md",
+              "log": f"who does what for {slug}: {len(data['aria'])} for "
+                     f"her, {len(data['you'])} for you; "
+                     + str(sum(1 for p in data["proposal"]
+                               if p["state"] != "there"))
+                     + " proposal item(s) still open"})
+    except Exception as exc:
+        if backend_trouble(exc):
+            raise
+        emit({"event": "error",
+              "log": f"{slug}: the business plan is written, but the list "
+                     f"of who does what could not be made ({exc}) — draft "
+                     f"it again: aria business {slug}"})
+    brain_journal(f"wrote a business plan for [[{slug}]]")
+    emit({"event": "stage_done", "stage": "business",
+          "log": f"business groundwork ready for {slug}"})
+    return files
+
+
+# The app starts a draft and comes back for it: {slug: {running, error,
+# started, finished}}
+BUSINESS_JOBS = {}
+
+
+def business_start(slug, emit=None):
+    """Draft a project's business groundwork in the background."""
+    _project_dir(slug)                           # validates the slug
+    job = BUSINESS_JOBS.get(slug)
+    if job and job.get("running"):
+        return job
+    job = BUSINESS_JOBS[slug] = {"running": True, "error": "", "step": "",
+                                 "started": time.time()}
+
+    def heard(ev):                      # what she is doing, for the app
+        said = ev.get("label") or ev.get("log")
+        if said and ev.get("event") != "token":
+            job["step"] = " ".join(str(said).split())[:200]
+        if ev.get("event") == "error" and "could not be made" in (
+                ev.get("log") or ""):
+            job["error"] = job["step"]
+        if emit:
+            emit(ev)
+
+    def work():
+        try:
+            business_run(slug, heard)
+        except Exception as exc:
+            job["error"] = " ".join(str(exc).split())[:400]
+        job.update(running=False, finished=time.time())
+
+    threading.Thread(target=work, daemon=True).start()
+    return job
+
+
+def project_business(slug, text=True):
+    """What the app's Business tab shows: the plan (its text, unless
+    `text` is False — a poll only needs to know whether it changed) and
+    where it is, the action list, and whether a draft is being written
+    right now."""
+    proj = _project_dir(slug)
+    plan = _project_doc(proj, "business-plan")
+    actions = project_actions(slug)
+    return {"plan": plan.read_text(encoding="utf-8") if plan and text
+            else "",
+            "has_plan": plan is not None,
+            "stamp": int(plan.stat().st_mtime) if plan else 0,
+            "path": str(plan.relative_to(proj)) if plan else "",
+            "actions": actions,
+            "list_path": (str(_project_doc(proj, "action-list")
+                              .relative_to(proj))
+                          if _project_doc(proj, "action-list") else ""),
+            "job": dict(BUSINESS_JOBS.get(slug) or {}),
+            "can_draft": _project_doc(proj, "proposed-plan") is not None}
+
+
+def project_action_done(slug, item_id, done=True):
+    """The owner ticks (or unticks) an item on their own list. Only ever
+    called from the owner's own action — the checkbox, `aria done`, or
+    saying so in chat. A.R.I.A. never ticks an item of theirs."""
+    data = project_actions(slug)
+    if not data:
+        raise ValueError(f"{slug} has no action list yet")
+    item = next((t for t in data["you"] if t["id"] == str(item_id).lower()),
+                None)
+    if item is None:
+        raise ValueError(
+            f"no item {item_id} on your list for {slug} — it has: "
+            + (", ".join(t["id"] for t in data["you"]) or "nothing"))
+    item["done"] = bool(done)
+    item["done_on"] = datetime.date.today().isoformat() if done else ""
+    _save_actions(slug, data)
+    if done:
+        brain_journal(f"you ticked off “{item['title']}” for [[{slug}]]")
+    return item
+
+
+def owner_list_text(slug=""):
+    """What is on the owner's own list — for one project, or all of them —
+    speakable."""
+    slugs = [slug] if slug else [p["slug"] for p in list_projects()]
+    parts = []
+    for s in slugs:
+        data = project_actions(s)
+        todo = [t for t in (data or {}).get("you", []) if not t.get("done")]
+        if not todo:
+            continue
+        parts.append(
+            f"For {s.replace('-', ' ')}, {_count(len(todo), 'thing')} "
+            f"{_is(len(todo))} yours: "
+            + "; ".join(f"{t['id']}, {t['title']}" for t in todo[:5])
+            + (f"; and {len(todo) - 5} more" if len(todo) > 5 else "") + ".")
+    if parts:
+        return " ".join(parts) + (" Tick one off in the app, or say "
+                                  "'done' with its id and the project.")
+    if slug and not project_actions(slug):
+        return (f"{slug.replace('-', ' ')} has no action list yet — say "
+                f"'business plan for {slug}' and I'll write one.")
+    return "Nothing is waiting on your own lists."
 
 
 # ---------------------------------------------------------------- brain
@@ -1390,7 +2499,7 @@ def brain_sync_project(slug):
     vault = _vault()
     proj = _project_dir(slug)
     docs = []
-    for name in ("idea", "research", "proposed-plan", "requirements"):
+    for name in PROJECT_DOCS:
         f = _project_doc(proj, name)
         if f:
             docs.append((name, f.read_text(encoding="utf-8"), False))
@@ -1751,6 +2860,23 @@ INTENT_NEEDS = re.compile(
     r"|waiting (?:on|for)) (?:me|my (?:decision|approval|attention))|"
     r"(?:is there )?anything (?:for me|i need to do|waiting (?:on|for) me)|"
     r"do you need (?:me|anything from me))\s*\??\s*$", re.I)
+# "business plan for the meal planner", "write a business plan for …"
+INTENT_BUSINESS = re.compile(
+    r"^\s*(?:(?:write|draft|make|do|create|plan out)\s+)?(?:me\s+)?"
+    r"(?:(?:a|the)\s+)?business (?:plan|case)\s+(?:for|of|on)\s+(.+?)\s*$",
+    re.I)
+# "what's on my list", "my list for the meal planner", "what do I need to
+# do for …" — the work that takes a person
+INTENT_MYLIST = re.compile(
+    r"^\s*(?:what(?:'s| is) on my (?:own )?(?:list|to-?do(?: list)?)|"
+    r"(?:show (?:me )?)?my (?:own )?(?:list|to-?do(?: list)?|tasks?|part)|"
+    r"what do i (?:need|have) to do|what (?:are|is) my (?:tasks?|part))"
+    r"(?:\s+(?:for|on|in|with)\s+(.+?))?\s*\??\s*$", re.I)
+# "done y2 in the meal planner", "I've done y2 for …", "untick y2 in …"
+INTENT_TICK = re.compile(
+    r"^\s*(?:(?P<un>untick|not done|undo)|i(?:'ve| have)? (?:done|finished|"
+    r"completed)|done|tick(?: off)?|finished|completed)\s+(?:item\s+)?"
+    r"(?P<id>y\d+)\s+(?:in|for|on|of)\s+(?P<proj>.+?)\s*$", re.I)
 INTENT_CHANGES = re.compile(
     r"^\s*(?:what(?:'s| has)? changed (?:in|on|with)|what did you "
     r"(?:do|change|build)(?: (?:in|on|to|for))?|(?:show (?:me )?)?(?:the )?"
@@ -1849,6 +2975,8 @@ def command_phrases(cfg=None):
            "approve task <id> in <project>: <your decision>",
            "skip task <id> in <project>",
            "what needs me", "status of <project>",
+           "business plan for <project>", "what's on my list",
+           "done <id> in <project>",
            "how far along is <project>",
            "what's left on <project>", "what changed in <project>",
            "where is <project>", "open the folder for <project>",
@@ -2020,6 +3148,25 @@ def _detect(text, cfg):
         return {"action": "status", "slug": ""}
     if INTENT_NEEDS.match(text):
         return {"action": "needs"}
+    m = INTENT_TICK.match(text)
+    if m:
+        slug = match_project(m.group("proj"))
+        if slug:
+            return {"action": "tick", "slug": slug,
+                    "id": m.group("id").lower(), "done": not m.group("un")}
+        return {"action": "no-project", "said": m.group("proj").strip()}
+    m = INTENT_MYLIST.match(text)
+    if m:
+        slug = match_project(m.group(1)) if m.group(1) else ""
+        if m.group(1) and not slug:
+            return {"action": "no-project", "said": m.group(1).strip()}
+        return {"action": "mylist", "slug": slug or ""}
+    m = INTENT_BUSINESS.match(text)
+    if m:
+        slug = match_project(m.group(1))
+        if slug:
+            return {"action": "business", "slug": slug}
+        return {"action": "no-project", "said": m.group(1).strip()}
     if INTENT_PROGRESS_ALL.match(text):
         return {"action": "progress", "slug": ""}
     m = INTENT_PROGRESS.match(text)
@@ -2220,6 +3367,35 @@ def perform(intent, source="chat"):
             out["where"] = str(_project_dir(intent["slug"]))
     elif action == "needs":
         out["say"] = workspace_needs_text()
+    elif action == "mylist":
+        out.update(slug=intent.get("slug", ""),
+                   say=owner_list_text(intent.get("slug", "")))
+    elif action == "tick":
+        try:
+            item = project_action_done(intent["slug"], intent["id"],
+                                       done=intent["done"])
+            left = sum(1 for t in project_actions(intent["slug"])["you"]
+                       if not t.get("done"))
+            out.update(slug=intent["slug"], say=(
+                ("Ticked " if intent["done"] else "Unticked ")
+                + f"{item['id']} — {item['title']}. "
+                + (f"{_count(left, 'thing')} left on your list for "
+                   f"{intent['slug'].replace('-', ' ')}." if left else
+                   "That was the last thing on your list for "
+                   f"{intent['slug'].replace('-', ' ')}.")))
+        except ValueError as exc:
+            out["say"] = str(exc)
+    elif action == "business":
+        try:
+            business_start(intent["slug"])
+            out.update(slug=intent["slug"], say=(
+                f"Writing the business plan for "
+                f"{intent['slug'].replace('-', ' ')} now — the plan, what "
+                "a complete proposal still needs, and who does what. It "
+                "takes a few minutes; you'll find it on the project's "
+                "Business tab."))
+        except ValueError as exc:
+            out["say"] = str(exc)
     elif action == "progress":
         out.update(slug=intent.get("slug", ""),
                    say=project_progress_text(intent["slug"])
@@ -2395,11 +3571,22 @@ def converse(messages, on_token=None, skill=None, patience=None,
         if on_token:
             on_token(text)
 
+    def thought(_text):
+        # a model that reasons first is not a model that hangs
+        if not first.is_set() and not box.get("thinking"):
+            box["thinking"] = True
+            if on_status and not box["gave_up"]:
+                on_status("thinking it over…")
+        box["thought_at"] = time.time()
+
     def work():
         try:
+            # chat is conversation: with thinking on "auto" she answers
+            # straight away, whichever model happens to serve the chat
             box["reply"] = chat_messages(
                 target, [{"role": "system", "content": system}] + trimmed,
-                on_token=token)
+                on_token=token, on_thought=thought,
+                think=None if cfg.get("thinking") == "always" else False)
         except Exception as exc:
             box["error"] = exc
         first.set()
@@ -2410,6 +3597,8 @@ def converse(messages, on_token=None, skill=None, patience=None,
     told = False
     while not first.wait(2):
         waited = time.time() - t0
+        if box.get("thinking") and time.time() - box.get("thought_at", 0) < 20:
+            continue                     # reasoning as we wait: let her
         if waited >= patience:
             box["gave_up"] = True        # the call may end later, unheard
             reply = _busy_reply(waited, target)
@@ -2814,8 +4003,17 @@ def run_agent(name, task, emit, timeout=3600, model="", skills=None,
     reply = chat_stream(target, task, system, timeout=timeout,
                         max_seconds=max_seconds,
                         on_token=lambda t: emit({"event": "token", "text": t}))
+    said = last_call()
+    if info is not None and said.get("cut_off"):
+        info["cut_off"] = (
+            f"the reply was cut off: {said.get('model') or 'the model'} ran "
+            "out of room in its window"
+            + (f" of {said['window']} tokens" if said.get("window") else "")
+            + " before it had finished")
     emit({"event": "stage_done", "stage": "agent", "agent": agent["name"],
-          "log": f"agent {agent['name']} finished"})
+          "log": f"agent {agent['name']} finished"
+                 + (" — but its reply was cut off (the model's window was "
+                    "full)" if said.get("cut_off") else "")})
     return strip_think(reply)
 
 
@@ -3083,6 +4281,14 @@ def approve_project(slug, via="ui"):
     add("Risks", _section(body, "Risks"))
     if len(parts) <= 4:                  # the plan had no usable sections
         add("Goal", body.strip())
+    actions = project_actions(slug)
+    if actions and actions["aria"]:
+        # what she listed for herself beside the build is approved with it
+        add("Business groundwork", (
+            "Beside the build, these are produced as documents under "
+            "`business/` — each one complete enough to act on:\n\n"
+            + "\n".join(f"- **{a['title']}** — {a['detail']}"
+                        for a in actions["aria"])))
     dest = plan.parent / "requirements.md"
     dest.write_text(
         f"---\nslug: {slug}\nstatus: approved\napproved: true\n"
@@ -3143,9 +4349,11 @@ def promote_project(slug):
     docs = dest / "docs"
     docs.mkdir(exist_ok=True)
     for f in sorted(dest.glob("*.md")):
-        if re.match(r"(idea|research|proposed-plan|requirements)"
-                    r"(\.v\d+)?\.md$", f.name):
+        if re.match(r"(" + "|".join(PROJECT_DOCS) + r")(\.v\d+)?\.md$",
+                    f.name):
             f.rename(docs / f.name)
+    if (dest / "actions.json").is_file():
+        (dest / "actions.json").rename(docs / "actions.json")
     req_text = (docs / "requirements.md").read_text(encoding="utf-8")
     title = _project_title(slug, req_text)
     today = datetime.date.today().isoformat()
@@ -3304,7 +4512,14 @@ def list_projects():
                 approved = project_approved(d.name)
             except ValueError:
                 approved = False
+            # open items on the owner's own list
+            listed = _load_actions(d, d.name)
+            mine = sum(1 for t in (listed or {}).get("you", [])
+                       if not t.get("done"))
             out.append({"slug": d.name, "kind": kind, "approved": approved,
+                        "your_list": mine,
+                        "has_business": _project_doc(d, "business-plan")
+                        is not None,
                         "autopilot": state.get("status", "idle"),
                         "iteration": state.get("iteration", 0),
                         "phase": state.get("phase", ""),
@@ -3412,8 +4627,18 @@ def project_progress_text(slug):
     if pr["reached"] == pr["total"]:
         say += " The whole road is behind me."
     elif pr["eta"] and pr["remaining_tasks"]:
+        # measured time, with the slow case said too: an estimate that is
+        # only ever the best case is the one that gets missed
+        slow = _spoken_time(pr.get("eta_slow") or 0)
+        usual = _spoken_time(pr["eta"])
         say += (f" That is roughly {_count(pr['remaining_tasks'], 'task')} "
-                f"— {_spoken_time(pr['eta'])} of work at the pace so far.")
+                f"— {usual} of work"
+                + (f", {slow.replace('about ', 'up to ')} if it goes slowly"
+                   if slow != usual else "")
+                + (" — a first guess; nothing has been measured on this "
+                   "machine yet." if pr.get("basis") == "guess" else
+                   f", going by {pr['rests_on']}."
+                   if pr.get("rests_on") else "."))
     if pr["status"] == "running" and pr["now"]:
         say += f" Right now I'm on: {pr['now']['title']}."
     elif pr["status"] != "running":
@@ -3453,6 +4678,13 @@ def workspace_needs_text():
         parts.append(f"{_count(len(unclear), 'note')} in the inbox "
                      f"{'has' if len(unclear) == 1 else 'have'} questions "
                      "for you.")
+    mine = sum(p["your_list"] for p in projects)
+    if mine:        # not waiting on a decision — but only they can do it
+        listed = [p["slug"].replace("-", " ") for p in projects
+                  if p["your_list"]]
+        parts.append(f"On your own {'list' if len(listed) == 1 else 'lists'} "
+                     f"({', '.join(listed[:3])}): {_count(mine, 'thing')} "
+                     "only you can do — say 'what's on my list'.")
     if not parts:
         return "Nothing needs you right now."
     return " ".join(parts) + (" Approvals and decisions are yours to make "
@@ -3957,13 +5189,45 @@ def version():
             "subject": git("log", "-1", "--format=%s")}
 
 
+SERVICE = "aria.service"
+
+
+def service_state():
+    """What systemd says about the always-on unit: its main process (0 when
+    it is not running, or where there is no systemd) and whether the unit
+    serves THIS copy of A.R.I.A."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", SERVICE, "-p", "MainPID",
+             "-p", "ExecStart"], capture_output=True, text=True,
+            timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {"pid": 0, "ours": False}
+    found = re.search(r"^MainPID=(\d+)", out, re.M)
+    return {"pid": int(found.group(1)) if found else 0,
+            "ours": str(ROOT / "bin" / "aria-ui") in out}
+
+
+def _is_the_service(pid):
+    """Is this process the one systemd runs as the always-on unit?"""
+    try:
+        return bool(pid) and service_state()["pid"] == int(pid)
+    except (TypeError, ValueError):
+        return False
+
+
 def server_mark(port):
     """The server, at start: put on record who is serving this copy."""
     info = {"pid": os.getpid(), "port": int(port), "code": code_version(),
             "version": version(),
             "started": datetime.datetime.now().isoformat(timespec="seconds"),
-            # systemd names every service run; nothing else sets this
-            "managed": bool(os.environ.get("INVOCATION_ID"))}
+            # "Run by systemd" means being the unit's own main process.
+            # Having been started under SOME unit is not it: systemd's
+            # INVOCATION_ID is handed down to everything a unit starts —
+            # a terminal the desktop launched as one, and with it every
+            # server started by hand there (and every self-test).
+            "managed": bool(os.environ.get("INVOCATION_ID"))
+            and _is_the_service(os.getpid())}
     tmp = SERVER_FILE.with_name(SERVER_FILE.name + ".tmp")
     tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
     os.replace(tmp, SERVER_FILE)
@@ -3995,14 +5259,17 @@ def server_running():
     if live.get("pid") != info.get("pid"):
         return None
     info["stale"] = info.get("code") != code_version()
+    # a record is a claim; whether systemd runs this process is asked now
+    info["managed"] = bool(info.get("managed")) \
+        and _is_the_service(info.get("pid"))
     return info
 
 
 def server_restart(info):
     """Restart the server `info` describes onto the code on disk. Returns
     how it was done: "systemd" or "respawned"."""
-    if info.get("managed"):
-        subprocess.run(["systemctl", "--user", "restart", "aria.service"],
+    if info.get("managed") and _is_the_service(info.get("pid")):
+        subprocess.run(["systemctl", "--user", "restart", SERVICE],
                        check=False)
         return "systemd"
     pid, port = int(info["pid"]), int(info["port"])
@@ -4038,7 +5305,8 @@ def autopilot_busy():
 
 # ---------------------------------------------------------------- config edit
 
-_BOOL_KEYS = {"auto_pipeline", "web_access", "github_access",
+_BOOL_KEYS = {"auto_pipeline", "business_plans", "web_access",
+              "github_access", "ollama_autostart", "models_warm",
               "brain_journal", "autopilot_git", "autopilot_refine",
               "desktop_notifications", "giants_free_memory"}
 _CHOICE_KEYS = {
@@ -4046,6 +5314,7 @@ _CHOICE_KEYS = {
                    "none"},
     "autopilot_after_goal": {"improve", "stop"},
     "giants_use": {"auto", "always", "never"},
+    "thinking": {"auto", "always", "never"},
     "autopilot_checks": {"sandbox", "direct", "off"},
     "engine": {"ollama", "claude"},
     "voice_engine": {"auto", "local", "browser"},
@@ -4062,7 +5331,8 @@ _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "promotion_target", "giant_general", "giant_research",
               "giant_coder", "giants_flags", "editor", "terminal",
               "heartbeat_url", "voice_name", "alexa_url",
-              "alexa_skill_id"}
+              "alexa_skill_id", "based_in", "ollama_keep_alive",
+              "ollama_command"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 
@@ -4106,6 +5376,10 @@ def _config_clean(key, value):
         value = str(int(number)) if number == int(number) else str(number)
     elif "#" in value:
         raise ValueError(f"{key} cannot contain '#'")
+    elif key == "ollama_keep_alive" and value and not re.fullmatch(
+            r"-1|\d+[smh]?", value.lower()):
+        raise ValueError("ollama_keep_alive is a time like 30m, 2h or 90s "
+                         "(-1 = never unload; empty = leave it to Ollama)")
     elif key == "alexa_url" and value and not re.fullmatch(
             r"https://[\w.-]+(?::\d+)?/?", value):
         raise ValueError("alexa_url is the tunnel's own address, like "
@@ -4344,10 +5618,15 @@ def health():
                        probes[key].items() if k != "models"}}
     fast = resolve_tier("fast", cfg)
     fast_probe = probes[(fast["kind"], fast["url"], fast["model"])]
+    # is Ollama answering? (None: no tier runs on it)
+    ollama = [p["server"] for (kind, _url, _model), p in probes.items()
+              if kind == "ollama"]
     return {"ok": fast_probe["ok"], "server": fast_probe["server"],
             "model": fast["model"], "url": fast["url"],
             "models": fast_probe.get("models", []),
             "error": fast_probe.get("error", ""),
+            "ollama": any(ollama) if ollama else None,
+            "wake": wake_state(),
             "tiers": tiers,
             "auto_pipeline": cfg["auto_pipeline"],
             "obsidian": bool(cfg["obsidian_vault"]),

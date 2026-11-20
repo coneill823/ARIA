@@ -162,6 +162,23 @@ bus.on('talk:chats', renderRecents);
 // old app talking to a new server, so it reloads itself — at once if
 // nothing would be lost, otherwise when you click.
 let bootCode = null;
+// "model server offline — start it": she starts it the way it is installed
+// here. Where only an administrator can (a system service that is not
+// enabled), she says so, with the one command that fixes it for good.
+let startingModels = false;
+async function startModels() {
+  if (startingModels) return;
+  startingModels = true;
+  $('#health-txt').textContent = 'starting the model server…';
+  try {
+    const r = await api.post('/api/models/start', {});
+    if (r.up) toast('The model server is up.', 'good');
+    else toast(r.note || 'The model server could not be started.', 'bad', 20000);
+  } catch (e) { toast(e.message, 'bad', 12000); }
+  startingModels = false;
+  poll();
+}
+
 function renderVersion(v) {
   let el = $('#version-now');
   if (!el) { el = h('button', { id: 'version-now', type: 'button' }); $('#side-foot').append(el); }
@@ -187,10 +204,23 @@ function renderState(st) {
   appState = st;
   const hl = st.health;
   $('#dot').className = 'dot' + (hl.ok ? ' ok' : '');
+  // the model server: up, being started, the quick model being loaded —
+  // or away, with what would fix that one click (and one hover) away
+  const wake = hl.wake || {};
   $('#health-txt').textContent = hl.ok
-    ? hl.model + (hl.smart && hl.smart !== hl.model ? ' · ' + hl.smart : '')
-    : (hl.server ? 'model missing — ' + hl.model : 'model server offline');
-  $('#health').title = hl.ok ? 'fast · smart tiers reachable' : (hl.error || '');
+    ? (wake.warming ? 'loading ' + wake.warming + '…'
+       : hl.model + (hl.smart && hl.smart !== hl.model ? ' · ' + hl.smart : ''))
+    : hl.server ? 'model missing — ' + hl.model
+    : wake.trying ? 'starting the model server…'
+    : hl.ollama === false ? 'model server offline — start it'
+    : 'model server offline';
+  $('#health').title = hl.ok ? 'fast · smart tiers reachable'
+    : hl.server ? (hl.error || '')
+    : (wake.note || hl.error || '') + (hl.ollama === false ? '\nClick to start it.' : '');
+  // (only Ollama is hers to start: a tier on another kind of server is not)
+  const startable = !hl.ok && !hl.server && !wake.trying && hl.ollama === false;
+  $('#health').classList.toggle('down', startable);
+  $('#health').onclick = startable ? startModels : null;
   const gz = st.garage || {}, gl = gz.loaded || [];
   let gnow = $('#garage-now');
   if (!gnow) { gnow = h('span', { id: 'garage-now' }); $('#health').after(gnow); }
