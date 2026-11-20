@@ -790,3 +790,7 @@ table.needs tr.assumed .n-mark { color: var(--warn); }
 table.needs tr.missing .n-mark { color: var(--err); }
 table.needs .n-item { width: 42%; }
 table.needs .n-note, table.needs .n-note p { color: var(--dim); font-size: 12.5px; margin: 0; }
+
+/* the model server is away: the line that says so is the button that starts it */
+#health.down { cursor: pointer; color: var(--warn); }
+#health.down:hover #health-txt { text-decoration: underline; }

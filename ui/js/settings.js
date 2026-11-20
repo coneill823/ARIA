@@ -230,6 +230,10 @@ function render() {
       tier('smart', 'plans, code, verification — e.g. ollama/qwen3:30b'),
       tier('deep', 'the hardest reasoning; leave empty to fall back to smart — or name a giant\'s role: general, research, coder'),
       text('context_tokens', 'Context window', 'Tokens requested from Ollama for every call, and the budget prompts are sized to. A model\'s prompt, its reasoning and its answer all share it. 0 leaves the backend\'s own setting alone.'),
+      toggle('ollama_autostart', 'Start the model server', 'when she starts — or finds it away — she starts Ollama herself, the way it is installed on this machine'),
+      toggle('models_warm', 'Load the quick model at start', 'so the first reply does not wait for the model to be read from disk'),
+      text('ollama_keep_alive', 'Keep models loaded for', 'How long the fast and smart models stay in memory after they were last used: 30m, 2h, -1 for always. Empty leaves it to Ollama (5 minutes), as a deep-tier model always is. A giant that needs the memory still gets it.'),
+      text('ollama_command', 'Start command', 'Leave empty: she works out how Ollama is run on this machine. Only where it is started in a way of its own (a container, say) — the command that starts it, e.g. docker start ollama'),
       choice('thinking', 'Models that reason first', [
         ['auto', 'automatic — reason where there is time and room for it'],
         ['always', 'always — leave every model to itself'],

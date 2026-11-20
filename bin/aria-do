@@ -34,6 +34,8 @@ itself and hands everything below to this script:
   models use <role> <file.gguf>  give a role its model (general, research,
                                  coder) — the first part of a split model
   models load <role> | unload [role]
+  models start                   start the everyday model server (Ollama)
+                                 and load the quick model
   models test <role>             prove a giant end to end: load it, ask it
                                  one question, report how long both took
   voice                          what she speaks and listens with here
@@ -344,6 +346,16 @@ def cmd_models(args):
             print(line)
         print(f"\nloaded at once: {st['loaded']} · use: {st['use']}"
               " (aria.giants_use) · logs: system/garage/<role>.log")
+    elif action == "start":
+        # the everyday model server: up, and the quick model loaded
+        say = lambda t: print("· " + t, flush=True)  # noqa: E731
+        state = eng.ollama_start(notify=say)
+        if not state["up"]:
+            raise SystemExit(state["note"] or "the model server is not "
+                             "answering")
+        loaded = eng.ollama_warm(notify=say)
+        print("the model server is up"
+              + (f"; {loaded} is loaded" if loaded else ""))
     elif action == "scan":
         found = eng.garage_scan(args[1] if len(args) > 1 else "")
         if not found:
@@ -914,6 +926,40 @@ def cmd_reach(_args):
     lib = len(eng.list_library_agents())
     print(f"ok   {len(eng.list_agents())} core agents, {lib} library "
           f"agents, {len(eng.list_skill_names())} skills")
+    # the everyday model server: will it be there without being started?
+    if eng.uses_ollama(cfg) and eng._is_local(
+            cfg["backend_urls"].get("ollama", "")):
+        how, boots = eng.ollama_how(cfg), eng.ollama_boots(cfg)
+        hers = cfg["ollama_autostart"]
+        off = "starting it is switched off (aria.ollama_autostart)"
+        if how == "system-unit":
+            print("ok   Ollama starts with the computer (its system service "
+                  "is enabled)" if boots else
+                  "note Ollama is a system service that does not start with "
+                  "the computer, and only an administrator can start it. "
+                  f"Once, in a terminal: {eng.ENABLE_OLLAMA}")
+        elif how == "user-unit":
+            print("ok   Ollama starts when you log in (its own service is "
+                  "enabled)" if boots else
+                  "ok   Ollama's own service is not set to start at login — "
+                  "she starts it when she starts" if hers else
+                  f"note Ollama's own service does not start at login, and "
+                  f"{off}: systemctl --user enable --now ollama")
+        elif how == "binary":
+            print("ok   Ollama has no service of its own here — she starts "
+                  "`ollama serve` when she starts, and whenever she finds "
+                  "it away" if hers else
+                  f"note Ollama has no service of its own here, and {off} — "
+                  "by hand: bin/aria models start")
+        elif how == "command":
+            print("ok   the model server is started with your own command "
+                  "(aria.ollama_command)" if hers else
+                  f"note the model server has your own start command, but "
+                  f"{off}")
+        else:
+            print("note there is no `ollama` command on this machine. If "
+                  "the model server is started some other way, she can do "
+                  "that for you: aria settings set ollama_command \"…\"")
     # the giants
     roles = eng.garage_status(probe=False)["roles"]
     for role, row in roles.items():

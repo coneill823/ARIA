@@ -126,6 +126,52 @@ ARTICLE = ("<html><head><title>Photo renaming guide</title></head><body>"
            "<script>ignore()</script></body></html>")
 
 
+
+# What `model server — started when she is` runs, in a process of its own
+# (so that nothing it starts or remembers leaks into the other checks).
+# argv: sandbox, the stand-in's command. Prints one JSON line.
+WAKE_PROBE = r"""
+import json, os, sys, time, urllib.request
+sandbox, stand_in = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(sandbox, "bin"))
+import aria_engine as eng
+
+def seen():
+    with urllib.request.urlopen(os.environ["ARIA_OLLAMA_URL"]
+                                + "/mock/calls", timeout=10) as r:
+        return json.load(r)
+
+out, said = {}, []
+eng.GARAGE_LISTENERS.append(said.append)
+if os.environ.get("WAKE_CASE") == "service":
+    # Ollama as a system service this user may not start
+    out["how"], out["boots"] = eng.ollama_how(), eng.ollama_boots()
+    state = eng.ollama_start(wait=2)
+    out.update(up=state["up"], note=state["note"],
+               fix=eng.ENABLE_OLLAMA in state["note"])
+else:
+    os.environ["ARIA_OLLAMA_COMMAND"] = stand_in
+    assert not eng.ollama_up(), "something already answers on the port"
+    fast = eng.resolve_tier("fast")
+    state = eng.models_wake(notify=said.append)        # what her start does
+    out["started"], out["warmed"] = state["started"], state["warmed"]
+    out["loads"] = seen()["loads"]
+    out["expect"] = {"model": fast["model"], "keep_alive": fast["keep_alive"],
+                     "num_ctx": fast["num_ctx"]}
+    out["again"] = eng.ollama_start()["started"]       # up: nothing to start
+    eng.chat_stream(fast, "Say hello.")
+    out["sent"] = seen()["calls"][-1]["keep_alive"]
+    # it goes away — and the next call brings it back
+    eng._WAKE_PROCS[-1].terminate()
+    eng._WAKE_PROCS[-1].wait(10)
+    eng.WAKE["at"] -= 61                               # "a minute later"
+    out["gone"] = not eng.ollama_up(timeout=1)
+    out["reply"] = bool(eng.chat_stream(fast, "Say hello."))
+    out["said"] = said
+    eng._WAKE_PROCS[-1].terminate()
+print(json.dumps(out))
+"""
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -305,7 +351,10 @@ def main():
                autopilot_refine="false", autopilot_checks="sandbox",
                autopilot_check_seconds="60", editor="", terminal="",
                # …and it stays off your screen
-               desktop_notifications="false")
+               desktop_notifications="false",
+               # it starts no service on this machine and loads no model
+               # by itself: that has a check of its own, with a stand-in
+               ollama_autostart="false", models_warm="false")
 
     # Her voice and her ears are exercised with a stand-in for the speech
     # worker (the real one needs the packages `aria voice install` adds):
@@ -491,10 +540,11 @@ def main():
                     except Exception:
                         active = "unknown"
                     if active != "active":
-                        hint = (" || ollama installed but not running — fix: "
-                                "sudo systemctl start ollama && "
-                                "sudo systemctl enable ollama "
-                                "(or run: ollama serve)")
+                        hint = (" || ollama installed but not running — "
+                                "start it: bin/aria models start (her app "
+                                "does that itself when it starts; a system "
+                                "service wants, once: sudo systemctl enable "
+                                "--now ollama)")
                     else:
                         hint = (" || ollama service is active but not "
                                 "answering on the configured URL — check "
@@ -1783,6 +1833,78 @@ def main():
                 "planner's undercount), and a machine with no record says "
                 "its estimate is a first guess")
     check("time estimates — from what was measured", c_pace)
+
+    def c_wake():
+        """Nobody should have to start Ollama first. When she starts — and
+        when a call finds the model server away — she starts it the way it
+        is run on this machine, and loads the quick model. A service only
+        an administrator may start she cannot: then she says the one
+        command that fixes it for good. (A stand-in is started here; your
+        own Ollama is never touched.)"""
+        was = eng.config()
+        port = free_port()
+        stand_in = (f"{sys.executable} "
+                    f"{os.path.join(sandbox, 'bin', 'aria-mock-llm')} "
+                    "{port}")
+        shims = tempfile.mkdtemp(prefix="aria-selftest-shims-")
+        home = tempfile.mkdtemp(prefix="aria-selftest-home-")
+
+        def shim(name, body):
+            path = os.path.join(shims, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+
+        def probe(**env):
+            done = subprocess.run(
+                [sys.executable, "-c", WAKE_PROBE, sandbox, stand_in],
+                env={k: v for k, v in dict(
+                    os.environ, ARIA_OLLAMA_URL=f"http://127.0.0.1:{port}",
+                    **env).items() if k != "ARIA_OLLAMA_COMMAND"},
+                capture_output=True, text=True, timeout=180)
+            assert done.returncode == 0, (done.stderr or done.stdout)[-600:]
+            return json.loads(done.stdout.strip().splitlines()[-1])
+
+        set_config(sandbox, fast="ollama/qwen3:30b", ollama_autostart="true",
+                   models_warm="true")
+        try:
+            got = probe()
+            assert got["started"] and got["warmed"] == "qwen3:30b", got
+            assert got["loads"] == [got["expect"]], \
+                ("the quick model was not loaded the way it will be used",
+                 got["loads"], got["expect"])
+            assert not got["again"], "started a server that was up"
+            assert got["sent"] == (got["expect"]["keep_alive"]
+                                   if got["expect"]["keep_alive"] is not None
+                                   else "unset"), got
+            assert got["gone"] and got["reply"] and any(
+                "starting it" in line for line in got["said"]), \
+                ("a call that found the model server away did not bring "
+                 "it back", got)
+            # a system service, not enabled, and no right to start it
+            shim("ollama", "exit 0\n")
+            shim("systemctl",
+                 'case "$*" in\n'
+                 '  "cat ollama.service") exit 0;;\n'
+                 '  "is-active ollama.service") echo inactive; exit 3;;\n'
+                 '  *) echo "Interactive authentication required." >&2; '
+                 'exit 1;;\n'
+                 'esac\n')
+            got = probe(WAKE_CASE="service", HOME=home,
+                        PATH=shims + os.pathsep + os.environ.get("PATH", ""))
+            assert got["how"] == "system-unit" and got["boots"] is False \
+                and not got["up"] and got["fix"], got
+        finally:
+            set_config(sandbox, fast=was["tiers"]["fast"],
+                       ollama_autostart="false", models_warm="false")
+            shutil.rmtree(shims, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
+        return ("a model server that is away is started at her start, the "
+                "quick model loaded with the window and keep-loaded time it "
+                "will be used with; a call that finds it gone brings it "
+                "back; a system service she may not start gets the one "
+                "command that fixes it — " + eng.ENABLE_OLLAMA)
+    check("model server — started when she is", c_wake)
 
     def c_run_sandbox():
         """Code a model wrote is run without being trusted: the project's

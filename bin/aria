@@ -277,6 +277,8 @@ UNIT
     systemctl --user disable --now aria.service aria-auto.timer \
       aria-voice.service aria-llama.service 'aria-llama-*.service' \
       2>/dev/null || true
+    # an `ollama serve` she started for herself goes with her
+    systemctl --user stop aria-ollama.service 2>/dev/null || true
     SYSD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     rm -f "$SYSD/aria.service" "$SYSD/aria-auto.service" \
       "$SYSD/aria-auto.timer" "$SYSD/aria-voice.service" \

@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -29,6 +30,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -207,6 +209,16 @@ def config():
         # how a model that reasons before it answers (qwen3, deepseek-r1…)
         # is used on the everyday tiers: see thinking_for()
         "thinking": find("thinking", "auto").split(" #")[0].strip().lower(),
+        # the everyday model server: started when she starts, the quick
+        # model loaded, and kept loaded this long between uses
+        "ollama_autostart": flag("ollama_autostart", "true"),
+        "models_warm": flag("models_warm", "true"),
+        # (set to nothing by the owner, it is nothing: Ollama decides)
+        "ollama_keep_alive": (mine["ollama_keep_alive"]
+                              if "ollama_keep_alive" in mine else
+                              find("ollama_keep_alive", "30m"))
+            .split(" #")[0].strip().lower(),
+        "ollama_command": find("ollama_command", "").split(" #")[0].strip(),
         "webhooks": block("webhooks"),
         "heartbeat_url": find("heartbeat_url", ""),
         "web_access": flag("web_access", "true"),
@@ -251,14 +263,34 @@ def config():
     }
 
 
-def _parse_spec(spec, cfg):
-    """Parse a 'backend/model' spec against configured backends; None if
-    the backend name is unknown."""
-    backend, _, model = spec.partition("/")
+def _split_spec(spec):
+    backend, _, model = (spec or "").partition("/")
     backend = backend.strip().lower()
     model = model.strip()
     if not model:  # bare model name means ollama
         backend, model = "ollama", backend
+    return backend, model
+
+
+def _kept_loaded(backend, model, cfg):
+    """How long Ollama is asked to keep this model in memory after a call
+    (None: Ollama decides). Only the everyday models — the fast and smart
+    tiers — are kept: they are what a chat or the next task waits for. A
+    deep-tier model the size of the machine's RAM is let go on Ollama's
+    own, shorter clock."""
+    if backend != "ollama":
+        return None
+    everyday = [_split_spec(cfg["tiers"].get(t)) for t in ("fast", "smart")
+                if cfg.get("tiers", {}).get(t)]
+    if everyday and (backend, model) not in everyday:
+        return None
+    return _keep_alive(cfg.get("ollama_keep_alive"))
+
+
+def _parse_spec(spec, cfg):
+    """Parse a 'backend/model' spec against configured backends; None if
+    the backend name is unknown."""
+    backend, model = _split_spec(spec)
     url = cfg["backend_urls"].get(backend)
     if url is None:
         return None
@@ -267,13 +299,15 @@ def _parse_spec(spec, cfg):
            or cfg["backend_keys"].get(backend) or "local")
     return {"kind": kind, "url": url, "model": model,
             "backend": backend, "key": key, "spec": f"{backend}/{model}",
-            "num_ctx": cfg.get("context_tokens", 0)}
+            "num_ctx": cfg.get("context_tokens", 0),
+            "keep_alive": _kept_loaded(backend, model, cfg)}
 
 
 def _legacy_target(cfg, tier):
     return {"kind": "ollama", "url": cfg["url"], "model": cfg["model"],
             "backend": "ollama", "spec": f"ollama/{cfg['model']}",
-            "num_ctx": cfg.get("context_tokens", 0), "tier": tier}
+            "num_ctx": cfg.get("context_tokens", 0), "tier": tier,
+            "keep_alive": _keep_alive(cfg.get("ollama_keep_alive"))}
 
 
 def resolve_tier(tier, cfg=None):
@@ -577,7 +611,22 @@ def chat_messages(target, messages, force_json=False, on_token=None,
         _free_for_everyday(target)
     if think is None:
         think = thinking_for(target, messages)
-    return call(target, think)
+    try:
+        return call(target, think)
+    except BackendDown:
+        # the model server is not running: start it (where it is hers to
+        # start) and ask again — once, and not more than once a minute
+        cfg = config()
+        # (a start that could not be made — no right to, no Ollama found —
+        # is not tried again for ten minutes: nothing will have changed)
+        hold = 600 if WAKE["note"] else 60
+        if target.get("kind", "ollama") != "ollama" \
+                or not cfg.get("ollama_autostart", True) \
+                or time.time() - WAKE["at"] < hold or ollama_up(cfg):
+            raise
+        if not ollama_start(cfg, notify=_garage_note)["up"]:
+            raise
+        return call(target, think)
 
 
 GARAGE_LISTENERS = []           # callables that want giant load notices
@@ -688,6 +737,329 @@ def chat_target(cfg=None):
     return fast
 
 
+# ---- the everyday model server: up when she is ---------------------------
+#
+# She cannot work without it, and "start Ollama first" is a step nobody
+# should have to remember. When her server starts — and whenever a call
+# finds the model server away — she starts it the way it is run on this
+# machine, then loads the quick-tier model so the first reply does not
+# wait for it. What she cannot do is start a service only an administrator
+# may start; then she says so, with the one command that fixes it for good.
+
+WAKE = {"at": 0.0, "trying": False, "how": "", "note": "", "started": False,
+        "warmed": "", "warming": "", "log": "", "away": False}
+_WAKE_LOCK = threading.Lock()
+_WAKE_PROCS = []                        # an `ollama serve` she started
+ENABLE_OLLAMA = "sudo systemctl enable --now ollama"
+OLLAMA_UNIT = "aria-ollama"             # hers, when she runs `ollama serve`
+
+
+def _is_local(url):
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def uses_ollama(cfg=None):
+    """Does any tier run on Ollama? Where none does, its server is not
+    hers to start."""
+    cfg = cfg or config()
+    return any(not t.get("giant") and t.get("kind", "ollama") == "ollama"
+               for t in (resolve_tier(n, cfg)
+                         for n in ("fast", "smart", "deep")))
+
+
+def ollama_up(cfg=None, timeout=2):
+    cfg = cfg or config()
+    url = cfg["backend_urls"].get("ollama")
+    if not url:
+        return False
+    try:
+        urllib.request.urlopen(url + "/api/tags", timeout=timeout).close()
+        return True
+    except Exception:
+        return False
+
+
+def _keep_alive(text):
+    """The keep-loaded setting as Ollama's API takes it: a count of seconds
+    goes as a number (a bare "-1" or "90" in a string is refused), a time
+    with its unit as text. None: nothing is sent, and Ollama decides."""
+    text = str(text or "").strip().lower()
+    if not text:
+        return None
+    return int(text) if re.fullmatch(r"-?\d+", text) else text
+
+
+def _systemctl(*args, timeout=5):
+    try:
+        return subprocess.run(["systemctl", *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _unit_known(*scope):
+    """Does systemd know an ollama.service (among the user's units, or the
+    system's)?"""
+    done = _systemctl(*scope, "cat", "ollama.service")
+    return bool(done) and done.returncode == 0
+
+
+def _unit_state(*scope, unit="ollama.service"):
+    """active, activating, inactive, failed … ("" when it cannot be told)"""
+    done = _systemctl(*scope, "is-active", unit)
+    return done.stdout.strip() if done else ""
+
+
+def _unit_enabled(*scope):
+    done = _systemctl(*scope, "is-enabled", "ollama.service")
+    return None if done is None else done.returncode == 0
+
+
+def _own_store():
+    """Has this user Ollama models of their own? That is the sign of an
+    Ollama that is run as them (`ollama serve` in a terminal) rather than
+    as the system's service, which keeps its models elsewhere — and a
+    server started the other way would come up with none of them."""
+    store = Path(os.environ.get("OLLAMA_MODELS")
+                 or Path.home() / ".ollama" / "models")
+    try:
+        return any(p.is_file() for p in (store / "manifests").rglob("*"))
+    except OSError:
+        return False
+
+
+def ollama_how(cfg=None):
+    """How the model server is started on this machine:
+      "command"      the owner's own command (the ollama_command setting)
+      "user-unit"    an ollama.service among the user's own units
+      "system-unit"  the system's ollama.service
+      "binary"       `ollama serve`, run as the user
+      ""             no Ollama was found"""
+    if os.environ.get("ARIA_OLLAMA_COMMAND") \
+            or (cfg or config()).get("ollama_command"):
+        return "command"
+    if not shutil.which("ollama"):
+        return ""
+    if _unit_known("--user"):
+        return "user-unit"
+    if _unit_known() and (_unit_state() in ("active", "activating")
+                          or _unit_enabled() or not _own_store()):
+        return "system-unit"
+    return "binary"
+
+
+def ollama_boots(cfg=None):
+    """Will the model server be there after the computer restarts, without
+    anyone starting it? True: its own service is set to. False: it is not.
+    None: it has no service (she starts it herself, when she starts)."""
+    how = ollama_how(cfg)
+    if how == "user-unit":
+        return _unit_enabled("--user")
+    if how == "system-unit":
+        return _unit_enabled()
+    return None
+
+
+def _ollama_env(url):
+    """What an `ollama serve` she starts is given beyond the usual: the
+    Ollama and graphics-card settings of her own environment, and the
+    address she expects it at when that is not Ollama's usual one."""
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith(("OLLAMA_", "CUDA_", "HSA_", "ROCR_", "HIP_",
+                            "GPU_DEVICE_"))}
+    at = urllib.parse.urlparse(url)
+    if (at.port or 11434) != 11434:
+        env["OLLAMA_HOST"] = f"{at.hostname}:{at.port}"
+    return env
+
+
+def _spawn_ollama(how, url, cfg):
+    """Start it. Returns (why not, "") — or ("", where its log is) when
+    the start was issued."""
+    port = urllib.parse.urlparse(url).port or 11434
+    log = ROOT / "system" / "ollama.log"
+    env = dict(os.environ)
+    if how == "command":
+        argv = [part.replace("{port}", str(port)) for part in shlex.split(
+            os.environ.get("ARIA_OLLAMA_COMMAND")
+            or cfg.get("ollama_command", ""))]
+    elif how in ("user-unit", "system-unit"):
+        scope = ["--user"] if how == "user-unit" else []
+        journal = "journalctl " + " ".join(scope + ["-u", "ollama", "-e"])
+        if _unit_state(*scope) in ("active", "activating"):
+            return "", journal          # on its way up already: wait for it
+        done = _systemctl(*scope, "--no-ask-password", "start",
+                          "ollama.service", timeout=60)
+        if done is not None and done.returncode == 0:
+            return "", journal
+        if how == "user-unit":
+            return ("systemd could not start ollama.service: " + " ".join(
+                (done.stderr or done.stdout).split())[:200]
+                if done is not None else
+                "systemd did not answer when asked to start ollama.service"
+            ), ""
+        if _unit_enabled():
+            return ("Ollama's service is set to start with the computer but "
+                    "is not running, and only an administrator can start "
+                    "it: sudo systemctl start ollama   (why it stopped: "
+                    + journal + ")"), ""
+        return ("Ollama is installed as a system service, which only an "
+                "administrator can start. Make it start with the computer "
+                f"— once, in a terminal: {ENABLE_OLLAMA}"), ""
+    elif how == "binary":
+        argv = [shutil.which("ollama"), "serve"]
+        extra = _ollama_env(url)
+        env.update(extra)
+        if shutil.which("systemd-run"):
+            # a unit of its own, so that it outlives a restart of hers
+            journal = f"journalctl --user -u {OLLAMA_UNIT} -e"
+            if _unit_state("--user", unit=OLLAMA_UNIT + ".service") in (
+                    "active", "activating"):
+                return "", journal
+            try:
+                done = subprocess.run(
+                    ["systemd-run", "--user", "--collect", "--quiet",
+                     "--unit", OLLAMA_UNIT,
+                     "--description", "Ollama, started by A.R.I.A.",
+                     *[f"--setenv={k}={v}" for k, v in extra.items()],
+                     *argv], capture_output=True, text=True, timeout=30)
+                if done.returncode == 0:
+                    return "", journal
+            except (OSError, subprocess.TimeoutExpired):
+                pass                    # no user manager here: run it plainly
+    else:
+        return ("I cannot find Ollama on this machine to start it (there "
+                "is no `ollama` command). If it is started some other way, "
+                "give me the command: aria settings set ollama_command "
+                "\"…\""), ""
+    if not argv:
+        return "the command to start the model server is empty", ""
+    with open(log, "ab") as fh:
+        _WAKE_PROCS.append(subprocess.Popen(
+            argv, stdout=fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True, env=env))
+    return "", str(log)
+
+
+def ollama_start(cfg=None, wait=45, notify=None):
+    """Make sure the everyday model server is answering; start it if it is
+    not and this is a machine she may start it on. Returns the state of
+    that: {up, how, started, note}. Never raises."""
+    cfg = cfg or config()
+    url = cfg["backend_urls"].get("ollama", "")
+    with _WAKE_LOCK:
+        if ollama_up(cfg):
+            WAKE.update(trying=False, note="", away=False)
+            return {"up": True, "how": WAKE["how"], "started": False,
+                    "note": ""}
+        if not url or not _is_local(url):
+            note = (f"the model server at {url} is not answering, and it "
+                    "is not on this machine for me to start")
+            WAKE.update(trying=False, how="remote", note=note, away=True)
+            return {"up": False, "how": "remote", "started": False,
+                    "note": note}
+        how = ollama_how(cfg)
+        WAKE.update(at=time.time(), trying=True, how=how, note="")
+        if notify:
+            notify("the model server is not running — starting it")
+        try:
+            note, log = _spawn_ollama(how, url, cfg)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            note, log = f"could not start the model server: {exc}", ""
+        up = False
+        if not note:
+            deadline = time.time() + wait
+            while time.time() < deadline and not up:
+                time.sleep(0.5)
+                up = ollama_up(cfg, timeout=1)
+            if not up:
+                note = ("the model server was started but is not answering "
+                        f"yet — see {log}")
+        WAKE.update(trying=False, note=note, log=log, away=not up,
+                    started=up or WAKE["started"])
+        if notify:
+            notify("the model server is up" if up else note)
+        return {"up": up, "how": how, "started": up, "note": note}
+
+
+def ollama_warm(cfg=None, notify=None):
+    """Load the quick-tier model now, so the first reply does not wait for
+    it. Left alone when it would get in the way: a giant has the memory,
+    or autopilot is mid-step and will load what it needs. Returns the
+    model loaded, or ""."""
+    cfg = cfg or config()
+    target = resolve_tier("fast", cfg)
+    if target.get("kind", "ollama") != "ollama" or target.get("giant") \
+            or target.get("keep_alive") == 0 \
+            or aria_garage.loaded_roles(cfg) or autopilot_busy():
+        return ""
+    model = target["model"]
+    if _in_memory(model, ollama_loaded(cfg)):
+        WAKE["warmed"] = model
+        return model
+    WAKE["warming"] = model
+    if notify:
+        notify(f"loading {model} so the first reply is quick")
+    body = {"model": model}
+    if target.get("keep_alive") is not None:
+        body["keep_alive"] = target["keep_alive"]
+    if target.get("num_ctx"):
+        # the window she will ask for anyway: a different one later would
+        # make Ollama load the model a second time
+        body["options"] = {"num_ctx": int(target["num_ctx"])}
+    try:
+        req = urllib.request.Request(
+            target["url"] + "/api/generate", method="POST",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=900).close()
+        WAKE.update(warmed=model, warming="")
+        if notify:
+            notify(f"{model} is loaded")
+        return model
+    except Exception as exc:
+        WAKE.update(warming="")
+        if notify:
+            notify(f"{model} could not be loaded ahead of time: "
+                   + " ".join(str(exc).split())[:160])
+        return ""
+
+
+def models_wake(notify=None):
+    """What her server does when it starts: the model server up, the quick
+    model loaded. Each part can be switched off in Settings."""
+    cfg = config()
+    if not uses_ollama(cfg):
+        return wake_state()
+    state = {"up": ollama_up(cfg), "note": ""}
+    if not state["up"] and cfg.get("ollama_autostart", True):
+        state = ollama_start(cfg, notify=notify)
+    WAKE["away"] = not state["up"]
+    if state["up"] and cfg.get("models_warm", True):
+        ollama_warm(cfg, notify=notify)
+    return wake_state()
+
+
+def wake_seen(up):
+    """Told what a look at the model server found. Returns True when it
+    has just come back from being away — started by hand, or by the
+    computer a moment after she started: the time to load the quick model
+    after all."""
+    back = bool(up) and WAKE["away"]
+    WAKE["away"] = not up
+    if up and not WAKE["trying"]:
+        WAKE["note"] = ""               # what was wrong no longer is
+    return back
+
+
+def wake_state():
+    """For the sidebar and doctor: is she starting or loading something,
+    and if the model server is away, what would fix that."""
+    return {k: WAKE[k] for k in ("trying", "how", "note", "started",
+                                 "warmed", "warming")}
+
+
 def _garage_note(text):
     for fn in list(GARAGE_LISTENERS):
         try:
@@ -746,6 +1118,10 @@ def _ollama_stream(target, messages, force_json, on_token, timeout, deadline,
                            "num_predict": max(256, window - int(chars / 4.5))}
     if think is False:
         body["think"] = False       # a reasoning model: the answer alone
+    if target.get("keep_alive") is not None:
+        # stay loaded between uses: a chat half an hour apart should not
+        # wait for the model to be read from disk again
+        body["keep_alive"] = target["keep_alive"]
     req = urllib.request.Request(
         target["url"] + "/api/chat",
         data=json.dumps(body).encode(),
@@ -4925,7 +5301,7 @@ def autopilot_busy():
 # ---------------------------------------------------------------- config edit
 
 _BOOL_KEYS = {"auto_pipeline", "business_plans", "web_access",
-              "github_access",
+              "github_access", "ollama_autostart", "models_warm",
               "brain_journal", "autopilot_git", "autopilot_refine",
               "desktop_notifications", "giants_free_memory"}
 _CHOICE_KEYS = {
@@ -4950,7 +5326,8 @@ _TEXT_KEYS = {"obsidian_vault", "fast", "smart", "deep", "stt_model",
               "promotion_target", "giant_general", "giant_research",
               "giant_coder", "giants_flags", "editor", "terminal",
               "heartbeat_url", "voice_name", "alexa_url",
-              "alexa_skill_id", "based_in"}
+              "alexa_skill_id", "based_in", "ollama_keep_alive",
+              "ollama_command"}
 SETTABLE = _BOOL_KEYS | set(_CHOICE_KEYS) | _NUMBER_KEYS | _TEXT_KEYS
 
 
@@ -4994,6 +5371,10 @@ def _config_clean(key, value):
         value = str(int(number)) if number == int(number) else str(number)
     elif "#" in value:
         raise ValueError(f"{key} cannot contain '#'")
+    elif key == "ollama_keep_alive" and value and not re.fullmatch(
+            r"-1|\d+[smh]?", value.lower()):
+        raise ValueError("ollama_keep_alive is a time like 30m, 2h or 90s "
+                         "(-1 = never unload; empty = leave it to Ollama)")
     elif key == "alexa_url" and value and not re.fullmatch(
             r"https://[\w.-]+(?::\d+)?/?", value):
         raise ValueError("alexa_url is the tunnel's own address, like "
@@ -5232,10 +5613,15 @@ def health():
                        probes[key].items() if k != "models"}}
     fast = resolve_tier("fast", cfg)
     fast_probe = probes[(fast["kind"], fast["url"], fast["model"])]
+    # is Ollama answering? (None: no tier runs on it)
+    ollama = [p["server"] for (kind, _url, _model), p in probes.items()
+              if kind == "ollama"]
     return {"ok": fast_probe["ok"], "server": fast_probe["server"],
             "model": fast["model"], "url": fast["url"],
             "models": fast_probe.get("models", []),
             "error": fast_probe.get("error", ""),
+            "ollama": any(ollama) if ollama else None,
+            "wake": wake_state(),
             "tiers": tiers,
             "auto_pipeline": cfg["auto_pipeline"],
             "obsidian": bool(cfg["obsidian_vault"]),

@@ -64,7 +64,21 @@ MODELS = [("llama3.1:8b", 4_900_000_000), ("qwen3:30b", 18_000_000_000),
 STATE = {"plans": {}, "attempts": {}, "audits": {}, "calls": [],
          # MOCK_LOADED: the models "in memory", as Ollama's /api/ps reports
          "loaded": [n for n in os.environ.get("MOCK_LOADED", "").split(",")
-                    if n], "released": []}
+                    if n], "released": [],
+         # models loaded ahead of use (/api/generate without a prompt)
+         "loads": []}
+
+
+def bad_keep_alive(value):
+    """Ollama's own rule for keep_alive: a number is a count of seconds; a
+    string is a time WITH its unit ("30m", "-1m") — a bare "-1" or "90" in
+    a string is refused with HTTP 400."""
+    if value is None or isinstance(value, (int, float)):
+        return ""
+    if isinstance(value, str) and re.fullmatch(
+            r"0|-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+", value):
+        return ""
+    return f'time: missing unit in duration "{value}"'
 DELAY = float(os.environ.get("MOCK_DELAY", "0") or 0)
 BATCHES = int(os.environ.get("MOCK_BATCHES", "2") or 2)
 LOAD_SECONDS = float(os.environ.get("MOCK_LOAD_SECONDS", "0") or 0)
@@ -679,7 +693,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/mock/calls":
             self._json({"calls": STATE["calls"][-200:],
                         "released": STATE["released"],
-                        "loaded": STATE["loaded"]})
+                        "loaded": STATE["loaded"],
+                        "loads": STATE["loads"]})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -691,12 +706,24 @@ class Handler(BaseHTTPRequestHandler):
                 STATE[key].clear()
             STATE["calls"].clear()
             return self._json({"ok": True})
-        if self.path == "/api/generate":  # keep_alive 0: "let go of it"
+        if bad_keep_alive(body.get("keep_alive")):
+            return self._json({"error": bad_keep_alive(body["keep_alive"])},
+                              400)
+        if self.path == "/api/generate":
+            # without a prompt: keep_alive 0 is "let go of it", anything
+            # else "load it now"
             name = body.get("model", "")
-            if body.get("keep_alive") == 0 and name in STATE["loaded"]:
-                STATE["loaded"].remove(name)
-                STATE["released"].append(name)
-            return self._json({"done": True})
+            if body.get("keep_alive") == 0:
+                if name in STATE["loaded"]:
+                    STATE["loaded"].remove(name)
+                    STATE["released"].append(name)
+            elif not body.get("prompt"):
+                if name not in STATE["loaded"]:
+                    STATE["loaded"].append(name)
+                STATE["loads"].append({
+                    "model": name, "keep_alive": body.get("keep_alive"),
+                    "num_ctx": (body.get("options") or {}).get("num_ctx")})
+            return self._json({"done": True, "done_reason": "load"})
         messages = body.get("messages") or []
         system = " ".join(m.get("content", "") for m in messages
                           if m.get("role") == "system")
@@ -720,6 +747,7 @@ class Handler(BaseHTTPRequestHandler):
                                "num_ctx": options.get("num_ctx"),
                                "num_predict": options.get("num_predict"),
                                "think": body.get("think", "unset"),
+                               "keep_alive": body.get("keep_alive", "unset"),
                                "reasoned": len(reasoning), "ended": ended,
                                "chars": len(prompt)})
 
