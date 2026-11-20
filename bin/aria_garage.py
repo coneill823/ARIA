@@ -655,6 +655,22 @@ def stop_all():
     return [r for r in ROLES if stop(r)]
 
 
+def stop_idle():
+    """Unload every giant this module started that is not answering right
+    now — so an everyday model can have the memory. Returns the roles
+    unloaded; a giant mid-answer is left alone."""
+    out = []
+    for role in ROLES:
+        if not _pidrec(role):
+            continue
+        try:
+            if stop(role, wait=0):
+                out.append(role)
+        except GarageBusy:
+            continue
+    return out
+
+
 def reap(cfg):
     """Unload giants nobody has used for giants_idle_minutes (0 = never)."""
     idle = float(cfg.get("giants_idle_minutes") or 0)

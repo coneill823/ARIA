@@ -57,9 +57,11 @@ aria:
   giants_loaded: 1
   giants_idle_minutes: 0
   giants_port: 8090
-  # Before a giant loads, ask Ollama to unload the everyday models it holds
-  # so the giant gets the video memory and RAM. They load again by
-  # themselves the next time a task needs them.
+  # Giants and Ollama's everyday models take turns with the memory: before
+  # a giant loads, Ollama unloads what it holds; before an everyday model
+  # is used, a giant that has finished its answer is unloaded (never one
+  # mid-answer). Off = both stay where they are, which only works if the
+  # machine holds both at once.
   giants_free_memory: true
   # Each giant's context window, in tokens. Prompts for a giant are sized
   # to it. Bigger costs real RAM for the whole time the giant is loaded —
