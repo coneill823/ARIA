@@ -22,6 +22,10 @@ Steps:
    who has read nothing else can execute the project: goals, non-goals,
    deliverables, milestones with acceptance criteria, the recommended
    subagent team, risks, and how success is measured.
+   If `action-list.md` exists, add a section **Business groundwork**
+   listing the items of *A.R.I.A.'s part* as deliverables (documents
+   under `business/`): approving the plan approves that work with it. The
+   items under *Your part* are the owner's and do not go in.
 3. Frontmatter: `status: approved`, `approved: true`, `approved_on: <date>`.
    Also flip `proposed-plan.md` frontmatter to `status: approved`.
 4. Update `pipeline/LEDGER.md`.

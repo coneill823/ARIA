@@ -20,7 +20,13 @@ Session flow:
    changed, why).
 3. If feedback demands new information, do targeted research and update
    `research.md` too.
-4. Keep iterating until the user is satisfied. If they say they approve
+4. The business groundwork is part of what is being reviewed. Summarise
+   `business-plan.md` (its one line, the money, the verdict) and
+   `action-list.md` (what a complete proposal still lacks, what is on the
+   user's own list) when asked or when they bear on the decision, and
+   revise them in place like the plan. Never tick an item under *Your
+   part* — that list is theirs.
+5. Keep iterating until the user is satisfied. If they say they approve
    ("approve it", "I'm ready, let's book it", "ship it"), invoke the
    `/approve $ARGUMENTS` flow immediately — don't make them run it
    separately.

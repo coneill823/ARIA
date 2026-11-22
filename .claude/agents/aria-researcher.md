@@ -19,7 +19,12 @@ Investigate, in priority order:
    bite.
 3. **Audience & market** — who wants this, roughly how many, what they use
    today. Keep it proportionate: a personal tool needs two sentences, a
-   product needs more.
+   product needs more. For anything that could earn, this is what the
+   business plan is built on: the named competitors and what they charge,
+   a rough market size with the arithmetic shown, and the rules that apply
+   where the owner is based (the `based_in` setting —
+   `system/config.local.yml` wins over `system/config.yml`; if it is
+   empty, say which points depend on the country).
 4. **Feasibility** — effort ballpark (weekend / weeks / months), the hard
    parts, what skills or resources are missing.
 5. **Open questions** — decisions the plan will need the human to make.

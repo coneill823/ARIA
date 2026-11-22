@@ -20,6 +20,14 @@ out which pipeline stage their request belongs to and behave accordingly.
 | Active | `active-projects/<slug>/` (the `promotion_target` setting) | `status: promoted` | project completion |
 | Archive | `pipeline/archive/` | `status: archived` | never deleted |
 
+A potential project's folder holds `idea.md`, `research.md` and
+`proposed-plan.md` — the plan is what the user approves — and, unless the
+`business_plans` setting is off, the business groundwork written beside
+it: `business-plan.md` and `action-list.md` (what a complete proposal
+still needs, A.R.I.A.'s part, the user's part). At approval, A.R.I.A.'s
+part joins `requirements.md`; at promotion all of it moves to `docs/`.
+What these documents ask, and why, is in `docs/PROJECT-GROUNDWORK.md`.
+
 Configuration: `system/config.yml` holds the defaults, and
 `system/config.local.yml` — when it exists — holds the owner's own values,
 which win. Read both and let the local file decide; write settings only
@@ -90,7 +98,12 @@ both accurate.
    promoted project belongs to that project's PM in its own directory —
    don't build the project from here.
 5. **Cite research.** Anything `research.md` claims about the outside world
-   links to its source.
+   links to its source. The same holds for `business-plan.md`: a figure is
+   either sourced or marked as an estimate with its arithmetic shown.
+6. **The user's list is theirs.** The items under *Your part* in an
+   `action-list.md` are work only the user can do. Surface them in
+   `/status`; prepare what helps; never tick one, and never move one to
+   A.R.I.A.'s part to get it done.
 
 ## Subagents
 
@@ -98,7 +111,8 @@ Delegate stage work to the specialists in `.claude/agents/`:
 
 - `aria-triage` — classifies a single note, returns type/slug/confidence.
 - `aria-researcher` — investigates an idea: prior art, tools, market, feasibility.
-- `aria-planner` — turns idea + research into a proposed plan.
+- `aria-planner` — turns idea + research into a proposed plan, then the
+  business plan and the action list beside it.
 
 Run independent classifications/research in parallel when the inbox has
 multiple items.

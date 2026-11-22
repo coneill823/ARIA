@@ -23,11 +23,17 @@ plan" stage. For each idea:
 3. Delegate to the `aria-planner` subagent: given `idea.md` + `research.md`,
    it writes `proposed-plan.md` from `system/templates/proposed-plan.md` —
    the plan the human will review. Frontmatter `status: proposed`.
+   Unless the `business_plans` setting is `false`, it then writes the
+   business groundwork beside it: `business-plan.md` (from
+   `system/templates/business-plan.md`) and `action-list.md` (from
+   `system/templates/action-list.md`: what a complete proposal still
+   needs, A.R.I.A.'s part, the owner's part).
 4. Update `pipeline/LEDGER.md` (state row + history line).
 
 Run research/planning for independent ideas in parallel.
 
 Finish by telling the user which proposed plans are now awaiting their
-review, with a one-line pitch for each, and remind them: `/review <slug>` to
-give feedback, `/approve <slug>` when ready. Do NOT approve anything
-yourself — this is the human's gate.
+review, with a one-line pitch for each — and, where a business plan was
+written, its verdict in a line and how many things are on their own list.
+Remind them: `/review <slug>` to give feedback, `/approve <slug>` when
+ready. Do NOT approve anything yourself — this is the human's gate.

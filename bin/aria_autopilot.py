@@ -77,7 +77,12 @@ SKIP_DIRS = {"autopilot", ".aria", ".git", "node_modules", "__pycache__",
 PROTECTED = ("autopilot/", ".aria/", ".git/", ".claude/", "docs/requirements.md",
              "docs/idea.md", "docs/research.md", "docs/proposed-plan.md",
              "requirements.md", "idea.md", "research.md", "proposed-plan.md",
-             "CLAUDE.md")
+             # the business plan as it was approved, and the owner's own
+             # list (its ticks are theirs): what she writes for the
+             # business side goes under business/
+             "docs/business-plan.md", "docs/action-list.md",
+             "docs/actions.json", "business-plan.md", "action-list.md",
+             "actions.json", "CLAUDE.md")
 TEXT_SUFFIXES = {
     ".md", ".txt", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
     ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".html", ".htm",
@@ -307,7 +312,21 @@ def _emitter(slug, emit):
                                              "at": time.time()})
                 if cur.pop("kept", None):       # tokens after a close: a
                     cur.update(text="", at=time.time())   # stream of its own
-                cur["text"] = (cur["text"] + ev.get("text", ""))[-LIVE_FULL:]
+                    cur.pop("mode", None)
+                # reasoning and answer are both shown, and told apart
+                mode = "thinking" if ev.get("thinking") else "answer"
+                mark = ""
+                if mode != cur.get("mode"):
+                    if mode == "thinking":
+                        mark = ("\n\n" if cur["text"] else "") \
+                            + "[thinking it through]\n"
+                    elif cur.get("mode") == "thinking":
+                        mark = "\n\n[her answer]\n"
+                    cur["mode"] = mode
+                cur["text"] = (cur["text"] + mark
+                               + ev.get("text", ""))[-LIVE_FULL:]
+            if ev.get("thinking"):
+                return              # for the Live tab only: not her answer
         elif kind == "thinking":
             _close_live(slug)
             with _LIVE_LOCK:
@@ -1245,7 +1264,7 @@ def _roadmap_make(slug, state, emit, cfg, why):
         state["stats"]["calls"] += 1
         if isinstance(data, list):
             data = {"milestones": data}
-        raw = [m for m in (data or {}).get("milestones") or []
+        raw = [m for m in _listed((data or {}).get("milestones"))
                if isinstance(m, dict)]
     except Exception as exc:
         if eng.backend_trouble(exc):
@@ -1276,7 +1295,8 @@ def _roadmap_make(slug, state, emit, cfg, why):
                       "status": same["status"] if same else "todo",
                       "outcome": " ".join(str(m.get("outcome") or "")
                                           .split())[:400],
-                      "depends_on": [str(d) for d in m.get("depends_on") or []
+                      "depends_on": [str(d) for d in
+                                     _listed(m.get("depends_on"))
                                      if isinstance(d, (str, int))],
                       "est_tasks": est})
     if not fresh:                       # still a road: the goal, in one step
@@ -1337,6 +1357,10 @@ def _roadmap_update(slug, plan, reached=(), fresh=()):
                 and (done or m["id"] in reached):
             m.update(status="done", reached=_stamp())
             changed = True
+            if done:
+                _pace_note("milestones", {"project": slug,
+                                          "est": m.get("est_tasks", 3),
+                                          "tasks": len(mine)})
         elif mine and m["status"] != "active":
             m["status"] = "active"
             changed = True
@@ -1471,6 +1495,22 @@ def _truthy(value):
     return value is True or value == 1
 
 
+def _listed(value):
+    """What a model gave where a list was asked for, as a list. Models
+    answer "a" for ["a"], 3 for [3], null for [], and now and then an
+    object for a list — none of which should stop a plan."""
+    if value is None or value is False or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, dict):
+        return list(value.values())
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,;\n]", value)
+                if part.strip()]
+    return [value]
+
+
 _CODE_WORDS = re.compile(
     r"\.(py|js|ts|tsx|jsx|rs|go|java|kt|c|cpp|h|cs|rb|php|swift|sh|sql|"
     r"html|css|vue|svelte|dart|lua)\b|\b(code|implement|function|class|"
@@ -1572,6 +1612,14 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             "these again, and plan nothing that needs their outcome)\n"
             + "\n".join(f"- {t['title']}" for t in plan["tasks"]
                         if t["id"] in held))
+    listed = eng.project_actions(slug)
+    if listed and listed["you"]:
+        sections.append(
+            "THE OWNER'S OWN LIST (work that takes a person — never plan "
+            "it, and plan nothing that assumes an open item is done. "
+            "✔ = they have done it)\n" + "\n".join(
+                f"{'✔' if t.get('done') else '○'} {t['title']}"
+                for t in listed["you"][:10]))
     unstarted = [t for t in plan["tasks"]
                  if t["status"] == "todo" and t["id"] not in held]
     if replace_unstarted and unstarted:
@@ -1611,7 +1659,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
         data = {"tasks": data}
     if not isinstance(data, dict):
         raise ValueError("the planner did not return a plan object")
-    raw_tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
+    raw_tasks = [t for t in _listed(data.get("tasks")) if isinstance(t, dict)]
 
     roster = {a["name"] for a in cap["agents"]} | \
         {a["name"] for a in eng.list_library_agents()}
@@ -1670,7 +1718,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             agent = _guess_agent(title + " " + detail,
                                  {a["name"] for a in cap["agents"]
                                   if not a["library"]})
-        skills = [s for s in (raw.get("skills") or [])
+        skills = [s for s in _listed(raw.get("skills"))
                   if isinstance(s, str) and s in skill_names][:3]
         auto_skills = False
         if not skills and skill_names:
@@ -1692,12 +1740,12 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
             "model": _valid_model(str(raw.get("model") or ""), cfg, installed),
             "phase": " ".join(str(raw.get("phase") or "work").split())[:40],
             "est_hours": est,
-            "depends_on": [str(d) for d in (raw.get("depends_on") or [])
+            "depends_on": [str(d) for d in _listed(raw.get("depends_on"))
                            if isinstance(d, (str, int))],
-            "reads": [str(p).lstrip("./") for p in (raw.get("reads") or [])
+            "reads": [str(p).lstrip("./") for p in _listed(raw.get("reads"))
                       if isinstance(p, str)
                       and str(p).lstrip("./") in existing_files][:6],
-            "research": bool(raw.get("research")) and eng.web_ready(cfg),
+            "research": _truthy(raw.get("research")) and eng.web_ready(cfg),
             "needs_human": _truthy(raw.get("needs_human")),
             "hard": _truthy(raw.get("hard")),
             "milestone": (str(raw.get("milestone") or "").strip()
@@ -1737,7 +1785,7 @@ def _plan_next(slug, state, emit, cfg, replace_unstarted=False):
     plan["iteration"] = state["iteration"]
     plan["updated"] = _stamp()
     _save_plan(slug, plan)
-    reached = {str(r) for r in data.get("reached") or []
+    reached = {str(r) for r in _listed(data.get("reached"))
                if isinstance(r, (str, int))} & ms_ids
     _roadmap_update(slug, plan, reached, fresh)
     complete = bool(data.get("project_complete")) and not fresh
@@ -2284,6 +2332,15 @@ def _run_task(slug, state, plan, task, cfg, emit):
         state["phase"] = "reviewing"
         _save_state(slug, state)
         problems = static_checks(slug, records)
+        if info.get("cut_off"):
+            # whatever was being written when the room ran out is half a
+            # file; nothing of this attempt is kept
+            problems.insert(0, (
+                f"{info['cut_off']}. Write less: only the files this task "
+                "names, each as short as it can be while complete — no "
+                "restating of the task, no commentary around the files"))
+            emit({"event": "error",
+                  "log": f"{slug}: {task['id']} — {info['cut_off']}"})
         if not problems and _wrote_code(records) \
                 and eng.checks_available(cfg)[0]:
             checks = _run_checks(slug, emit,
@@ -2345,6 +2402,7 @@ def _run_task(slug, state, plan, task, cfg, emit):
               f"Verified: {verdict['feedback'] or 'passed'}", emit)
         _record(slug, state, task, records, info, verdict, output, sha,
                 checks)
+        _pace_task(slug, task, info, ok=True)
         if checks and checks["ran"]:        # the new "before", for the next
             state["check"] = {k: v for k, v in checks.items()
                               if k != "output"}
@@ -2368,6 +2426,7 @@ def _run_task(slug, state, plan, task, cfg, emit):
             state["failed_titles"] = dict(list(failed.items())[-200:])
             _record(slug, state, task, [], info, verdict, output,
                     checks=checks)
+            _pace_task(slug, task, info, ok=False)
             emit({"event": "error",
                   "log": f"{slug}: {task['id']} failed after "
                          f"{task['attempts']} attempts — "
@@ -2461,7 +2520,7 @@ def _audit(slug, state, cfg, emit):
     state["stats"]["calls"] += 1
     if not isinstance(data, dict):
         return []
-    gaps = [" ".join(str(g).split())[:240] for g in (data.get("gaps") or [])
+    gaps = [" ".join(str(g).split())[:240] for g in _listed(data.get("gaps"))
             if str(g).strip()][:6]
     met = data.get("met")
     if isinstance(met, str):
@@ -2714,7 +2773,7 @@ def _review_file(slug, state, path, cfg, emit):
     state["stats"]["calls"] += 1
     raw = data.get("findings") if isinstance(data, dict) else data
     out = []
-    for f in (raw or [])[:5]:
+    for f in _listed(raw)[:5]:
         if not isinstance(f, dict):
             continue
         problem = " ".join(str(f.get("problem") or "").split())[:400]
@@ -2929,6 +2988,17 @@ def _garage_notice(text):
 eng.GARAGE_LISTENERS.append(_garage_notice)
 
 
+def _thinking_token(text):
+    """A model's reasoning as it streams: into the Live tab of the project
+    whose step this is, marked off from what it then answers."""
+    emit = getattr(_STEP, "emit", None)
+    if emit is not None:
+        emit({"event": "token", "text": text, "thinking": True})
+
+
+eng.THINK_LISTENERS.append(_thinking_token)
+
+
 def tick(slug, emit):
     """Run ONE step for a project. Returns what happened: 'task',
     'assessed', 'mapped' (the roadmap was laid out), 'replanned',
@@ -2967,8 +3037,19 @@ def _tick(slug, emit):
     if state["backoff_until"] > time.time():
         return "waiting"
     cfg = eng.config()
+    began = time.time()
     try:
         result = _step(slug, state, cfg, emit)
+        if result not in NOT_WORK:
+            # planning, memory, audits: time no task accounts for, and a
+            # large part of why a project takes longer than its tasks
+            took = round(time.time() - began, 1)
+            _pace_note("steps", {"project": slug, "kind": result,
+                                 "seconds": took})
+            now = _state(slug)
+            now["overhead_seconds"] = round(
+                now.get("overhead_seconds", 0) + took, 1)
+            _save_state(slug, now)
     except Exception as exc:
         state = _state(slug)                 # what the step managed to save
         state["current"] = None
@@ -3602,38 +3683,227 @@ def _ts(stamp):
         return 0.0
 
 
-def _timings(tasks, archived, state):
-    """Real time on the board and the Gantt: how long each finished task
-    took, and — for work not done yet — a prediction calibrated on how
-    long this project's tasks have actually taken (per model where there
-    is enough history), rather than the planner's guess."""
-    finished = [t for t in archived + tasks if t.get("seconds")
-                and t.get("status") in ("done", "failed")]
-    ratios, by_model = [], {}
-    for t in finished:
-        size = max(0.25, float(t.get("est_hours") or 1))
-        r = t["seconds"] / size
-        ratios.append(r)
-        by_model.setdefault(t.get("model_used") or t.get("model") or "",
-                            []).append(r)
+# ------------------------------------------------------------ pace
+#
+# How long things take on THIS machine, measured: every finished task (all
+# its attempts and its verification), every step that is not a task —
+# planning, the roadmap, memory, audits — and, when a milestone is reached,
+# how many tasks it really took against the planner's guess. Estimates are
+# made from these. The planner's own "est_hours" is a person's guess at a
+# person's effort; it says little about how long a model takes here, and
+# estimating from the work's own description is how plans come out short.
+# (docs/PROJECT-GROUNDWORK.md: the planning fallacy, and its remedy.)
 
-    def median(xs):
-        xs = sorted(xs)
-        return xs[len(xs) // 2] if xs else 0
+PACE_FILE = eng.ROOT / "system" / "pace.json"
+PACE_KEEP = 500                       # measurements kept, per kind
+# where nothing at all has been measured: deliberately not optimistic
+FIRST_GUESS = {"giant": 3600.0, "everyday": 420.0}
+NOT_WORK = ("task", "waiting", "idle", "busy", "recovered")
 
-    overall = median(ratios)
-    for t in tasks:
-        size = max(0.25, float(t.get("est_hours") or 1))
+
+def _pace_book():
+    book = _read_json(PACE_FILE, {})
+    for kind in ("tasks", "steps", "milestones"):
+        if not isinstance(book.get(kind), list):
+            book[kind] = []
+    return book
+
+
+def _pace_note(kind, row):
+    """Put one measurement on this machine's record."""
+    try:
+        with open(PACE_FILE.with_name("pace.lock"), "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            book = _pace_book()
+            book[kind] = (book[kind] + [dict(row, at=_stamp())])[-PACE_KEEP:]
+            _write_json(PACE_FILE, book)
+    except OSError:
+        pass                          # a record, never a reason to stop
+
+
+def _pace_task(slug, task, info, ok):
+    if task.get("seconds"):
+        _pace_note("tasks", {
+            "project": slug, "ok": bool(ok),
+            "model": info.get("model") or task.get("model_used") or "",
+            "agent": task.get("agent", ""), "attempts": task.get("attempts", 1),
+            "seconds": round(float(task["seconds"]), 1)})
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _slow(xs):
+    """An ordinary bad day: the time four tasks in five come in under."""
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * 0.8))] if xs else 0.0
+
+
+def _model_class(spec):
+    return "giant" if str(spec).startswith("giant/") else "everyday"
+
+
+class Pace:
+    """What a task is expected to take, from what has been measured: this
+    project's own tasks where there are enough of them, else everything
+    this machine has measured on the same model, else on the same kind of
+    model — and only where there is nothing at all, a first guess."""
+
+    def __init__(self, slug, finished, state):
+        self.slug = slug
+        book = _pace_book()
+        self.own = [{"model": t.get("model_used") or "",
+                     "agent": t.get("agent", ""),
+                     "seconds": float(t["seconds"]),
+                     "ok": t.get("status") == "done"}
+                    for t in finished if t.get("seconds")]
+        self.others = [r for r in book["tasks"]
+                       if r.get("project") != slug and r.get("seconds")]
+        self.steps = book["steps"]
+        self.milestones = book["milestones"]
+        self.tasks_measured = len(book["tasks"])
+        self.own_overhead = float(state.get("overhead_seconds") or 0)
+        self.basis = set()
+
+    def task(self, model, agent=""):
+        """(typical seconds, slow seconds, what it rests on) for one task."""
+        cls = _model_class(model)
+        mine = [t["seconds"] for t in self.own if t["model"] == model]
+        there = [r["seconds"] for r in self.others if r.get("model") == model]
+        if len(mine) >= 3:
+            xs, basis = mine, "project"
+        elif len(mine) + len(there) >= 3:
+            same = [r["seconds"] for r in self.others
+                    if r.get("model") == model and r.get("agent") == agent]
+            xs = mine + (same if len(mine) + len(same) >= 5 else there)
+            basis = "machine"
+        else:
+            kin = [t["seconds"] for t in self.own
+                   if _model_class(t["model"]) == cls] \
+                + [r["seconds"] for r in self.others
+                   if _model_class(r.get("model", "")) == cls]
+            if len(kin) >= 3:
+                xs, basis = kin, "kind"
+            elif kin and cls == "everyday":
+                # one or two measurements beat none, but they are not much:
+                # lean towards the cautious first guess
+                xs, basis = kin + [FIRST_GUESS[cls]], "kind"
+            else:
+                xs, basis = [FIRST_GUESS[cls]], "guess"
+        self.basis.add(basis)
+        typical = _mean(xs)
+        return typical, max(_slow(xs), typical * 1.4), basis
+
+    def overhead(self, typical_task):
+        """Seconds of planning, memory and auditing that go with each task
+        — time that is not in any task but is spent all the same."""
+        done = len(self.own)
+        if done >= 3 and self.own_overhead:
+            return self.own_overhead / done
+        if self.tasks_measured >= 5 and self.steps:
+            return sum(float(s.get("seconds") or 0)
+                       for s in self.steps) / self.tasks_measured
+        return typical_task * 0.35
+
+    def more_tasks(self):
+        """How many tasks get done for each one foreseen: the planner's
+        count for a milestone against what it really took, and the work
+        that fails and is planned again."""
+        rows = [m for m in self.milestones if m.get("est") and m.get("tasks")]
+        per_milestone = min(3.0, max(1.0, sum(m["tasks"] for m in rows)
+                                     / sum(m["est"] for m in rows))) \
+            if len(rows) >= 3 else 1.25
+        seen = self.own + self.others
+        again = min(2.0, len(seen) / max(1, sum(1 for t in seen
+                                                if t.get("ok")))) \
+            if len(seen) >= 5 else 1.15
+        return per_milestone, again
+
+    def rests_on(self):
+        """In a few words, what the estimate is made from."""
+        n_own, n_all = len(self.own), len(self.own) + len(self.others)
+        if "guess" in self.basis and not n_all:
+            return ("a first guess — nothing has been measured on this "
+                    "machine yet; it corrects itself as tasks finish")
+        if self.basis <= {"project"}:
+            return f"this project's own {n_own} finished tasks"
+        return (f"{n_all} tasks measured on this machine"
+                + (f", {n_own} of them in this project" if n_own else "")
+                + (" (some of it still a first guess)"
+                   if "guess" in self.basis else ""))
+
+
+def _task_spec(task, cfg, cache):
+    """The model a task will run on, named the way finished tasks record
+    it (ollama/qwen3:30b, giant/general)."""
+    spec = _task_model(task)
+    if spec not in cache:
+        target = eng.resolve_model(spec, cfg) or eng.resolve_tier("smart", cfg)
+        cache[spec] = target.get("spec") or target.get("model", "")
+    return cache[spec]
+
+
+def forecast(slug, plan, state, cfg=None, road=None):
+    """How much work is left, in measured time. Sets `took` / `predict` /
+    `elapsed` on the plan's tasks (the board and the Gantt draw from them),
+    `left` on the road's open milestones, and returns the whole picture:
+    {seconds, slow, tasks, unplanned, per_task, overhead, basis, rests_on}.
+    `seconds` is working time — waiting for the owner or for a model
+    server that is away is not in it."""
+    cfg = cfg or eng.config()
+    auto = eng._auto_dir(slug, create=False)
+    finished = [t for t in _archived(auto) + plan["tasks"]
+                if t.get("seconds") and t.get("status") in ("done", "failed")]
+    pace = Pace(slug, finished, state)
+    specs, left, slow_left, open_tasks = {}, 0.0, 0.0, []
+    for t in plan["tasks"]:
         if "seconds" in t and t["status"] in ("done", "failed", "skipped"):
             t["took"] = t["seconds"]          # measured, however short
             continue
-        model_r = median(by_model.get(t.get("model") or "", []))
-        rate = model_r if len(by_model.get(t.get("model") or "", [])) >= 3 \
-            else overall
-        t["predict"] = int(size * rate) if rate else 0
+        if t["status"] not in ("todo", "inprogress", "reviewing"):
+            continue
+        typical, slow, _basis = pace.task(_task_spec(t, cfg, specs),
+                                          t.get("agent", ""))
+        t["predict"] = max(1, round(typical))
+        spent = 0.0
         if t["status"] in ("inprogress", "reviewing") and t.get("started"):
             t["elapsed"] = int(time.time() - _ts(t["started"]))
-    return overall
+            spent = t["elapsed"]
+        left += max(typical * 0.1, typical - spent)
+        slow_left += max(slow * 0.1, slow - spent)
+        open_tasks.append(t)
+    # work the roadmap foresees but nobody has planned yet runs on the
+    # everyday model unless a plan says otherwise
+    typical, slow, _basis = pace.task(
+        eng.resolve_tier("smart", cfg).get("spec", ""), "")
+    per_milestone, again = pace.more_tasks()
+    overhead = pace.overhead(typical)
+    road = road if road is not None else roadmap_view(slug, plan)
+    unplanned = 0.0
+    if state.get("mode") not in ("improve", "refine"):
+        for m in road["milestones"]:
+            if m["status"] not in ("todo", "active"):
+                continue
+            more = max(0.0, m["est_tasks"] * per_milestone
+                       - m["done"] - m["open"])
+            if not more and not m["open"] and m["status"] == "todo":
+                more = 1.0                # reaching it takes something
+            m["left"] = round(more * again * (typical + overhead))
+            unplanned += more
+    count = (len(open_tasks) + unplanned) * again
+    seconds = left * again + unplanned * again * typical + count * overhead
+    slow_all = slow_left * again + unplanned * again * slow \
+        + count * overhead * 1.3
+    return {"seconds": round(seconds), "slow": round(max(slow_all, seconds)),
+            "tasks": len(open_tasks), "unplanned": int(round(unplanned)),
+            "per_task": round(typical, 1), "overhead": round(overhead, 1),
+            "basis": ("guess" if "guess" in pace.basis
+                      and not (pace.own or pace.others)
+                      else "project" if pace.basis <= {"project"}
+                      else "machine"),
+            "measured": len(pace.own) + len(pace.others),
+            "rests_on": pace.rests_on()}
 
 
 def reports(slug):
@@ -3688,22 +3958,17 @@ def progress(slug):
     road = roadmap_view(slug)
     ms = road["milestones"]
     state = _state(slug)
-    took = [r["seconds"] for r in eng.project_changes(slug)
-            if r.get("status") == "done" and r.get("seconds")]
-    per_task = sum(took) / len(took) if took else 0
     plan = _plan(slug) if (eng._auto_dir(slug, create=False)
                            / "plan.json").is_file() else {"tasks": []}
-    open_tasks = [t for t in plan["tasks"]
-                  if t["status"] in ("todo", "inprogress", "reviewing")]
-    unplanned = sum(max(0, m["est_tasks"] - m["done"] - m["open"])
-                    for m in ms if m["status"] in ("todo", "active"))
-    remaining = len(open_tasks) + unplanned
+    ahead = forecast(slug, plan, state, road=road)
     return {"status": state["status"], "reached": road.get("reached", 0),
             "total": len(ms),
             "current": [m for m in ms if m["status"] == "active"],
             "next": [m for m in ms if m["status"] == "todo"],
-            "remaining_tasks": remaining, "per_task": per_task,
-            "eta": remaining * per_task,
+            "remaining_tasks": ahead["tasks"] + ahead["unplanned"],
+            "per_task": ahead["per_task"],
+            "eta": ahead["seconds"], "eta_slow": ahead["slow"],
+            "rests_on": ahead["rests_on"], "basis": ahead["basis"],
             "now": state.get("current") or None,
             "needs_you": _gated(plan)}
 
@@ -3724,7 +3989,8 @@ def view(slug):
 
     plan = _with_decisions(_plan(slug), auto) \
         if (auto / "plan.json").is_file() else {"tasks": []}
-    pace = _timings(plan["tasks"], _archived(auto), state)
+    road = roadmap_view(slug, plan)
+    ahead = forecast(slug, plan, state, road=road)
     held = _held(plan)
     for t in plan["tasks"]:
         t["held"] = t["id"] in held and not t.get("needs_human")
@@ -3747,7 +4013,7 @@ def view(slug):
         "needs_you": [{"id": t["id"], "title": t["title"],
                        "why": t.get("why", "")} for t in _gated(plan)],
         "assessment": text("ASSESSMENT.md"),
-        "roadmap": roadmap_view(slug, plan),
+        "roadmap": road,
         "review": text("REVIEW.md"),
         "memory": text("MEMORY.md") or text("lessons.md"),
         "steering": text("STEERING.md"),
@@ -3755,9 +4021,12 @@ def view(slug):
         "report": text("FINAL-REPORT.md"),
         "reports": reports(slug),
         "history": [_brief_task(t) for t in _archived(auto)],
-        # measured seconds of work per unit of the planner's size estimate
-        # (0 until a task has finished): what predictions are scaled by
-        "pace": pace,
+        # how much work is left, in time measured on this machine — and
+        # what that rests on. "pace": seconds a task takes here, 0 while
+        # that is still a first guess.
+        "forecast": ahead,
+        "pace": ahead["per_task"] if ahead["basis"] != "guess" else 0,
+        "business": eng.project_business(slug, text=False),
         "changes": eng.project_changes(slug, limit=300),
         "changes_total": _count_lines(auto / "changes.jsonl"),
         "activity": activity(slug) if auto.is_dir() else [],
